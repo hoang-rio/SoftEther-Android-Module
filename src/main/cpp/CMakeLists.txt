@@ -80,17 +80,17 @@ include_directories(${SODIUM_INCLUDE_DIRS})
 
 link_directories(${BUILD_DIRECTORY})
 
+# Android iconv shim library (for Bionic libc) - MUST be created BEFORE Mayaqua
+if(ANDROID)
+  add_library(android-iconv-shim STATIC android_iconv_shim.c)
+endif()
+
 # Add libhamcore first (needed by Mayaqua)
 add_subdirectory(${SOFTETHER_DIR}/libhamcore ${CMAKE_BINARY_DIR}/libhamcore)
 
 # Add only Mayaqua and Cedar (skip executables for Android)
 add_subdirectory(${SOFTETHER_DIR}/Mayaqua ${CMAKE_BINARY_DIR}/mayaqua)
 add_subdirectory(${SOFTETHER_DIR}/Cedar ${CMAKE_BINARY_DIR}/cedar)
-
-# Android iconv shim library (for Bionic libc)
-if(ANDROID)
-  add_library(android-iconv-shim STATIC android_iconv_shim.c)
-endif()
 
 # JNI bridge implementation
 add_library(softether-jni SHARED softether_jni.c)

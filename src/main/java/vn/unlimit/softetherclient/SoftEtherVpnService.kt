@@ -268,15 +268,25 @@ class SoftEtherVpnService : VpnService() {
         Log.e(TAG, "VPN Error $errorCode: $errorMessage")
 
         mainHandler.post {
+            // Update internal state
+            isConnected = false
+            isConnecting = false
+
             // Update notification with error
             updateNotification("Error: $errorMessage", false)
 
-            // Broadcast error to UI
+            // Broadcast state change to ERROR
+            broadcastStateChange(STATE_ERROR)
+
+            // Broadcast error details to UI
             val intent = Intent(ACTION_ERROR).apply {
                 putExtra(EXTRA_ERROR_CODE, errorCode)
                 putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
             }
             sendBroadcast(intent)
+
+            stopForeground(true)
+            stopSelf()
         }
     }
 

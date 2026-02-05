@@ -230,6 +230,7 @@ class SoftEtherClient {
      */
     @Suppress("unused")
     private fun onError(errorCode: Int, errorMessage: String?) {
+        setState(STATE_ERROR)
         connectionListener?.onError(errorCode, errorMessage)
     }
 

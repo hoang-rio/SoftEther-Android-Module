@@ -271,6 +271,17 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeInit(JNIEnv* env, jobject 
     g_client.onBytesTransferred = (*env)->GetMethodID(env, cls, "onBytesTransferred", "(JJ)V");
     g_client.onPacketReceived = (*env)->GetMethodID(env, cls, "onPacketReceived", "([B)V");
 
+    // Check if method IDs were found
+    if (g_client.onConnectionEstablished == NULL ||
+        g_client.onError == NULL ||
+        g_client.onBytesTransferred == NULL ||
+        g_client.onPacketReceived == NULL) {
+        LOGE("Failed to cache method IDs - check method signatures match Java class");
+        (*env)->DeleteGlobalRef(env, g_client.javaClient);
+        g_client.javaClient = NULL;
+        return JNI_FALSE;
+    }
+
     // Initialize SoftEther libraries
     InitMayaquaWrapper();
 
@@ -699,6 +710,12 @@ static void ReportBytesTransferred(UINT64 sent, UINT64 received)
 static void InitMayaquaWrapper(void)
 {
     // Initialize Mayaqua/SoftEther libraries
+    // Use minimal mode for Android to avoid checks that call exit()
+    // (e.g., executable file existence check, /tmp check)
+    MayaquaMinimalMode();
+    
+    // Initialize with minimal flags - avoid the standard initialization
+    // that calls exit() on Android
     InitMayaqua(false, false, 0, NULL);
     InitCedar();
 }
