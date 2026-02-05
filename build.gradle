@@ -18,11 +18,7 @@ android {
             }
         }
         ndk {
-            // Note: arm64-v8a excluded due to OpenSSL static library non-PIC code issue
-            // The OpenSSL libcrypto.a for arm64-v8a contains SVE2 assembly code
-            // that was not compiled with -fPIC, causing linker errors.
-            // TODO: Rebuild OpenSSL with -fPIC for arm64-v8a support
-            abiFilters "armeabi-v7a", "x86", "x86_64"
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
         }
     }
 
