@@ -1,9 +1,9 @@
 [submodule "src/main/cpp/SoftEtherVPN"]
 	path = src/main/cpp/SoftEtherVPN
-	url = https://github.com/SoftEtherVPN/SoftEtherVPN
+	url = git@github.com:SoftEtherVPN/SoftEtherVPN.git
 [submodule "src/main/cpp/openssl"]
 	path = src/main/cpp/openssl
-	url = https://github.com/openssl/openssl
+	url = git@github.com:openssl/openssl.git
 [submodule "src/main/cpp/libsodium"]
 	path = src/main/cpp/libsodium
-	url = https://github.com/jedisct1/libsodium
+	url = git@github.com:jedisct1/libsodium.git
