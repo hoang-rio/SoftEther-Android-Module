@@ -1,6 +1,6 @@
 [submodule "src/main/cpp/SoftEtherVPN"]
 	path = src/main/cpp/SoftEtherVPN
-	url = git@github.com:SoftEtherVPN/SoftEtherVPN.git
+	url = git@github.com:hoang-rio/SoftEtherVPN.git
 [submodule "src/main/cpp/openssl"]
 	path = src/main/cpp/openssl
 	url = git@github.com:openssl/openssl.git
