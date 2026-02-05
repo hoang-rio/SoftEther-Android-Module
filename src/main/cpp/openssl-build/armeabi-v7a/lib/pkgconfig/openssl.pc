@@ -1,0 +1,9 @@
+prefix=/Volumes/HoangND/Projects/android/vpngate-connector/SoftEtherClient/src/main/cpp/openssl/../openssl-build/armeabi-v7a
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include 
+
+Name: OpenSSL
+Description: Secure Sockets Layer and cryptography libraries and tools
+Version: 4.0.0-dev
+Requires: libssl libcrypto
