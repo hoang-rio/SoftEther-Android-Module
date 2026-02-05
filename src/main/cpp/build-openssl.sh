@@ -49,8 +49,9 @@ build_openssl() {
     
     # Configure OpenSSL for Android
     # Use no-asm for arm64 to avoid SVE2 relocation issues
+    # Use no-asm for x86 to avoid PIC relocation issues with assembly code
     local EXTRA_OPTS=""
-    if [ "$ABI" = "arm64-v8a" ]; then
+    if [ "$ABI" = "arm64-v8a" ] || [ "$ABI" = "x86" ]; then
         EXTRA_OPTS="no-asm"
     fi
     
