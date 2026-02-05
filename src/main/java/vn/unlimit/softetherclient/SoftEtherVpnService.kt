@@ -36,6 +36,17 @@ class SoftEtherVpnService : VpnService() {
         const val ACTION_CONNECT = "vn.unlimit.softetherclient.CONNECT"
         const val ACTION_DISCONNECT = "vn.unlimit.softetherclient.DISCONNECT"
 
+        // Broadcast actions
+        const val ACTION_STATE_CHANGE = "vn.unlimit.softetherclient.STATE_CHANGE"
+        const val ACTION_CONNECTED = "vn.unlimit.softetherclient.CONNECTED"
+        const val ACTION_ERROR = "vn.unlimit.softetherclient.ERROR"
+
+        // Broadcast extras
+        const val EXTRA_STATE = "state"
+        const val EXTRA_VIRTUAL_IP = "virtual_ip"
+        const val EXTRA_ERROR_CODE = "error_code"
+        const val EXTRA_ERROR_MESSAGE = "error_message"
+
         // Preference keys
         private const val PREFS_NAME = "softether_vpn_prefs"
 
@@ -261,9 +272,9 @@ class SoftEtherVpnService : VpnService() {
             updateNotification("Error: $errorMessage", false)
 
             // Broadcast error to UI
-            val intent = Intent("vn.unlimit.softetherclient.ERROR").apply {
-                putExtra("error_code", errorCode)
-                putExtra("error_message", errorMessage)
+            val intent = Intent(ACTION_ERROR).apply {
+                putExtra(EXTRA_ERROR_CODE, errorCode)
+                putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
             }
             sendBroadcast(intent)
         }
@@ -281,8 +292,8 @@ class SoftEtherVpnService : VpnService() {
         }
 
         // Broadcast connection info
-        val intent = Intent("vn.unlimit.softetherclient.CONNECTED").apply {
-            putExtra("virtual_ip", virtualIp)
+        val intent = Intent(ACTION_CONNECTED).apply {
+            putExtra(EXTRA_VIRTUAL_IP, virtualIp)
             putExtra("subnet_mask", subnetMask)
             putExtra("dns_server", dnsServer)
         }
@@ -290,8 +301,8 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun broadcastStateChange(state: Int) {
-        val intent = Intent("vn.unlimit.softetherclient.STATE_CHANGE").apply {
-            putExtra("state", state)
+        val intent = Intent(ACTION_STATE_CHANGE).apply {
+            putExtra(EXTRA_STATE, state)
         }
         sendBroadcast(intent)
     }
