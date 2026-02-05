@@ -92,8 +92,8 @@ if(ANDROID)
   add_library(android-iconv-shim STATIC android_iconv_shim.c)
 endif()
 
-# JNI bridge stub
-add_library(softether-jni SHARED jni_stub.c)
+# JNI bridge implementation
+add_library(softether-jni SHARED softether_jni.c)
 target_link_libraries(softether-jni
   android
   log

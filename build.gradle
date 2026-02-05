@@ -1,5 +1,6 @@
 plugins {
     id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
 }
 
 android {
@@ -43,13 +44,17 @@ android {
 
     sourceSets {
         main {
+            kotlin.srcDirs = ["src/main/java"]
             jniLibs.srcDirs = ["src/main/jniLibs"]
         }
     }
 }
 
-// No Java/Kotlin sources yet; this module is purely native for now.
+kotlin {
+    jvmToolchain(17)
+}
 
 dependencies {
-    // Placeholder for future Android dependencies if needed
+    implementation "org.jetbrains.kotlin:kotlin-stdlib"
+    implementation "androidx.core:core-ktx:1.12.0"
 }
