@@ -7,3 +7,6 @@
 [submodule "src/main/cpp/libsodium"]
 	path = src/main/cpp/libsodium
 	url = git@github.com:jedisct1/libsodium.git
+[submodule "src/main/cpp/SoftEtherVPN4"]
+	path = src/main/cpp/SoftEtherVPN4
+	url = git@github.com:hoang-rio/SoftEtherVPN_Stable.git

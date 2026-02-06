@@ -5,14 +5,14 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Directories
-set(SOFTETHER_DIR ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN/src)
+# Directories - Using SoftEtherVPN4 (v4) for protocol compatibility
+set(SOFTETHER_DIR ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN4/src)
 set(OPENSSL_DIR   ${CMAKE_CURRENT_LIST_DIR}/openssl)
 set(LIBSODIUM_DIR ${CMAKE_CURRENT_LIST_DIR}/libsodium)
 set(PREBUILT_OPENSSL_DIR ${CMAKE_CURRENT_LIST_DIR}/openssl-build)
 set(PREBUILT_JNILIBS_DIR ${CMAKE_CURRENT_LIST_DIR}/../jniLibs)
 set(BUILD_DIRECTORY ${CMAKE_BINARY_DIR}/softether-build)
-set(TOP_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN)
+set(TOP_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN4)
 file(MAKE_DIRECTORY ${BUILD_DIRECTORY})
 
 # Map ABI to OpenSSL android target
@@ -59,6 +59,29 @@ else()
 endif()
 add_definitions(-DUNIX -DOS_UNIX -DUNIX_LINUX)
 
+# Android compatibility flags to suppress errors in SoftEtherVPN4 source
+if(ANDROID)
+  # Suppress errors for modern C compilers
+  add_compile_options(
+    -Wno-error=incompatible-function-pointer-types
+    -Wno-error=implicit-function-declaration
+    -Wno-error=int-conversion
+    -Wno-error=pointer-sign
+    -Wno-error=macro-redefined
+    -Wno-error=unused-value
+    -Wno-error=tautological-pointer-compare
+    -Wno-incompatible-function-pointer-types
+    -Wno-implicit-function-declaration
+    -Wno-int-conversion
+    -Wno-pointer-sign
+    -Wno-macro-redefined
+    -Wno-unused-value
+    -Wno-tautological-pointer-compare
+    -Wno-deprecated-declarations
+    -ferror-limit=0
+  )
+endif()
+
 if(ANDROID)
   set(THREADS_PREFER_PTHREAD_FLAG OFF)
   set(CMAKE_THREAD_LIBS_INIT "")
@@ -72,6 +95,12 @@ if(ANDROID)
   # Android Bionic doesn't have iconv - use our shim
   add_definitions(-DANDROID_ICONV_SHIM)
   include_directories(${CMAKE_CURRENT_LIST_DIR})
+  
+  # Android doesn't have readline
+  add_definitions(-DSKIP_READLINE)
+  
+  # Define ANDROID macro for source code conditional compilation
+  add_definitions(-DANDROID)
 endif()
 
 include_directories(${SOFTETHER_DIR})
@@ -80,15 +109,17 @@ include_directories(${SODIUM_INCLUDE_DIRS})
 
 link_directories(${BUILD_DIRECTORY})
 
-# Android iconv shim library (for Bionic libc) - MUST be created BEFORE Mayaqua
+# Android shim libraries (for Bionic libc) - MUST be created BEFORE Mayaqua/Cedar
 if(ANDROID)
   add_library(android-iconv-shim STATIC android_iconv_shim.c)
+  add_library(android-readline-shim STATIC android_readline_shim.c)
+  # Android Mayaqua threading/memory patch
+  add_library(android-mayaqua-patch STATIC android_mayaqua_patch.c)
+  target_include_directories(android-mayaqua-patch PRIVATE ${SOFTETHER_DIR})
 endif()
 
-# Add libhamcore first (needed by Mayaqua)
-add_subdirectory(${SOFTETHER_DIR}/libhamcore ${CMAKE_BINARY_DIR}/libhamcore)
-
-# Add only Mayaqua and Cedar (skip executables for Android)
+# Add Mayaqua and Cedar (skip executables for Android)
+# Note: v4 doesn't have libhamcore, it's integrated differently
 add_subdirectory(${SOFTETHER_DIR}/Mayaqua ${CMAKE_BINARY_DIR}/mayaqua)
 add_subdirectory(${SOFTETHER_DIR}/Cedar ${CMAKE_BINARY_DIR}/cedar)
 
@@ -99,14 +130,17 @@ target_link_libraries(softether-jni
   log
   cedar
   mayaqua
-  libhamcore
   openssl-ssl
   openssl-crypto
   sodium
 )
 
 if(ANDROID)
-  target_link_libraries(softether-jni android-iconv-shim)
-  # Also link iconv shim to mayaqua since it's a shared library
+  target_link_libraries(softether-jni android-iconv-shim android-readline-shim android-mayaqua-patch)
+  # Also link iconv shim to mayaqua
   target_link_libraries(mayaqua PRIVATE android-iconv-shim)
+  # Link readline shim to cedar (Console.c uses these functions)
+  target_link_libraries(cedar PRIVATE android-readline-shim)
+  # Link Mayaqua patch to mayaqua for thread safety fixes
+  target_link_libraries(mayaqua PRIVATE android-mayaqua-patch)
 endif()

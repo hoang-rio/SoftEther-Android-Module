@@ -80,12 +80,16 @@ class SoftEtherClient {
     external fun nativeCleanup()
 
     /**
-     * Connect to SoftEther VPN server
-     * @param params Connection parameters
+     * Connect to SoftEther VPN server (v4 API)
+     * @param host Server hostname
+     * @param port Server port
+     * @param hub Hub name
+     * @param user Username
+     * @param pass Password
      * @param tunFd File descriptor of the TUN interface
      * @return true if connection started successfully
      */
-    private external fun nativeConnect(params: ConnectionParams, tunFd: Int): Boolean
+    private external fun nativeConnect(host: String, port: Int, hub: String, user: String, pass: String, tunFd: Int): Boolean
 
     /**
      * Disconnect from VPN server
@@ -105,18 +109,12 @@ class SoftEtherClient {
     external fun nativeGetStatistics(): LongArray
 
     /**
-     * Write packet to VPN (called from native code)
-     * @param packet IP packet data
-     * @return true if successful
+     * Test function with hardcoded parameters
+     * Host: 219.100.37.92, Port: 443, Hub: VPN, User: vpn, Pass: vpn
+     * @param tunFd File descriptor of the TUN interface (-1 for testing without TUN)
+     * @return true if connection started successfully
      */
-    private external fun nativeWritePacket(packet: ByteArray?): Boolean
-
-    /**
-     * Read packet from VPN (called from native code)
-     * @param buffer buffer to store packet data
-     * @return number of bytes read, or -1 if no packet available
-     */
-    private external fun nativeReadPacket(buffer: ByteArray?): Int
+    external fun nativeConnectTest(tunFd: Int): Boolean
 
     /**
      * Set the connection listener
@@ -158,9 +156,16 @@ class SoftEtherClient {
                 return false
             }
 
-            // Start native connection
+            // Start native connection with v4 API
             val tunFd = tunInterface!!.fd
-            val result = nativeConnect(params, tunFd)
+            val result = nativeConnect(
+                params.serverHost ?: "",
+                params.serverPort,
+                params.hubName,
+                params.username ?: "",
+                params.password ?: "",
+                tunFd
+            )
 
             if (!result) {
                 setState(STATE_ERROR)
