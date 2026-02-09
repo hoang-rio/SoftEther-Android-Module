@@ -22,7 +22,7 @@ class SoftEtherNativeInstrumentedTest {
         private const val TAG = "SoftEtherInstrumented"
 
         // Test server configuration
-        const val TEST_SERVER_HOST = "106.174.122.123"
+        const val TEST_SERVER_HOST = "27.83.68.134"
         const val TEST_SERVER_PORT = 443
         const val TEST_HUB_NAME = "VPN"
         const val TEST_USERNAME = "vpn"

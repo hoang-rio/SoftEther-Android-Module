@@ -437,21 +437,81 @@ static int resolve_and_connect(const char* hostname, int port, int timeout_ms) {
 }
 
 // ============================================================================
-// SSL/TLS Operations (simplified - actual SSL implementation needed)
+// SSL/TLS Operations using OpenSSL
 // ============================================================================
 
-// Note: Full SSL implementation would require OpenSSL
-// This is a simplified version for the protocol structure
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+
+static bool openssl_initialized = false;
+
+static void openssl_init(void) {
+    if (openssl_initialized) return;
+    
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+    
+    openssl_initialized = true;
+    LOGD("OpenSSL initialized");
+}
 
 static se_ssl_context_t* ssl_context_new(int socket_fd, bool verify_cert) {
+    openssl_init();
+    
     se_ssl_context_t* ctx = (se_ssl_context_t*)calloc(1, sizeof(se_ssl_context_t));
     if (!ctx) return NULL;
     
     ctx->socket_fd = socket_fd;
     ctx->is_initialized = false;
     
-    // TODO: Initialize actual SSL context here
-    // For now, we just store the socket fd
+    // Create SSL context
+    const SSL_METHOD* method = TLS_client_method();
+    if (!method) {
+        LOGE("Failed to get SSL method");
+        free(ctx);
+        return NULL;
+    }
+    
+    ctx->ctx = SSL_CTX_new(method);
+    if (!ctx->ctx) {
+        LOGE("Failed to create SSL context");
+        free(ctx);
+        return NULL;
+    }
+    
+    // Set options for compatibility
+    SSL_CTX_set_options(ctx->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+    
+    // For SoftEther compatibility, allow older TLS versions
+    SSL_CTX_set_min_proto_version(ctx->ctx, TLS1_VERSION);
+    
+    if (!verify_cert) {
+        // Disable certificate verification for testing
+        SSL_CTX_set_verify(ctx->ctx, SSL_VERIFY_NONE, NULL);
+    } else {
+        SSL_CTX_set_verify(ctx->ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_default_verify_paths(ctx->ctx);
+    }
+    
+    // Create SSL connection
+    ctx->ssl = SSL_new(ctx->ctx);
+    if (!ctx->ssl) {
+        LOGE("Failed to create SSL");
+        SSL_CTX_free(ctx->ctx);
+        free(ctx);
+        return NULL;
+    }
+    
+    // Attach socket to SSL
+    if (!SSL_set_fd((SSL*)ctx->ssl, socket_fd)) {
+        LOGE("Failed to set SSL fd");
+        SSL_free((SSL*)ctx->ssl);
+        SSL_CTX_free(ctx->ctx);
+        free(ctx);
+        return NULL;
+    }
     
     return ctx;
 }
@@ -459,37 +519,72 @@ static se_ssl_context_t* ssl_context_new(int socket_fd, bool verify_cert) {
 static void ssl_context_free(se_ssl_context_t* ctx) {
     if (!ctx) return;
     
-    // TODO: Cleanup SSL context
+    if (ctx->ssl) {
+        SSL_shutdown((SSL*)ctx->ssl);
+        SSL_free((SSL*)ctx->ssl);
+        ctx->ssl = NULL;
+    }
+    
+    if (ctx->ctx) {
+        SSL_CTX_free((SSL_CTX*)ctx->ctx);
+        ctx->ctx = NULL;
+    }
     
     free(ctx);
 }
 
 static int ssl_handshake(se_ssl_context_t* ctx) {
-    if (!ctx) return -1;
+    if (!ctx || !ctx->ssl) return -1;
     
-    // TODO: Perform actual SSL handshake
-    // For testing, we'll simulate success
+    LOGD("Starting SSL handshake");
     
-    LOGD("SSL handshake (simulated)");
+    int result = SSL_connect((SSL*)ctx->ssl);
+    if (result <= 0) {
+        int ssl_error = SSL_get_error((SSL*)ctx->ssl, result);
+        LOGE("SSL handshake failed: %d", ssl_error);
+        
+        // Log OpenSSL error string
+        char error_buf[256];
+        ERR_error_string_n(ERR_get_error(), error_buf, sizeof(error_buf));
+        LOGE("OpenSSL error: %s", error_buf);
+        
+        return -1;
+    }
+    
+    LOGD("SSL handshake successful, version: %s, cipher: %s",
+         SSL_get_version((SSL*)ctx->ssl),
+         SSL_get_cipher((SSL*)ctx->ssl));
+    
     ctx->is_initialized = true;
-    
     return 0;
 }
 
 static int ssl_read(se_ssl_context_t* ctx, uint8_t* buffer, size_t len) {
-    if (!ctx || ctx->socket_fd < 0) return -1;
+    if (!ctx || !ctx->ssl || !ctx->is_initialized) return -1;
     
-    // For now, just read directly from socket
-    // In real implementation, this would use SSL_read
-    return recv(ctx->socket_fd, buffer, len, 0);
+    int result = SSL_read((SSL*)ctx->ssl, buffer, (int)len);
+    if (result < 0) {
+        int ssl_error = SSL_get_error((SSL*)ctx->ssl, result);
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            return 0; // Would block
+        }
+        return -1;
+    }
+    return result;
 }
 
 static int ssl_write(se_ssl_context_t* ctx, const uint8_t* data, size_t len) {
-    if (!ctx || ctx->socket_fd < 0) return -1;
+    if (!ctx || !ctx->ssl || !ctx->is_initialized) return -1;
     
-    // For now, just write directly to socket
-    // In real implementation, this would use SSL_write
-    return send(ctx->socket_fd, data, len, MSG_NOSIGNAL);
+    int result = SSL_write((SSL*)ctx->ssl, data, (int)len);
+    if (result < 0) {
+        int ssl_error = SSL_get_error((SSL*)ctx->ssl, result);
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            return 0; // Would block
+        }
+        return -1;
+    }
+    return result;
 }
 
 // ============================================================================
