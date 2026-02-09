@@ -28,8 +28,20 @@ class SoftEtherClient {
         const val ERR_DHCP_FAILED = 4
         const val ERR_TUN_CREATE_FAILED = 5
 
+        // Track if native library is available
+        @JvmStatic
+        var isNativeLibraryAvailable = false
+            private set
+
         init {
-            System.loadLibrary("softether-jni")
+            try {
+                System.loadLibrary("softether-jni")
+                isNativeLibraryAvailable = true
+                Log.i(TAG, "Native library loaded successfully")
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e(TAG, "Native library not available: ${e.message}")
+                isNativeLibraryAvailable = false
+            }
         }
     }
 
@@ -131,9 +143,78 @@ class SoftEtherClient {
     fun getState(): Int = state
 
     /**
+     * Safely initialize the client with library availability check
+     */
+    fun doNativeInit(): Boolean {
+        if (!isNativeLibraryAvailable) {
+            Log.e(TAG, "Cannot initialize: native library not available")
+            return false
+        }
+        return try {
+            nativeInit()
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "nativeInit failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Safely cleanup with library availability check
+     */
+    fun doNativeCleanup() {
+        if (!isNativeLibraryAvailable) {
+            Log.e(TAG, "Cannot cleanup: native library not available")
+            return
+        }
+        try {
+            nativeCleanup()
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "nativeCleanup failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Safely connect with library availability check
+     */
+    private fun doNativeConnect(params: ConnectionParams, tunFd: Int): Boolean {
+        if (!isNativeLibraryAvailable) {
+            Log.e(TAG, "Cannot connect: native library not available")
+            return false
+        }
+        return try {
+            nativeConnect(params, tunFd)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "nativeConnect failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Safely disconnect with library availability check
+     */
+    fun doNativeDisconnect() {
+        if (!isNativeLibraryAvailable) {
+            Log.e(TAG, "Cannot disconnect: native library not available")
+            return
+        }
+        try {
+            nativeDisconnect()
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "nativeDisconnect failed: ${e.message}")
+        }
+    }
+
+    /**
      * Connect to VPN with the given parameters
      */
     fun connect(service: VpnService, params: ConnectionParams): Boolean {
+        if (!isNativeLibraryAvailable) {
+            Log.e(TAG, "Cannot connect: native library not available")
+            setState(STATE_ERROR)
+            onError(ERR_CONNECT_FAILED, "SoftEther native library not available")
+            return false
+        }
+
         if (state != STATE_DISCONNECTED && state != STATE_ERROR) {
             Log.w(TAG, "Already connected or connecting")
             return false
@@ -143,6 +224,13 @@ class SoftEtherClient {
         setState(STATE_CONNECTING)
 
         return try {
+            // Initialize native client first
+            if (!doNativeInit()) {
+                setState(STATE_ERROR)
+                onError(ERR_CONNECT_FAILED, "Failed to initialize native client")
+                return false
+            }
+
             // Create TUN interface
             val builder = service.Builder()
             builder.setMtu(1400)
@@ -160,7 +248,7 @@ class SoftEtherClient {
 
             // Start native connection
             val tunFd = tunInterface!!.fd
-            val result = nativeConnect(params, tunFd)
+            val result = doNativeConnect(params, tunFd)
 
             if (!result) {
                 setState(STATE_ERROR)
@@ -187,7 +275,7 @@ class SoftEtherClient {
         }
 
         setState(STATE_DISCONNECTING)
-        nativeDisconnect()
+        doNativeDisconnect()
         closeTunInterface()
         setState(STATE_DISCONNECTED)
     }
@@ -197,7 +285,7 @@ class SoftEtherClient {
      */
     fun cleanup() {
         disconnect()
-        nativeCleanup()
+        doNativeCleanup()
     }
 
     private fun closeTunInterface() {

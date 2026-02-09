@@ -631,6 +631,84 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeGetStatistics(JNIEnv* env,
     return result;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_vn_unlimit_softetherclient_SoftEtherClient_nativeWritePacket(JNIEnv* env, jobject thiz, jbyteArray packet)
+{
+    if (packet == NULL) {
+        return JNI_FALSE;
+    }
+
+    jsize len = (*env)->GetArrayLength(env, packet);
+    if (len <= 0 || len > SE_MAX_PACKET_SIZE) {
+        return JNI_FALSE;
+    }
+
+    jbyte* data = (*env)->GetByteArrayElements(env, packet, NULL);
+    if (data == NULL) {
+        return JNI_FALSE;
+    }
+
+    bool result = JNI_FALSE;
+
+    Lock(g_client.lock);
+    if (g_client.connected && g_client.tunFd >= 0) {
+        ssize_t written = write(g_client.tunFd, data, len);
+        if (written == len) {
+            g_client.bytesSent += len;
+            result = JNI_TRUE;
+        }
+    }
+    Unlock(g_client.lock);
+
+    (*env)->ReleaseByteArrayElements(env, packet, data, JNI_ABORT);
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_vn_unlimit_softetherclient_SoftEtherClient_nativeReadPacket(JNIEnv* env, jobject thiz, jbyteArray buffer)
+{
+    if (buffer == NULL) {
+        return -1;
+    }
+
+    jsize bufLen = (*env)->GetArrayLength(env, buffer);
+    if (bufLen <= 0) {
+        return -1;
+    }
+
+    jbyte* data = (*env)->GetByteArrayElements(env, buffer, NULL);
+    if (data == NULL) {
+        return -1;
+    }
+
+    jint result = -1;
+
+    Lock(g_client.lock);
+    if (g_client.connected && g_client.tunFd >= 0) {
+        // Set non-blocking mode for this read
+        int flags = fcntl(g_client.tunFd, F_GETFL, 0);
+        fcntl(g_client.tunFd, F_SETFL, flags | O_NONBLOCK);
+
+        ssize_t len = read(g_client.tunFd, data, bufLen);
+
+        // Restore blocking mode
+        fcntl(g_client.tunFd, F_SETFL, flags);
+
+        if (len > 0) {
+            g_client.bytesReceived += len;
+            result = (jint)len;
+        } else if (len == 0 || (len < 0 && errno == EAGAIN)) {
+            result = 0; // No data available
+        } else {
+            result = -1; // Error
+        }
+    }
+    Unlock(g_client.lock);
+
+    (*env)->ReleaseByteArrayElements(env, buffer, data, (result > 0) ? 0 : JNI_ABORT);
+    return result;
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================

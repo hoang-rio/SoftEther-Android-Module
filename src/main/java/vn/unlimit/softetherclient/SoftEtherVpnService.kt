@@ -4,9 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -35,6 +35,11 @@ class SoftEtherVpnService : VpnService() {
         // Actions
         const val ACTION_CONNECT = "vn.unlimit.softetherclient.CONNECT"
         const val ACTION_DISCONNECT = "vn.unlimit.softetherclient.DISCONNECT"
+        
+        // Broadcast actions for UI updates
+        const val ACTION_STATE_CHANGE = "vn.unlimit.softetherclient.STATE_CHANGE"
+        const val ACTION_CONNECTED = "vn.unlimit.softetherclient.CONNECTED"
+        const val ACTION_ERROR = "vn.unlimit.softetherclient.ERROR"
 
         // Preference keys
         private const val PREFS_NAME = "softether_vpn_prefs"
@@ -187,7 +192,12 @@ class SoftEtherVpnService : VpnService() {
             if (!success) {
                 mainHandler.post {
                     isConnecting = false
-                    stopForeground(true)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
                     stopSelf()
                 }
             }
@@ -239,12 +249,22 @@ class SoftEtherVpnService : VpnService() {
                 SoftEtherClient.STATE_DISCONNECTED -> {
                     isConnected = false
                     isConnecting = false
-                    stopForeground(true)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
                 }
                 SoftEtherClient.STATE_ERROR -> {
                     isConnected = false
                     isConnecting = false
-                    stopForeground(true)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
                     stopSelf()
                 }
             }

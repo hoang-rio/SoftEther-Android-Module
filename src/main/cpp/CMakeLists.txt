@@ -9,7 +9,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(SOFTETHER_DIR ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN/src)
 set(OPENSSL_DIR   ${CMAKE_CURRENT_LIST_DIR}/openssl)
 set(LIBSODIUM_DIR ${CMAKE_CURRENT_LIST_DIR}/libsodium)
-set(PREBUILT_OPENSSL_DIR ${CMAKE_CURRENT_LIST_DIR}/openssl-build)
 set(PREBUILT_JNILIBS_DIR ${CMAKE_CURRENT_LIST_DIR}/../jniLibs)
 set(BUILD_DIRECTORY ${CMAKE_BINARY_DIR}/softether-build)
 set(TOP_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/SoftEtherVPN)
@@ -28,18 +27,18 @@ else()
   message(FATAL_ERROR "Unsupported ANDROID_ABI: ${ANDROID_ABI}")
 endif()
 
-set(OPENSSL_INSTALL_DIR ${PREBUILT_OPENSSL_DIR}/${ANDROID_ABI})
+# OpenSSL: headers from source, libraries from jniLibs
+set(OPENSSL_LIBRARIES_DIR ${PREBUILT_JNILIBS_DIR}/${ANDROID_ABI})
 
-set(OPENSSL_ROOT_DIR ${OPENSSL_INSTALL_DIR})
-set(OPENSSL_CRYPTO_LIBRARY ${OPENSSL_INSTALL_DIR}/lib/libcrypto.a)
-set(OPENSSL_SSL_LIBRARY ${OPENSSL_INSTALL_DIR}/lib/libssl.a)
-set(OPENSSL_INCLUDE_DIR ${OPENSSL_INSTALL_DIR}/include)
+set(OPENSSL_ROOT_DIR ${OPENSSL_DIR})
+set(OPENSSL_CRYPTO_LIBRARY ${OPENSSL_LIBRARIES_DIR}/libcrypto.a)
+set(OPENSSL_SSL_LIBRARY ${OPENSSL_LIBRARIES_DIR}/libssl.a)
+set(OPENSSL_INCLUDE_DIR ${OPENSSL_DIR}/include)
 
 add_library(openssl-crypto STATIC IMPORTED)
 add_library(openssl-ssl STATIC IMPORTED)
-set_target_properties(openssl-crypto PROPERTIES IMPORTED_LOCATION ${OPENSSL_INSTALL_DIR}/lib/libcrypto.a)
-set_target_properties(openssl-ssl    PROPERTIES IMPORTED_LOCATION ${OPENSSL_INSTALL_DIR}/lib/libssl.a)
-set(OPENSSL_INCLUDE_DIR ${OPENSSL_INSTALL_DIR}/include)
+set_target_properties(openssl-crypto PROPERTIES IMPORTED_LOCATION ${OPENSSL_LIBRARIES_DIR}/libcrypto.a)
+set_target_properties(openssl-ssl    PROPERTIES IMPORTED_LOCATION ${OPENSSL_LIBRARIES_DIR}/libssl.a)
 
 # Use static libsodium library where possible
 # Note: arm64-v8a static library has -fPIC issues, excluded from build.gradle
