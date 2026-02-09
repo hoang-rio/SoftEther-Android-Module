@@ -1,2 +1,4 @@
 .cxx/
 build/
+src/main/cpp/openssl-build/
+src/main/cpp/libsodium-build/
