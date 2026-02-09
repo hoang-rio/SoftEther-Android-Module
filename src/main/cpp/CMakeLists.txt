@@ -38,7 +38,7 @@ set(OPENSSL_LIBRARIES
 # libsodium library
 set(SODIUM_LIBRARY ${OPENSSL_ROOT}/libsodium.a)
 
-# SoftEther VPN Cedar sources (core library) - excluding Bridge, EtherLog, NativeStack
+# SoftEther VPN Cedar sources (core library)
 set(CEDAR_SOURCES
     ${SOFTETHER_DIR}/Cedar/Account.c
     ${SOFTETHER_DIR}/Cedar/Admin.c
@@ -70,7 +70,6 @@ set(CEDAR_SOURCES
     ${SOFTETHER_DIR}/Cedar/Proto_PPP.c
     ${SOFTETHER_DIR}/Cedar/Proto_SSTP.c
     ${SOFTETHER_DIR}/Cedar/Proto_Win7.c
-    ${SOFTETHER_DIR}/Cedar/Proto_WireGuard.c
     ${SOFTETHER_DIR}/Cedar/Protocol.c
     ${SOFTETHER_DIR}/Cedar/Radius.c
     ${SOFTETHER_DIR}/Cedar/Remote.c
@@ -117,11 +116,10 @@ set(MAYAQUA_SOURCES
 # Stub files for Android (replacing Windows-specific components)
 set(STUB_SOURCES
     ${STUBS_DIR}/Bridge_stub.c
-    ${STUBS_DIR}/EtherLog_stub.c
-    ${STUBS_DIR}/NativeStack_stub.c
+    ${STUBS_DIR}/Kernel_stub.c
 )
 
-# JNI Bridge source (real implementation)
+# JNI Bridge source
 set(JNI_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/softether_jni.c
 )
@@ -152,12 +150,18 @@ target_compile_options(softether-native PRIVATE
     -Wno-missing-field-initializers
     -Wno-implicit-function-declaration
     -Wno-incompatible-pointer-types-discards-qualifiers
+    -Wno-unused-function
+    -Wno-unused-but-set-variable
+    -Wno-format
+    -Wno-int-conversion
     -fPIC
     -DUNIX
     -DUNIX_ANDROID
+    -DOS_UNIX
     -D_REENTRANT
     -DOPENSSL_NO_SPEED
     -DNO_VLAN
+    -DNO_BRIDGE
     -include stubs.h
 )
 
