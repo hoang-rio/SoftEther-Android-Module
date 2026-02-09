@@ -90,10 +90,24 @@ static struct {
     // Synchronization
     LOCK* lock;
     EVENT* haltEvent;
+    bool lockInitialized;
 
     // Packet adapter
     PACKET_ADAPTER* packetAdapter;
 } g_client = {0};
+
+// Safe lock/unlock macros
+#define SAFE_LOCK() do { \
+    if (g_client.lock != NULL && g_client.lockInitialized) { \
+        Lock(g_client.lock); \
+    } \
+} while(0)
+
+#define SAFE_UNLOCK() do { \
+    if (g_client.lock != NULL && g_client.lockInitialized) { \
+        Unlock(g_client.lock); \
+    } \
+} while(0)
 
 // Forward declarations
 static void ReportError(int errorCode, const char* message);
@@ -276,6 +290,7 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeInit(JNIEnv* env, jobject 
 
     // Initialize synchronization
     g_client.lock = NewLock();
+    g_client.lockInitialized = true;
     g_client.haltEvent = NewEvent();
     g_client.halt = false;
     g_client.connected = false;
@@ -289,61 +304,56 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeCleanup(JNIEnv* env, jobje
 {
     LOGD("nativeCleanup called");
 
-    // Disconnect if still connected
-    if (g_client.connected) {
-        // Call disconnect directly
-        if (g_client.lock != NULL) {
-            Lock(g_client.lock);
-
-            if (g_client.connected) {
-                g_client.halt = true;
-                g_client.connected = false;
-
-                if (g_client.haltEvent != NULL) {
-                    Set(g_client.haltEvent);
-                }
-            }
-
-            Unlock(g_client.lock);
-
-            // Wait for TUN read thread to finish
-            if (g_client.tunReadThread != NULL) {
-                WaitThread(g_client.tunReadThread, INFINITE);
-                ReleaseThread(g_client.tunReadThread);
-                g_client.tunReadThread = NULL;
-            }
-
-            Lock(g_client.lock);
-
-            // Free IPC
-            if (g_client.ipc != NULL) {
-                FreeIPC(g_client.ipc);
-                g_client.ipc = NULL;
-            }
-
-            // Free packet adapter
-            if (g_client.packetAdapter != NULL) {
-                FreePacketAdapter(g_client.packetAdapter);
-                g_client.packetAdapter = NULL;
-            }
-
-            // Release Cedar
-            if (g_client.cedar != NULL) {
-                ReleaseCedar(g_client.cedar);
-                g_client.cedar = NULL;
-            }
-
-            // Close TUN fd
-            if (g_client.tunFd >= 0) {
-                close(g_client.tunFd);
-                g_client.tunFd = -1;
-            }
-
-            g_client.bytesSent = 0;
-            g_client.bytesReceived = 0;
-
-            Unlock(g_client.lock);
+    // First, signal all threads to halt and mark lock as being destroyed
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        Lock(g_client.lock);
+        g_client.halt = true;
+        g_client.connected = false;
+        if (g_client.haltEvent != NULL) {
+            Set(g_client.haltEvent);
         }
+        Unlock(g_client.lock);
+    }
+
+    // Wait for TUN read thread to finish (outside of lock)
+    if (g_client.tunReadThread != NULL) {
+        WaitThread(g_client.tunReadThread, INFINITE);
+        ReleaseThread(g_client.tunReadThread);
+        g_client.tunReadThread = NULL;
+    }
+
+    // Now safe to cleanup with lock
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        Lock(g_client.lock);
+
+        // Free IPC
+        if (g_client.ipc != NULL) {
+            FreeIPC(g_client.ipc);
+            g_client.ipc = NULL;
+        }
+
+        // Free packet adapter
+        if (g_client.packetAdapter != NULL) {
+            FreePacketAdapter(g_client.packetAdapter);
+            g_client.packetAdapter = NULL;
+        }
+
+        // Release Cedar
+        if (g_client.cedar != NULL) {
+            ReleaseCedar(g_client.cedar);
+            g_client.cedar = NULL;
+        }
+
+        // Close TUN fd
+        if (g_client.tunFd >= 0) {
+            close(g_client.tunFd);
+            g_client.tunFd = -1;
+        }
+
+        g_client.bytesSent = 0;
+        g_client.bytesReceived = 0;
+
+        Unlock(g_client.lock);
     }
 
     // Cleanup synchronization
@@ -352,7 +362,8 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeCleanup(JNIEnv* env, jobje
         g_client.haltEvent = NULL;
     }
 
-    if (g_client.lock != NULL) {
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        g_client.lockInitialized = false;  // Mark as destroyed before deleting
         DeleteLock(g_client.lock);
         g_client.lock = NULL;
     }
@@ -377,6 +388,11 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeConnect(
     jint tunFd)
 {
     LOGD("nativeConnect called with tunFd=%d", tunFd);
+
+    if (g_client.lock == NULL || !g_client.lockInitialized) {
+        LOGE("Lock not initialized");
+        return JNI_FALSE;
+    }
 
     Lock(g_client.lock);
 
@@ -541,7 +557,7 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeDisconnect(JNIEnv* env, jo
 {
     LOGD("nativeDisconnect called");
 
-    if (g_client.lock == NULL) {
+    if (g_client.lock == NULL || !g_client.lockInitialized) {
         return;
     }
 
@@ -606,6 +622,9 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeDisconnect(JNIEnv* env, jo
 JNIEXPORT jint JNICALL
 Java_vn_unlimit_softetherclient_SoftEtherClient_nativeGetStatus(JNIEnv* env, jobject thiz)
 {
+    if (g_client.lock == NULL || !g_client.lockInitialized) {
+        return JNI_STATE_DISCONNECTED;
+    }
     Lock(g_client.lock);
     jint status = g_client.connected ? JNI_STATE_CONNECTED : JNI_STATE_DISCONNECTED;
     Unlock(g_client.lock);
@@ -620,12 +639,13 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeGetStatistics(JNIEnv* env,
         return NULL;
     }
 
-    Lock(g_client.lock);
-    jlong stats[2] = {
-        (jlong)g_client.bytesSent,
-        (jlong)g_client.bytesReceived
-    };
-    Unlock(g_client.lock);
+    jlong stats[2] = {0, 0};
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        Lock(g_client.lock);
+        stats[0] = (jlong)g_client.bytesSent;
+        stats[1] = (jlong)g_client.bytesReceived;
+        Unlock(g_client.lock);
+    }
 
     (*env)->SetLongArrayRegion(env, result, 0, 2, stats);
     return result;
@@ -650,15 +670,17 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeWritePacket(JNIEnv* env, j
 
     bool result = JNI_FALSE;
 
-    Lock(g_client.lock);
-    if (g_client.connected && g_client.tunFd >= 0) {
-        ssize_t written = write(g_client.tunFd, data, len);
-        if (written == len) {
-            g_client.bytesSent += len;
-            result = JNI_TRUE;
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        Lock(g_client.lock);
+        if (g_client.connected && g_client.tunFd >= 0) {
+            ssize_t written = write(g_client.tunFd, data, len);
+            if (written == len) {
+                g_client.bytesSent += len;
+                result = JNI_TRUE;
+            }
         }
+        Unlock(g_client.lock);
     }
-    Unlock(g_client.lock);
 
     (*env)->ReleaseByteArrayElements(env, packet, data, JNI_ABORT);
     return result ? JNI_TRUE : JNI_FALSE;
@@ -683,27 +705,29 @@ Java_vn_unlimit_softetherclient_SoftEtherClient_nativeReadPacket(JNIEnv* env, jo
 
     jint result = -1;
 
-    Lock(g_client.lock);
-    if (g_client.connected && g_client.tunFd >= 0) {
-        // Set non-blocking mode for this read
-        int flags = fcntl(g_client.tunFd, F_GETFL, 0);
-        fcntl(g_client.tunFd, F_SETFL, flags | O_NONBLOCK);
+    if (g_client.lock != NULL && g_client.lockInitialized) {
+        Lock(g_client.lock);
+        if (g_client.connected && g_client.tunFd >= 0) {
+            // Set non-blocking mode for this read
+            int flags = fcntl(g_client.tunFd, F_GETFL, 0);
+            fcntl(g_client.tunFd, F_SETFL, flags | O_NONBLOCK);
 
-        ssize_t len = read(g_client.tunFd, data, bufLen);
+            ssize_t len = read(g_client.tunFd, data, bufLen);
 
-        // Restore blocking mode
-        fcntl(g_client.tunFd, F_SETFL, flags);
+            // Restore blocking mode
+            fcntl(g_client.tunFd, F_SETFL, flags);
 
-        if (len > 0) {
-            g_client.bytesReceived += len;
-            result = (jint)len;
-        } else if (len == 0 || (len < 0 && errno == EAGAIN)) {
-            result = 0; // No data available
-        } else {
-            result = -1; // Error
+            if (len > 0) {
+                g_client.bytesReceived += len;
+                result = (jint)len;
+            } else if (len == 0 || (len < 0 && errno == EAGAIN)) {
+                result = 0; // No data available
+            } else {
+                result = -1; // Error
+            }
         }
+        Unlock(g_client.lock);
     }
-    Unlock(g_client.lock);
 
     (*env)->ReleaseByteArrayElements(env, buffer, data, (result > 0) ? 0 : JNI_ABORT);
     return result;
