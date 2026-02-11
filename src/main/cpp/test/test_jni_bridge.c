@@ -1,5 +1,6 @@
 #include "../jni/softether_jni.h"
 #include "native_test.h"
+#include "softether_protocol.h"
 #include <string.h>
 #include <stdlib.h>
 #include <android/log.h>

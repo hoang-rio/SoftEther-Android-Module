@@ -1,31 +1,44 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("softetherclient")
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Find required libraries
 find_library(log-lib log)
 find_library(android-lib android)
 
-# OpenSSL for crypto - using find_package if available, otherwise manual path
-if(EXISTS "${ANDROID_HOME}/ndk/${ndkVersion}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib")
-    # Android NDK OpenSSL
-    set(OPENSSL_ROOT_DIR "${ANDROID_HOME}/ndk/${ndkVersion}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr")
-endif()
+# Directories
+set(PREBUILT_JNILIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs)
 
-# Try to find OpenSSL package
-find_package(OpenSSL QUIET)
+# Prebuilt OpenSSL libraries
+set(OPENSSL_ROOT ${PREBUILT_JNILIBS_DIR}/${ANDROID_ABI})
+set(OPENSSL_LIBRARIES
+    ${OPENSSL_ROOT}/libssl.a
+    ${OPENSSL_ROOT}/libcrypto.a
+)
 
-# If OpenSSL not found, set paths manually
-if(NOT OPENSSL_FOUND)
-    message(STATUS "OpenSSL package not found, using manual paths")
-    set(OPENSSL_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../openssl/include")
-    set(OPENSSL_LIBRARIES "ssl" "crypto")
+# Check if prebuilt libraries exist
+if(EXISTS ${OPENSSL_ROOT}/libssl.a AND EXISTS ${OPENSSL_ROOT}/libcrypto.a)
+    message(STATUS "Using prebuilt OpenSSL from ${OPENSSL_ROOT}")
+    set(USE_PREBUILT_OPENSSL TRUE)
+else()
+    message(WARNING "Prebuilt OpenSSL not found in ${OPENSSL_ROOT}, trying system OpenSSL")
+    set(USE_PREBUILT_OPENSSL FALSE)
 endif()
 
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/softether-core/include
-    ${OPENSSL_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/openssl/include
 )
+
+# If prebuilt OpenSSL exists, also include its headers from build dir
+if(USE_PREBUILT_OPENSSL)
+    # OpenSSL headers are typically in the build directory after install
+    # For now, we'll use the system headers or create a minimal include dir
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/openssl/include/openssl)
+endif()
 
 # Source files for main library
 set(SOFTETHER_SOURCES
@@ -46,11 +59,27 @@ target_link_libraries(softether
     ${android-lib}
 )
 
-# Link OpenSSL if found
-if(OPENSSL_FOUND)
-    target_link_libraries(softether OpenSSL::SSL OpenSSL::Crypto)
-else()
+# Link prebuilt OpenSSL if available
+if(USE_PREBUILT_OPENSSL)
     target_link_libraries(softether ${OPENSSL_LIBRARIES})
+else()
+    # Fallback to system OpenSSL
+    target_link_libraries(softether ssl crypto)
+endif()
+
+# Compiler flags
+target_compile_options(softether PRIVATE
+    -Wall
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -fPIC
+)
+
+# Debug/Release specific flags
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(softether PRIVATE -g -O0)
+else()
+    target_compile_options(softether PRIVATE -O2)
 endif()
 
 # Test library sources
@@ -67,7 +96,6 @@ add_library(softether_test SHARED ${TEST_SOURCES})
 target_include_directories(softether_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/softether-core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
-    ${OPENSSL_INCLUDE_DIR}
 )
 
 # Link libraries for test library
@@ -76,12 +104,20 @@ target_link_libraries(softether_test
     ${android-lib}
 )
 
-# Link OpenSSL for test library
-if(OPENSSL_FOUND)
-    target_link_libraries(softether_test OpenSSL::SSL OpenSSL::Crypto)
-else()
+# Link prebuilt OpenSSL for test library if available
+if(USE_PREBUILT_OPENSSL)
     target_link_libraries(softether_test ${OPENSSL_LIBRARIES})
+else()
+    target_link_libraries(softether_test ssl crypto)
 endif()
+
+# Compiler flags for test library
+target_compile_options(softether_test PRIVATE
+    -Wall
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -fPIC
+)
 
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

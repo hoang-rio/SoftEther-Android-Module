@@ -10,6 +10,16 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// Forward declarations from serializer.c
+extern int serialize_header(const softether_header_t* header, uint8_t* buffer, size_t buffer_size);
+extern int deserialize_header(const uint8_t* buffer, size_t buffer_size, softether_header_t* header);
+extern int serialize_packet(const softether_header_t* header, const uint8_t* payload,
+                            uint8_t* buffer, size_t buffer_size);
+extern void create_packet_header(softether_header_t* header, uint16_t command,
+                                 uint32_t payload_length, uint32_t session_id,
+                                 uint32_t sequence_num);
+extern const char* command_to_string(uint16_t command);
+
 // Send a packet through the connection
 int softether_send_packet(softether_connection_t* conn, uint16_t command,
                           const uint8_t* payload, uint32_t payload_len) {
