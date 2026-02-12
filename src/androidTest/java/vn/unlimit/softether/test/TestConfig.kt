@@ -25,7 +25,7 @@ object TestConfig {
     // Server filters
     const val MIN_SCORE = 1000
     const val MAX_PING = 500
-    const val MIN_SPEED = 1000000 // 1 Mbps
+    const val MIN_SPEED = 1000000L // 1 Mbps
 
     // VPNGate default credentials
     const val DEFAULT_USERNAME = "vpn"

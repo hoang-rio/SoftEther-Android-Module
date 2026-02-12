@@ -17,7 +17,7 @@ class VpngateServerProvider(private val context: Context) {
 
     companion object {
         private const val TAG = "VpngateServerProvider"
-        private const val VPNGATE_API_URL = "http://www.vpngate.net/api/iphone/"
+        private const val VPNGATE_API_URL = "https://www.vpngate.net/api/iphone/"
         private const val CACHE_DURATION_MS = 5 * 60 * 1000 // 5 minutes
     }
 

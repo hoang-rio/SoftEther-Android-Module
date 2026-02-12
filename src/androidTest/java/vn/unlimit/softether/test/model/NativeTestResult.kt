@@ -11,11 +11,32 @@ data class NativeTestResult(
     val errorCode: Int,
     val errorMessage: String,
     val connectTimeMs: Long,
-    val bytesSent: Long,
-    val bytesReceived: Long,
-    val serverIp: String,
-    val serverPort: Int
+    val bytesSent: Long = 0,
+    val bytesReceived: Long = 0,
+    val serverIp: String = "",
+    val serverPort: Int = 0
 ) : Parcelable {
+
+    /**
+     * Secondary constructor for JNI bridge compatibility.
+     * JNI expects: (ZILjava/lang/String;J)V
+     * This allows native test code to create results with basic info.
+     */
+    constructor(
+        success: Boolean,
+        errorCode: Int,
+        errorMessage: String,
+        connectTimeMs: Long
+    ) : this(
+        success = success,
+        errorCode = errorCode,
+        errorMessage = errorMessage,
+        connectTimeMs = connectTimeMs,
+        bytesSent = 0,
+        bytesReceived = 0,
+        serverIp = "",
+        serverPort = 0
+    )
 
     constructor(parcel: Parcel) : this(
         success = parcel.readByte() != 0.toByte(),
