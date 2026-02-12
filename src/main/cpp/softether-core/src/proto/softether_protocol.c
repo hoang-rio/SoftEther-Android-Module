@@ -55,14 +55,20 @@ void softether_destroy(softether_connection_t* conn) {
         return;
     }
 
-    // Disconnect if still connected
+    // Disconnect if still connected (not disconnected)
+    // Check for any active state
     if (conn->state != STATE_DISCONNECTED) {
+        LOGD("Destroying connection in state: %s", softether_state_string(conn->state));
         softether_disconnect(conn);
     }
 
     // Clear sensitive data
-    memset(conn->username, 0, sizeof(conn->username));
-    memset(conn->password, 0, sizeof(conn->password));
+    if (conn->username[0] != '\0') {
+        memset(conn->username, 0, sizeof(conn->username));
+    }
+    if (conn->password[0] != '\0') {
+        memset(conn->password, 0, sizeof(conn->password));
+    }
 
     free(conn);
     LOGD("Connection destroyed");
@@ -73,6 +79,8 @@ softether_state_t softether_get_state(softether_connection_t* conn) {
     if (conn == NULL) {
         return STATE_DISCONNECTED;
     }
+    // Use memory barrier to ensure we read the latest state
+    __sync_synchronize();
     return conn->state;
 }
 
@@ -418,26 +426,31 @@ void softether_disconnect(softether_connection_t* conn) {
         return;
     }
 
-    if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+    // Save the current state before changing it
+    softether_state_t prev_state = conn->state;
+    
+    if (prev_state == STATE_DISCONNECTED || prev_state == STATE_DISCONNECTING) {
         return;
     }
 
-    LOGD("Disconnecting");
+    LOGD("Disconnecting (previous state: %s)", softether_state_string(prev_state));
     conn->state = STATE_DISCONNECTING;
 
-    // Send disconnect packet if connected
-    if (conn->state == STATE_CONNECTED && conn->socket_fd >= 0) {
+    // Send disconnect packet only if we were fully connected
+    if (prev_state == STATE_CONNECTED && conn->socket_fd >= 0) {
+        LOGD("Sending disconnect packet");
         softether_send_packet(conn, CMD_DISCONNECT, NULL, 0);
 
-        // Wait for disconnect ACK
+        // Wait for disconnect ACK with short timeout
         uint16_t command;
         uint8_t response[256];
         uint32_t response_len;
         softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
     }
 
-    // Shutdown SSL
-    if (conn->ssl != NULL) {
+    // Shutdown SSL only if it was initialized
+    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
+        LOGD("Shutting down SSL");
         ssl_shutdown((ssl_context_t*)conn->ssl);
         ssl_destroy((ssl_context_t*)conn->ssl_ctx);
         conn->ssl = NULL;
@@ -446,6 +459,7 @@ void softether_disconnect(softether_connection_t* conn) {
 
     // Close socket
     if (conn->socket_fd >= 0) {
+        LOGD("Closing socket");
         close(conn->socket_fd);
         conn->socket_fd = -1;
     }

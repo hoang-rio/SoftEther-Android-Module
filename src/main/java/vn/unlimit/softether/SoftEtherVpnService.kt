@@ -109,10 +109,32 @@ class SoftEtherVpnService : VpnService() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Service destroyed")
-        stopVpn()
+        
+        // Cancel any ongoing connection attempt
+        connectionJob?.cancel()
+        connectionJob = null
+        
+        // Clean up resources
+        try {
+            controller?.disconnect()
+            controller = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error disconnecting on destroy", e)
+        }
+        
+        try {
+            vpnInterface?.close()
+            vpnInterface = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing VPN interface on destroy", e)
+        }
+        
         unregisterNetworkReceiver()
         serviceScope.cancel()
     }
+
+    @Volatile
+    private var connectionJob: kotlinx.coroutines.Job? = null
 
     private fun startVpn(config: ConnectionConfig) {
         if (isRunning) {
@@ -125,7 +147,7 @@ class SoftEtherVpnService : VpnService() {
         // Start as foreground service
         startForeground(NOTIFICATION_ID, createNotification("Connecting..."))
 
-        serviceScope.launch {
+        connectionJob = serviceScope.launch {
             try {
                 // Initialize connection controller
                 controller = ConnectionController(
@@ -151,6 +173,10 @@ class SoftEtherVpnService : VpnService() {
                 // Send connected broadcast
                 sendConnectionStateBroadcast(STATE_CONNECTED, config.serverHost)
 
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Connection was cancelled (user pressed cancel)
+                Log.d(TAG, "Connection cancelled by user")
+                sendConnectionStateBroadcast(STATE_DISCONNECTED)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start VPN", e)
                 updateNotification("Connection failed: ${e.message}")
@@ -166,12 +192,20 @@ class SoftEtherVpnService : VpnService() {
         // Send disconnect broadcast
         sendConnectionStateBroadcast(STATE_DISCONNECTED)
 
-        // Disconnect controller
-        controller?.disconnect()
+        // Disconnect controller - this will interrupt any ongoing connection attempt
+        try {
+            controller?.disconnect()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error disconnecting controller", e)
+        }
         controller = null
 
         // Close VPN interface
-        vpnInterface?.close()
+        try {
+            vpnInterface?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing VPN interface", e)
+        }
         vpnInterface = null
 
         // Show disconnected notification (dismissable, no disconnect button)

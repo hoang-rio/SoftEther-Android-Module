@@ -275,6 +275,27 @@ Client                              Server
 
 Phase 5 has been completed with full integration of SoftEther VPN into the main Android app:
 
+### Issue Fixed: Cancel Button During Connection
+**Problem:** When pressing the cancel button while SoftEther was connecting, the disconnect request was not being sent to the SoftEther VPN service, causing the connection to continue in the background.
+
+**Solution:**
+1. Added `isSoftEtherConnecting` flag in `DetailActivity.kt` to track when a SoftEther connection is in progress
+2. Modified the cancel button handler to check this flag and call `disconnectSoftEther()` instead of `stopVpn()` when appropriate
+3. Updated `SoftEtherVpnService.kt` to:
+   - Track the connection coroutine job (`connectionJob`) for proper cancellation
+   - Handle `CancellationException` when user cancels during connection
+   - Properly clean up resources in `onDestroy()`
+4. Updated `ConnectionController.kt` to:
+   - Check `isCancelled` flag at key points during connection
+   - Throw `CancellationException` when cancelled during connection
+   - Properly handle disconnect during connection state
+
+**Files Modified:**
+- `app/src/main/java/vn/unlimit/vpngate/activities/DetailActivity.kt`
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/SoftEtherVpnService.kt`
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/controller/ConnectionController.kt`
+
+
 ### UI Components
 
 **VpnProtocolSelectionDialog.kt:**

@@ -55,7 +55,13 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     
     // Send through SSL if available, otherwise through plain socket
     int bytes_sent = 0;
-    if (conn->ssl != NULL) {
+    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
+        // Check state before SSL operation
+        if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+            LOGE("Connection is disconnected, cannot send");
+            free(packet);
+            return -1;
+        }
         bytes_sent = ssl_write((ssl_context_t*)conn->ssl, packet, serialized_size);
     } else {
         // Create a temporary socket wrapper for plain socket send
@@ -92,13 +98,26 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         return -1;
     }
     
+    // Check if connection is in a valid state for receiving
+    if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+        LOGE("Connection is disconnected or disconnecting, state=%s", 
+             softether_state_string(conn->state));
+        return -1;
+    }
+    
     // First, receive the header
     uint8_t header_buffer[SOFTETHER_HEADER_SIZE];
     int header_received = 0;
     
-    if (conn->ssl != NULL) {
+    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
         // Receive through SSL
         while (header_received < SOFTETHER_HEADER_SIZE) {
+            // Check state again before each SSL operation
+            if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+                LOGE("Connection state changed during receive");
+                return -1;
+            }
+            
             int ret = ssl_read((ssl_context_t*)conn->ssl, 
                               header_buffer + header_received, 
                               SOFTETHER_HEADER_SIZE - header_received);
@@ -157,9 +176,15 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         
         int payload_received = 0;
         
-        if (conn->ssl != NULL) {
+        if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
             // Receive payload through SSL
             while (payload_received < (int)header.payload_length) {
+                // Check state again before each SSL operation
+                if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+                    LOGE("Connection state changed during payload receive");
+                    return -1;
+                }
+                
                 int ret = ssl_read((ssl_context_t*)conn->ssl,
                                   payload + payload_received,
                                   header.payload_length - payload_received);

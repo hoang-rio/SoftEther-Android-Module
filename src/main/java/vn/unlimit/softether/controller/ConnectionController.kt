@@ -67,6 +67,11 @@ class ConnectionController(
      */
     suspend fun connect() {
         connectionMutex.withLock {
+            if (isCancelled.get()) {
+                Log.w(TAG, "Connection cancelled, not starting")
+                return
+            }
+            
             if (currentState != ConnectionState.DISCONNECTED) {
                 Log.w(TAG, "Connection already in progress or established")
                 return
@@ -75,7 +80,12 @@ class ConnectionController(
             try {
                 performConnect()
             } catch (e: Exception) {
-                if (reconnectAttempts.incrementAndGet() < MAX_RECONNECT_ATTEMPTS && !isCancelled.get()) {
+                if (isCancelled.get()) {
+                    Log.d(TAG, "Connection cancelled, not retrying")
+                    return
+                }
+                
+                if (reconnectAttempts.incrementAndGet() < MAX_RECONNECT_ATTEMPTS) {
                     Log.w(TAG, "Connection failed, attempting retry ${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS")
                     delay(RECONNECT_DELAY_MS)
                     connect()
@@ -103,6 +113,15 @@ class ConnectionController(
             throw Exception("Failed to create native connection")
         }
 
+        // Check if already cancelled before proceeding
+        if (isCancelled.get()) {
+            Log.d(TAG, "Connection cancelled before starting")
+            val handle = nativeHandle
+            nativeHandle = 0  // Clear handle first
+            client.nativeDestroy(handle)
+            throw CancellationException("Connection cancelled by user")
+        }
+
         // Set timeout
         client.setTimeout(config.connectTimeoutMs)
 
@@ -117,15 +136,36 @@ class ConnectionController(
             config.password
         )
 
+        // Check if cancelled during connection
+        if (isCancelled.get()) {
+            Log.d(TAG, "Connection was cancelled during connect")
+            val handle = nativeHandle
+            nativeHandle = 0  // Clear handle first
+            client.nativeDisconnect(handle)
+            client.nativeDestroy(handle)
+            throw CancellationException("Connection cancelled by user")
+        }
+
         if (result != 0) {
-            client.nativeDestroy(nativeHandle)
-            nativeHandle = 0
+            val handle = nativeHandle
+            nativeHandle = 0  // Clear handle first
+            client.nativeDestroy(handle)
             throw Exception("Connection failed with error code: $result")
         }
 
         currentState = ConnectionState.CONNECTED
         reconnectAttempts.set(0) // Reset on successful connection
         Log.d(TAG, "VPN connection established successfully")
+
+        // Check if cancelled before establishing VPN interface
+        if (isCancelled.get()) {
+            Log.d(TAG, "Connection cancelled after successful connect, tearing down")
+            val handle = nativeHandle
+            nativeHandle = 0  // Clear handle first
+            client.nativeDisconnect(handle)
+            client.nativeDestroy(handle)
+            throw CancellationException("Connection cancelled by user")
+        }
 
         // Establish VPN interface
         vpnInterface = service.establishVpnInterface(config)
@@ -168,20 +208,41 @@ class ConnectionController(
         Log.d(TAG, "Disconnecting VPN")
         isCancelled.set(true)
 
-        // Update state
-        if (currentState == ConnectionState.CONNECTED) {
-            currentState = ConnectionState.DISCONNECTING
-        }
+        // Use mutex to prevent race with connect()
+        connectionMutex.tryLock()
+        try {
+            // Update state
+            if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
+                currentState = ConnectionState.DISCONNECTING
+            }
 
-        // Disconnect native connection
-        if (nativeHandle != 0L) {
-            client.nativeDisconnect(nativeHandle)
-            client.nativeDestroy(nativeHandle)
-            nativeHandle = 0
+            // Disconnect native connection (this will interrupt any blocking operations)
+            if (nativeHandle != 0L) {
+                val handle = nativeHandle
+                nativeHandle = 0  // Clear the handle first to prevent double-free
+                
+                try {
+                    Log.d(TAG, "Calling nativeDisconnect on handle $handle")
+                    client.nativeDisconnect(handle)
+                    Log.d(TAG, "nativeDisconnect completed, calling nativeDestroy")
+                    client.nativeDestroy(handle)
+                    Log.d(TAG, "nativeDestroy completed")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during native disconnect", e)
+                }
+            }
+        } finally {
+            if (connectionMutex.isLocked) {
+                connectionMutex.unlock()
+            }
         }
 
         // Close VPN interface
-        vpnInterface?.close()
+        try {
+            vpnInterface?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing VPN interface", e)
+        }
         vpnInterface = null
 
         // Cancel all coroutines
@@ -351,9 +412,10 @@ class ConnectionController(
         try {
             // Disconnect current connection
             if (nativeHandle != 0L) {
-                client.nativeDisconnect(nativeHandle)
-                client.nativeDestroy(nativeHandle)
-                nativeHandle = 0
+                val handle = nativeHandle
+                nativeHandle = 0  // Clear handle first
+                client.nativeDisconnect(handle)
+                client.nativeDestroy(handle)
             }
 
             currentState = ConnectionState.CONNECTING

@@ -33,7 +33,13 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDe
     }
     
     softether_connection_t* conn = (softether_connection_t*)handle;
+    
+    // Get state before destroying for logging
+    softether_state_t state = softether_get_state(conn);
+    LOGD("Destroying connection in state: %s", softether_state_string(state));
+    
     softether_destroy(conn);
+    LOGD("nativeDestroy completed");
 }
 
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeConnect(
@@ -78,7 +84,18 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDi
     }
     
     softether_connection_t* conn = (softether_connection_t*)handle;
+    
+    // Check if connection is in a state that can be disconnected
+    softether_state_t state = softether_get_state(conn);
+    if (state == STATE_DISCONNECTED || state == STATE_DISCONNECTING) {
+        LOGD("Connection already disconnected or disconnecting, state=%s", 
+             softether_state_string(state));
+        return;
+    }
+    
+    LOGD("Disconnecting connection in state: %s", softether_state_string(state));
     softether_disconnect(conn);
+    LOGD("nativeDisconnect completed");
 }
 
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSend(
