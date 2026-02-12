@@ -112,9 +112,18 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
 int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                              uint8_t* payload, uint32_t* payload_len, uint32_t max_payload);
 
+// Data tunnel operations
+int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint32_t data_len);
+int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32_t max_len,
+                           uint32_t* received_len, uint16_t* command);
+
 // Keepalive
 int softether_send_keepalive(softether_connection_t* conn);
 int softether_process_keepalive(softether_connection_t* conn);
+
+// Reconnection support
+void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);
+int softether_reconnect(softether_connection_t* conn);
 
 // Utility
 const char* softether_error_string(int error_code);

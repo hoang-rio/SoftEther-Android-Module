@@ -31,6 +31,14 @@ class PacketHandler(private val client: SoftEtherClient) {
     }
 
     /**
+     * Poll next packet from send queue (non-blocking)
+     * @return Next packet or null if queue is empty
+     */
+    fun pollSendQueue(): ByteArray? {
+        return sendQueue.poll()
+    }
+
+    /**
      * Process and send all queued packets
      * @return Number of packets sent
      */
