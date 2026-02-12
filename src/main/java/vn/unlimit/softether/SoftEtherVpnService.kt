@@ -37,6 +37,14 @@ class SoftEtherVpnService : VpnService() {
         const val ACTION_CONNECT = "vn.unlimit.softether.CONNECT"
         const val ACTION_DISCONNECT = "vn.unlimit.softether.DISCONNECT"
 
+        // Broadcast actions
+        const val ACTION_CONNECTION_STATE = "vn.unlimit.softether.CONNECTION_STATE"
+        const val EXTRA_STATE = "state"
+        const val EXTRA_HOSTNAME = "hostname"
+        const val STATE_CONNECTED = "CONNECTED"
+        const val STATE_DISCONNECTED = "DISCONNECTED"
+        const val STATE_ERROR = "ERROR"
+
         // Extras
         const val EXTRA_CONFIG = "config"
     }
@@ -139,6 +147,9 @@ class SoftEtherVpnService : VpnService() {
 
                 Log.d(TAG, "VPN connection established")
                 updateNotification("Connected to ${config.serverHost}")
+                
+                // Send connected broadcast
+                sendConnectionStateBroadcast(STATE_CONNECTED, config.serverHost)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start VPN", e)
@@ -152,6 +163,9 @@ class SoftEtherVpnService : VpnService() {
         Log.d(TAG, "Stopping VPN")
         isRunning = false
 
+        // Send disconnect broadcast
+        sendConnectionStateBroadcast(STATE_DISCONNECTED)
+
         // Disconnect controller
         controller?.disconnect()
         controller = null
@@ -159,6 +173,9 @@ class SoftEtherVpnService : VpnService() {
         // Close VPN interface
         vpnInterface?.close()
         vpnInterface = null
+
+        // Show disconnected notification (dismissable, no disconnect button)
+        showDisconnectedNotification()
 
         // Stop foreground service
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -169,6 +186,47 @@ class SoftEtherVpnService : VpnService() {
         }
 
         stopSelf()
+    }
+
+    /**
+     * Show disconnected notification (dismissable, no action buttons)
+     */
+    private fun showDisconnectedNotification() {
+        // Intent to open DetailActivity when notification is tapped
+        val contentIntent = Intent().apply {
+            setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            this, 0, contentIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("SoftEther VPN")
+            .setContentText("Disconnected")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(contentPendingIntent)
+            .setOngoing(false)  // Dismissable
+            .setAutoCancel(true)  // Auto-dismiss when tapped
+            .build()
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    /**
+     * Send connection state broadcast to update UI
+     */
+    private fun sendConnectionStateBroadcast(state: String, hostname: String = "") {
+        val intent = Intent(ACTION_CONNECTION_STATE).apply {
+            putExtra(EXTRA_STATE, state)
+            if (hostname.isNotEmpty()) {
+                putExtra(EXTRA_HOSTNAME, hostname)
+            }
+        }
+        sendBroadcast(intent)
+        Log.d(TAG, "Sent connection state broadcast: $state")
     }
 
     /**
@@ -222,18 +280,30 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun createNotification(content: String): Notification {
+        // Intent to open DetailActivity when notification is tapped
+        val contentIntent = Intent().apply {
+            setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            this, 0, contentIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Intent for disconnect action button
         val disconnectIntent = Intent(this, SoftEtherVpnService::class.java).apply {
             action = ACTION_DISCONNECT
         }
         val disconnectPendingIntent = PendingIntent.getService(
-            this, 0, disconnectIntent,
+            this, 1, disconnectIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("SoftEther VPN")
             .setContentText(content)
-            .setSmallIcon(android.R.drawable.ic_menu_close_clear_cancel) // Replace with your icon
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(contentPendingIntent)
             .setOngoing(true)
             .setAutoCancel(false)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", disconnectPendingIntent)

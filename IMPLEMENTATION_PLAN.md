@@ -63,8 +63,8 @@ This document outlines the plan for implementing SoftEther VPN protocol in C lan
   - [x] Automatic reconnection logic with retry and backoff
   - [x] Keepalive handling and connection monitoring
   - [x] Connection statistics tracking
-- [ ] Phase 5: Integrate with main Android app
-- [ ] Phase 6: Implement Android instrumentation tests for native code
+- [x] Phase 5: Integrate with main Android app
+- [x] Phase 6: Implement Android instrumentation tests for native code
 - [ ] Phase 7: Testing and validation against vpngate.net servers
 - [ ] Documentation and code review
 
@@ -271,5 +271,228 @@ Client                              Server
 
 ---
 
+## Phase 5 Summary: Main App Integration
+
+Phase 5 has been completed with full integration of SoftEther VPN into the main Android app:
+
+### UI Components
+
+**VpnProtocolSelectionDialog.kt:**
+- Bottom sheet dialog for selecting VPN protocol
+- Shows available protocols: OpenVPN (TCP/UDP) and SoftEther VPN
+- Protocol availability indicators with port information
+- Clean Material Design 3 UI with card-based layout
+- Server info display (hostname, location)
+
+**dialog_vpn_protocol_selection.xml:**
+- Header with server name and close button
+- Server info section with icon and details
+- Three protocol options in card format:
+  - OpenVPN TCP with port status
+  - OpenVPN UDP with port status  
+  - SoftEther VPN with protocol type
+- Visual feedback for unavailable protocols (dimmed)
+- Navigation arrows for each option
+
+### Connection Management
+
+**SoftEtherConnectionHelper.kt:**
+- Manages SoftEther VPN connection lifecycle
+- VPN permission handling with ActivityResultLauncher
+- Connection state broadcast receiver
+- SharedPreferences for connection persistence
+- Excluded apps support for split tunneling
+
+**Key Features:**
+- `connect()` - Initiates connection with VPN permission check
+- `disconnect()` - Clean disconnect from VPN
+- `isConnected()` - Check current connection state
+- `isConnectedTo()` - Check if connected to specific server
+- Connection state listener interface for UI updates
+
+**Integration with DetailActivity:**
+The existing DetailActivity has been extended to support SoftEther:
+- Protocol selection dialog on connect button press
+- SoftEther connection state management
+- UI updates for SoftEther connection status
+- Disconnect handling for SoftEther connections
+- Firebase Analytics tracking for SoftEther connections
+
+### String Resources
+
+**New strings added:**
+- `select_vpn_protocol` - Dialog title
+- `available_protocols` - Section header
+- `openvpn_tcp`, `openvpn_udp`, `softether_vpn` - Protocol names
+- `protocol_available_port` - Port info format
+- `softether_available` - Status text
+- `connecting_softether`, `softether_connected` - Connection status
+- `softether_disconnected`, `softether_disconnected_by_error` - Disconnection status
+
+### Connection Flow
+
+```
+User taps Connect button
+        ↓
+Protocol Selection Dialog opens
+        ↓
+User selects SoftEther VPN
+        ↓
+VPN Permission Check
+        ↓
+SoftEtherVpnService starts with connection extras
+        ↓
+Connection established → UI updates with status
+        ↓
+Broadcast sent → HomeFragment/StatusFragment update
+```
+
+### Compatibility
+
+- **OpenVPN**: Existing OpenVPN integration remains unchanged
+- **SSTP**: MS-SSTP integration remains unchanged
+- **L2TP**: L2TP instructions remain unchanged
+- **SoftEther**: New protocol added alongside existing options
+
+### Key Design Decisions
+
+1. **Bottom Sheet Dialog**: Used instead of new buttons to keep UI clean and consistent with Material Design 3
+2. **Protocol Selection**: Users can see all available protocols in one place
+3. **Availability Indicators**: Protocols not available for a server are shown but disabled
+4. **State Persistence**: Connection state saved in SharedPreferences for app restart handling
+5. **Broadcast Communication**: Uses LocalBroadcastManager for service-to-activity communication
+6. **Helper Pattern**: SoftEtherConnectionHelper follows same pattern as existing SSTP integration
+
+---
+
+## Phase 6 Summary: Android Instrumentation Tests
+
+Phase 6 has been completed with comprehensive Android instrumentation tests for native code:
+
+### Native Test Layer (C/C++)
+
+**native_test.h:**
+- Test result structure with success status, error code, message, and duration
+- Test configuration structure with host, port, credentials, timeouts
+- Function declarations for 8 test types:
+  - `test_tcp_connection()` - Basic TCP connectivity
+  - `test_tls_handshake()` - TLS/SSL handshake validation
+  - `test_softether_handshake()` - Protocol version negotiation
+  - `test_authentication()` - User credential validation
+  - `test_session()` - Full session establishment
+  - `test_data_transmission()` - Data packet send/receive
+  - `test_keepalive()` - Keepalive packet exchange
+  - `test_full_lifecycle()` - Complete connection flow
+
+**native_test.c:**
+- Complete implementations for all 8 test types
+- Proper resource management and cleanup
+- Detailed logging with Android logcat
+- Support for VPNGate server testing with "vpn"/"vpn" credentials
+- Keepalive testing with configurable duration
+- Data transmission testing with packet count and size parameters
+
+**test_jni_bridge.c:**
+- JNI bridge for all native test functions
+- Proper Java string to C string conversion
+- NativeTestResult object creation for Kotlin interop
+- Error handling and resource cleanup
+
+### Kotlin Test Layer
+
+**NativeConnectionTest.kt:**
+- JUnit4 instrumentation test runner
+- 9 comprehensive test methods:
+  - `testTcpConnection()` - Verify TCP connectivity
+  - `testTlsHandshake()` - Verify TLS handshake
+  - `testSoftEtherHandshake()` - Verify protocol handshake
+  - `testAuthentication()` - Verify authentication
+  - `testSessionEstablishment()` - Verify session setup
+  - `testDataTransmission()` - Verify data transfer
+  - `testKeepalive()` - Verify keepalive handling
+  - `testFullConnectionLifecycle()` - Verify complete flow
+  - `testMultipleServers()` - Test against multiple servers
+- Native library loading with error handling
+- VPNGate server provider integration
+
+**VpngateServerProvider.kt:**
+- Fetches server list from VPNGate API
+- Caching with 5-minute TTL
+- CSV parsing for server data
+- Server filtering by score, ping, speed
+- SoftEther compatibility detection
+
+**ServerAvailabilityChecker.kt:**
+- Pre-test server availability validation
+- TCP connectivity checks
+- TLS handshake verification
+- Batch availability checking
+- Server availability status reporting
+
+**TestResultReporter.kt:**
+- Comprehensive test result reporting
+- Markdown report generation
+- File output with automatic cleanup
+- Test run summary with success rates
+- Device and Android version logging
+
+**TestConfig.kt:**
+- Test timeout constants (10s - 40s)
+- Default packet parameters (10 packets, 1024 bytes)
+- Keepalive test duration (30 seconds)
+- Retry settings (3 retries, 2s delay)
+- VPNGate default credentials (vpn/vpn)
+- Server filtering criteria
+
+**NativeTestResult.kt:**
+- Parcelable data class for native test results
+- Error code constants matching native implementation
+- Secondary constructor for JNI compatibility
+- Error message resolution
+
+### Model Classes
+
+**SessionState.kt:**
+- Parcelable session state data class
+- Session ID, IP addresses, DNS servers
+- Traffic statistics (bytes/packets)
+- Connection timing information
+- SessionStatistics helper class for tracking
+
+### Build Configuration
+
+**CMakeLists.txt:**
+- Separate libraries: `softether` (main) and `softether_test` (test)
+- OpenSSL linking for both libraries
+- Prebuilt library support
+- Debug/Release compiler flags
+
+**build.gradle:**
+- Test instrumentation runner configuration
+- Native library build configuration
+- Test dependencies (JUnit, Espresso, Coroutines)
+
+### Test Execution
+
+Tests can be run via:
+```bash
+./gradlew :SoftEtherClient:connectedAndroidTest
+```
+
+Or specific test classes:
+```bash
+./gradlew :SoftEtherClient:connectedAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=vn.unlimit.softether.test.NativeConnectionTest
+```
+
+### Key Features
+1. **Real Server Testing**: Tests run against live VPNGate servers
+2. **Comprehensive Coverage**: 8 test types covering all protocol layers
+3. **Detailed Reporting**: Markdown reports with full test history
+4. **Server Availability**: Pre-check servers before testing
+5. **Error Classification**: Native error codes map to meaningful messages
+6. **Resource Management**: Proper cleanup in all test paths
+
+---
+
 *Last Updated: 2026-02-12*
-*Status: Phase 4 Complete - Ready for Phase 5 (Main App Integration)*
+*Status: Phase 5 & 6 Complete - Ready for Phase 7 (Testing & Validation)*

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <fcntl.h>
 
 #ifdef __cplusplus
 extern "C" {
