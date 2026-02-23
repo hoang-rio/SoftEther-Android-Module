@@ -11,7 +11,8 @@ BUILD_DIR="$SCRIPT_DIR/openssl-build"
 JNILIBS_DIR="$SCRIPT_DIR/../jniLibs"
 
 # Android NDK settings
-export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-/Volumes/HoangND/Sdks/Android/sdk/ndk/28.2.13676358}"
+# ANDROID_NDK_ROOT must be set by user or via environment variable
+export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:?ANDROID_NDK_ROOT must be set}"
 export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"  # OpenSSL uses ANDROID_NDK_HOME
 export ANDROID_API="${ANDROID_API:-23}"
 
@@ -247,7 +248,7 @@ show_usage() {
     echo "  x86_64        x86 64-bit"
     echo ""
     echo "Environment Variables:"
-    echo "  ANDROID_NDK_ROOT    Path to Android NDK (default: /Volumes/HoangND/Sdks/Android/sdk/ndk/28.2.13676358)"
+    echo "  ANDROID_NDK_ROOT    Path to Android NDK (required, must be set)"
     echo "  ANDROID_API         Android API level (default: 23)"
     echo ""
     echo "Examples:"
