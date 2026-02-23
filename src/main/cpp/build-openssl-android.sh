@@ -239,7 +239,8 @@ show_usage() {
     echo "Build OpenSSL for Android"
     echo ""
     echo "Arguments:"
-    echo "  ABI       Target ABI (optional, builds all if not specified)"
+    echo "  ABI           Target ABI (optional, builds all if not specified)"
+    echo "  --headers-only   Generate only headers, skip library build"
     echo ""
     echo "Supported ABIs:"
     echo "  arm64-v8a     ARM 64-bit"
@@ -255,11 +256,21 @@ show_usage() {
     echo "  $0                  Build for all ABIs"
     echo "  $0 arm64-v8a        Build for ARM64 only"
     echo "  $0 x86_64           Build for x86_64 only"
+    echo "  $0 --headers-only   Generate headers only (skip library build)"
 }
 
 # Handle command line
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_usage
+    exit 0
+fi
+
+# Handle header-only mode (skip library build)
+if [ "$1" = "--headers-only" ]; then
+    check_prerequisites
+    generate_headers
+    log_info "Headers generated successfully! OpenSSL libraries were NOT built."
+    log_info "To build libraries, run the script without --headers-only"
     exit 0
 fi
 
