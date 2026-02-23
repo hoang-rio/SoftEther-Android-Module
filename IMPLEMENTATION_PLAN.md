@@ -515,5 +515,90 @@ Or specific test classes:
 
 ---
 
-*Last Updated: 2026-02-12*
-*Status: Phase 5 & 6 Complete - Ready for Phase 7 (Testing & Validation)*
+## Phase 7 Summary: Testing & Validation Against VPNGate Servers
+
+Phase 7 testing infrastructure is ready. Tests require an Android device or emulator to run.
+
+### Test Infrastructure Status
+
+**✅ Test Framework Ready:**
+- Native C test implementations for all 8 test types
+- JNI bridge connecting Kotlin tests to native code
+- VPNGate server provider fetching live servers
+- Test configuration with appropriate timeouts and parameters
+- Full build artifacts (libsoftether.so, libsoftether_test.so)
+
+### Test Coverage
+
+| Test | Description | Timeout |
+|------|-------------|---------|
+| `testTcpConnection` | Basic TCP connectivity | 10s |
+| `testTlsHandshake` | TLS/SSL handshake validation | 10s |
+| `testSoftEtherHandshake` | Protocol version negotiation | 10s |
+| `testAuthentication` | User credential validation | 20s |
+| `testSessionEstablishment` | Full session establishment | 25s |
+| `testDataTransmission` | Data packet send/receive | 30s |
+| `testKeepalive` | Keepalive packet exchange (30s) | 40s |
+| `testFullConnectionLifecycle` | Complete connection flow | 40s |
+| `testMultipleServers` | Test up to 5 servers | Variable |
+
+### Prerequisites for Testing
+
+1. **Android Device/Emulator**: Physical device or emulator running Android 6.0+
+2. **VPNGate API Access**: Tests connect to vpngate.net servers
+3. **Network Permissions**: Internet permission required
+4. **ADB Connection**: For running tests via command line
+
+### Running Tests
+
+**Full test suite:**
+```bash
+./gradlew :SoftEtherClient:connectedAndroidTest
+```
+
+**Specific test class:**
+```bash
+./gradlew :SoftEtherClient:connectedAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=vn.unlimit.softether.test.NativeConnectionTest
+```
+
+**Single test method:**
+```bash
+./gradlew :SoftEtherClient:connectedAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=vn.unlimit.softether.test.NativeConnectionTest#testTcpConnection
+```
+
+### Test Credentials
+
+- **Username**: `vpn`
+- **Password**: `vpn`
+- Default VPNGate anonymous credentials (no registration required)
+
+### Expected Test Results
+
+When run against VPNGate servers, tests validate:
+1. **TCP connectivity** - Server responds on port 443
+2. **TLS handshake** - Server accepts SSL connections
+3. **Protocol handshake** - SoftEther protocol version negotiation
+4. **Authentication** - Accepts "vpn"/"vpn" credentials
+5. **Session setup** - Virtual IP assignment and routing
+6. **Data transmission** - Bidirectional packet flow
+7. **Keepalive** - Connection stability over time
+8. **Full lifecycle** - Complete connection/disconnection cycle
+
+### Troubleshooting
+
+**No servers found:**
+- Check internet connection
+- VPNGate API may be temporarily unavailable
+
+**Tests timing out:**
+- Increase timeout values in `TestConfig.kt`
+- Check network latency to server
+
+**Authentication failures:**
+- Some servers may have disabled anonymous access
+- Try different servers from the list
+
+---
+
+*Last Updated: 2026-02-23*
+*Status: Phase 7 Ready - Testing Infrastructure Complete*
