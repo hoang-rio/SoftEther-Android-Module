@@ -172,16 +172,25 @@ generate_headers() {
     
     # Generate headers using a simple config
     log_info "Configuring for header generation..."
-    ./Configure gcc -DOPENSSL_NO_ASM --prefix=/tmp/openssl-headers 2>/dev/null || true
+    if ! ./Configure gcc -DOPENSSL_NO_ASM --prefix=/tmp/openssl-headers; then
+        log_error "Failed to configure OpenSSL for header generation"
+        exit 1
+    fi
     
     # Generate headers
     log_info "Generating headers..."
-    make build_generated 2>/dev/null || true
+    if ! make build_generated; then
+        log_error "Failed to generate OpenSSL headers"
+        log_error "Build output above"
+        exit 1
+    fi
     
     if [ -f "$OPENSSL_DIR/include/openssl/opensslconf.h" ]; then
         log_info "✓ Headers generated successfully"
     else
-        log_warn "Headers may not have been generated properly"
+        log_error "Headers were not generated properly"
+        log_error "Expected file: $OPENSSL_DIR/include/openssl/opensslconf.h"
+        exit 1
     fi
 }
 
