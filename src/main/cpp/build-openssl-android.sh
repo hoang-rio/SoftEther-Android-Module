@@ -11,9 +11,11 @@ BUILD_DIR="$SCRIPT_DIR/openssl-build"
 JNILIBS_DIR="$SCRIPT_DIR/../jniLibs"
 
 # Android NDK settings
-# ANDROID_NDK_ROOT must be set by user or via environment variable
-export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:?ANDROID_NDK_ROOT must be set}"
-export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"  # OpenSSL uses ANDROID_NDK_HOME
+# ANDROID_NDK_ROOT must be set by user or via environment variable (except for --headers-only)
+if [ -n "$ANDROID_NDK_ROOT" ]; then
+    export ANDROID_NDK_ROOT
+    export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"  # OpenSSL uses ANDROID_NDK_HOME
+fi
 export ANDROID_API="${ANDROID_API:-23}"
 
 # Colors for output
@@ -161,6 +163,13 @@ generate_headers() {
     
     cd "$OPENSSL_DIR"
     
+    # Check if headers already exist in the repository
+    if [ -f "$OPENSSL_DIR/include/openssl/opensslconf.h" ]; then
+        log_info "OpenSSL headers already exist in repository"
+        log_info "✓ Using existing headers from $OPENSSL_DIR/include/openssl/"
+        return 0
+    fi
+    
     # Generate headers using a simple config
     log_info "Configuring for header generation..."
     ./Configure gcc -DOPENSSL_NO_ASM --prefix=/tmp/openssl-headers 2>/dev/null || true
@@ -180,7 +189,7 @@ generate_headers() {
 main() {
     log_info "OpenSSL Android Build Script"
     log_info "============================"
-    log_info "NDK: $ANDROID_NDK_ROOT"
+    log_info "NDK: ${ANDROID_NDK_ROOT:-not set}"
     log_info "API Level: $ANDROID_API"
     log_info "OpenSSL: $OPENSSL_DIR"
     log_info ""
@@ -267,9 +276,15 @@ fi
 
 # Handle header-only mode (skip library build)
 if [ "$1" = "--headers-only" ]; then
-    check_prerequisites
+    # For header-only mode, we just need to verify the OpenSSL directory exists
+    if [ ! -d "$OPENSSL_DIR" ]; then
+        log_error "OpenSSL directory not found at $OPENSSL_DIR"
+        log_error "Please run: git submodule update --init"
+        exit 1
+    fi
+    
     generate_headers
-    log_info "Headers generated successfully! OpenSSL libraries were NOT built."
+    log_info "Headers check completed! OpenSSL libraries were NOT built."
     log_info "To build libraries, run the script without --headers-only"
     exit 0
 fi
