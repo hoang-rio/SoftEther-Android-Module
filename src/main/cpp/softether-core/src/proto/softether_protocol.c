@@ -24,6 +24,78 @@ extern const char* command_to_string(uint16_t command);
 static const char* http_detect_startwith = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">";
 static const char* http_detect_tag = "9C37197CA7C2428388C2E6E59B829B30";
 
+// PACK serialization types
+#define PACK_TYPE_INT      0
+#define PACK_TYPE_INT64    1
+#define PACK_TYPE_BOOL     2
+#define PACK_TYPE_STR      3
+#define PACK_TYPE_DATA     4
+#define PACK_TYPE_UNISTR  5
+#define PACK_TYPE_TIME    6
+
+#define SHA1_SIZE 20
+
+// PACK serialization helpers
+static void pack_write_uint32(uint8_t** buf, uint32_t val) {
+    (*buf)[0] = (val >> 24) & 0xFF;
+    (*buf)[1] = (val >> 16) & 0xFF;
+    (*buf)[2] = (val >> 8) & 0xFF;
+    (*buf)[3] = val & 0xFF;
+    *buf += 4;
+}
+
+static void pack_write_string(uint8_t** buf, const char* str) {
+    uint32_t len = strlen(str);
+    pack_write_uint32(buf, len);
+    memcpy(*buf, str, len);
+    *buf += len;
+}
+
+static void pack_write_data(uint8_t** buf, const uint8_t* data, uint32_t len) {
+    pack_write_uint32(buf, len);
+    memcpy(*buf, data, len);
+    *buf += len;
+}
+
+// Create a PACK buffer for Hello
+static uint8_t* pack_create_hello(const char* client_str, uint32_t ver, uint32_t build, 
+                                   const uint8_t* random, uint32_t* out_len) {
+    uint32_t num_elements = 4;
+    uint32_t size = 4 + 34 + 19 + 17 + 38;  // Pre-calculated
+    
+    uint8_t* buf = (uint8_t*)malloc(size);
+    uint8_t* p = buf;
+    
+    pack_write_uint32(&p, num_elements);
+    
+    // Element 1: hello (string)
+    pack_write_string(&p, "hello");
+    pack_write_uint32(&p, PACK_TYPE_STR);
+    pack_write_uint32(&p, 1);
+    pack_write_string(&p, client_str);
+    
+    // Element 2: version (int)
+    pack_write_string(&p, "version");
+    pack_write_uint32(&p, PACK_TYPE_INT);
+    pack_write_uint32(&p, 1);
+    pack_write_uint32(&p, ver);
+    
+    // Element 3: build (int)
+    pack_write_string(&p, "build");
+    pack_write_uint32(&p, PACK_TYPE_INT);
+    pack_write_uint32(&p, 1);
+    pack_write_uint32(&p, build);
+    
+    // Element 4: random (data)
+    pack_write_string(&p, "random");
+    pack_write_uint32(&p, PACK_TYPE_DATA);
+    pack_write_uint32(&p, 1);
+    pack_write_data(&p, random, SHA1_SIZE);
+    
+    *out_len = p - buf;
+    return buf;
+}
+
 // Perform HTTP detection - Send HTTP GET with X-VPN header to detect SoftEther server
 static int detect_softether_server(softether_connection_t* conn, const char* server_ip) {
     if (conn == NULL || conn->ssl == NULL) {
@@ -280,8 +352,10 @@ static int perform_tls_handshake(softether_connection_t* conn, const char* hostn
     return ERR_NONE;
 }
 
-// Perform protocol handshake with HubName support
-static int perform_protocol_handshake_ex(softether_connection_t* conn, const char* hub_name) {
+// Perform protocol handshake with HubName and credentials support (VPNGate format)
+// VPNGate expects: [version:2][hub_len:2][hub_name][username_len:2][username][password_len:2][password]
+static int perform_protocol_handshake_ex(softether_connection_t* conn, const char* hub_name,
+                                         const char* username, const char* password) {
     if (conn == NULL) {
         return ERR_PROTOCOL_VERSION;
     }
@@ -292,33 +366,70 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
         use_hub = conn->hub_name[0] != '\0' ? conn->hub_name : "VPN";
     }
     
-    size_t hub_name_len = strlen(use_hub);
+    // Use provided credentials or stored credentials
+    const char* use_username = username;
+    const char* use_password = password;
+    if (use_username == NULL || use_username[0] == '\0') {
+        use_username = conn->username;
+    }
+    if (use_password == NULL || use_password[0] == '\0') {
+        use_password = conn->password;
+    }
     
-    LOGD("Starting protocol handshake (hub: %s)", use_hub);
+    size_t hub_name_len = strlen(use_hub);
+    size_t username_len = strlen(use_username);
+    size_t password_len = strlen(use_password);
+    
+    LOGD("Starting protocol handshake (hub: %s, user: %s)", use_hub, use_username);
     conn->state = STATE_PROTOCOL_HANDSHAKE;
 
-    // Build CONNECT packet payload:
-    // [protocol_version:2][hub_name_length:2][hub_name:hub_name_length]
-    size_t payload_len = 2 + 2 + hub_name_len;
+    // Build CONNECT packet payload with credentials (VPNGate format):
+    // [protocol_version:2][hub_name_length:2][hub_name:hub_name_length][username_len:2][username][password_len:2][password]
+    size_t payload_len = 2 + 2 + hub_name_len + 2 + username_len + 2 + password_len;
     uint8_t* hello_payload = (uint8_t*)malloc(payload_len);
     if (hello_payload == NULL) {
         LOGE("Failed to allocate hello payload");
         return ERR_PROTOCOL_VERSION;
     }
     
+    uint32_t offset = 0;
+    
     // Protocol version (2 bytes) - big endian
-    hello_payload[0] = (SOFTETHER_VERSION >> 8) & 0xFF;
-    hello_payload[1] = SOFTETHER_VERSION & 0xFF;
+    hello_payload[offset++] = (SOFTETHER_VERSION >> 8) & 0xFF;
+    hello_payload[offset++] = SOFTETHER_VERSION & 0xFF;
     
     // Hub name length (2 bytes) - big endian
-    hello_payload[2] = (hub_name_len >> 8) & 0xFF;
-    hello_payload[3] = hub_name_len & 0xFF;
+    hello_payload[offset++] = (hub_name_len >> 8) & 0xFF;
+    hello_payload[offset++] = hub_name_len & 0xFF;
     
     // Hub name
-    memcpy(hello_payload + 4, use_hub, hub_name_len);
+    memcpy(hello_payload + offset, use_hub, hub_name_len);
+    offset += hub_name_len;
     
-    LOGD("CONNECT payload: version=0x%04X, hub='%s' (len=%zu)", 
-         SOFTETHER_VERSION, use_hub, hub_name_len);
+    // Username length (2 bytes) - big endian
+    hello_payload[offset++] = (username_len >> 8) & 0xFF;
+    hello_payload[offset++] = username_len & 0xFF;
+    
+    // Username
+    memcpy(hello_payload + offset, use_username, username_len);
+    offset += username_len;
+    
+    // Password length (2 bytes) - big endian
+    hello_payload[offset++] = (password_len >> 8) & 0xFF;
+    hello_payload[offset++] = password_len & 0xFF;
+    
+    // Password
+    memcpy(hello_payload + offset, use_password, password_len);
+    offset += password_len;
+    
+    LOGD("CONNECT payload: version=0x%04X, hub='%s' (len=%zu), user='%s' (len=%zu), pass_len=%zu", 
+         SOFTETHER_VERSION, use_hub, hub_name_len, use_username, username_len, password_len);
+
+    // Debug: print hex dump of payload
+    LOGD("CONNECT payload hex dump:");
+    for (size_t i = 0; i < payload_len; i++) {
+        LOGD("  [%02zu]: 0x%02X", i, hello_payload[i]);
+    }
 
     if (softether_send_packet(conn, CMD_CONNECT, hello_payload, (uint32_t)payload_len) < 0) {
         LOGE("Failed to send HELLO packet");
@@ -333,13 +444,28 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
     uint8_t response[256];
     uint32_t response_len;
 
+    // Set a short timeout for receiving response
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
         LOGE("Failed to receive HELLO_ACK");
+        // Restore timeout
+        tv.tv_sec = conn->timeout_ms / 1000;
+        tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
+        setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         return ERR_PROTOCOL_VERSION;
     }
+    
+    // Restore timeout
+    tv.tv_sec = conn->timeout_ms / 1000;
+    tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (command != CMD_CONNECT_ACK) {
-        LOGE("Expected CONNECT_ACK, got %s", command_to_string(command));
+        LOGE("Expected CONNECT_ACK, got %s (0x%04X)", command_to_string(command), command);
         return ERR_PROTOCOL_VERSION;
     }
 
@@ -361,7 +487,7 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
 
 // Perform protocol handshake (legacy wrapper)
 static int perform_protocol_handshake(softether_connection_t* conn) {
-    return perform_protocol_handshake_ex(conn, NULL);
+    return perform_protocol_handshake_ex(conn, NULL, NULL, NULL);
 }
 
 // Perform authentication
@@ -572,21 +698,119 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
     LOGD("HTTP detection completed (result: %d)", detect_result);
 
-    // Perform protocol handshake with hub name
-    result = perform_protocol_handshake_ex(conn, conn->hub_name);
+    // Step 2: Send HTTP POST to /vpnsvc/connect.cgi (ClientUploadSignature)
+    // This is required before Hello PACK
+    LOGD("Step 2: Sending watermark to /vpnsvc/connect.cgi...");
+    
+    // Send "VPNCONNECT" as the body - this is the required format
+    const char* watermark = "VPNCONNECT";
+    size_t watermark_len = strlen(watermark);
+    
+    char http_post[1024];
+    int post_len = snprintf(http_post, sizeof(http_post),
+        "POST /vpnsvc/connect.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n",
+        host, watermark_len);
+    
+    if (post_len <= 0) {
+        LOGE("Failed to format HTTP POST");
+        softether_disconnect(conn);
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, post_len);
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, watermark, sizeof(watermark));
+    }
+    
+    if (sent <= 0) {
+        LOGE("Failed to send watermark");
+        softether_disconnect(conn);
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    // Wait for response
+    uint8_t resp[1024];
+    int recvd = ssl_read((ssl_context_t*)conn->ssl, resp, sizeof(resp) - 1);
+    if (recvd > 0) {
+        resp[recvd] = '\0';
+        LOGD("Watermark response: %.100s", (char*)resp);
+    }
+    
+    // Step 3: Send Hello PACK to /vpnsvc/vpn.cgi
+    LOGD("Step 3: Sending Hello PACK to /vpnsvc/vpn.cgi...");
+    
+    // Generate random value for hello
+    uint8_t random[20];
+    for (int i = 0; i < 20; i++) {
+        random[i] = (uint8_t)(i * 0x11 + 0x33);
+    }
+    
+    // Create PACK hello
+    uint32_t pack_len;
+    uint8_t* pack = pack_create_hello("SoftEther VPN Client", 4, 9600, random, &pack_len);
+    
+    if (pack != NULL) {
+        LOGD("Created Hello PACK: %u bytes", pack_len);
+        
+        // Send HTTP POST with PACK
+        post_len = snprintf(http_post, sizeof(http_post),
+            "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Connection: Keep-Alive\r\n"
+            "Content-Length: %u\r\n"
+            "\r\n",
+            host, pack_len);
+        
+        sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, post_len);
+        if (sent > 0) {
+            sent = ssl_write((ssl_context_t*)conn->ssl, pack, pack_len);
+            LOGD("Sent Hello PACK: %d bytes", sent);
+        }
+        
+        free(pack);
+        
+        // Wait for server hello response
+        uint8_t hello_resp[4096];
+        recvd = ssl_read((ssl_context_t*)conn->ssl, hello_resp, sizeof(hello_resp) - 1);
+        
+        LOGD("Hello response: %d bytes", recvd);
+        
+        if (recvd > 0) {
+            hello_resp[recvd] = '\0';
+            
+            // Check for HTTP/1.1 200 OK
+            if (strstr((char*)hello_resp, "HTTP/1.1 200") != NULL || 
+                strstr((char*)hello_resp, "HTTP/1.0 200") != NULL) {
+                
+                // Check Content-Type header
+                if (strstr((char*)hello_resp, "application/octet-stream") != NULL) {
+                    LOGD("Got HTTP 200 with correct Content-Type - server accepted Hello!");
+                    // Success! HTTP handshake complete, switch to binary protocol
+                }
+            }
+        }
+    }
+    
+    LOGD("HTTP handshake complete, switching to binary protocol");
+
+    // Perform protocol handshake with hub name and credentials (VPNGate format)
+    result = perform_protocol_handshake_ex(conn, conn->hub_name, username, password);
     if (result != ERR_NONE) {
         LOGE("Protocol handshake failed");
         softether_disconnect(conn);
         return result;
     }
 
-    // Perform authentication
-    result = perform_authentication(conn, username, password);
-    if (result != ERR_NONE) {
-        LOGE("Authentication failed");
-        softether_disconnect(conn);
-        return result;
-    }
+    // Note: Authentication is now included in CONNECT packet for VPNGate
+    // Store credentials for potential reconnection
+    strncpy(conn->username, username, sizeof(conn->username) - 1);
+    strncpy(conn->password, password, sizeof(conn->password) - 1);
 
     // Setup session
     result = setup_session(conn);

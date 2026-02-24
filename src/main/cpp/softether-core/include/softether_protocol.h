@@ -10,7 +10,7 @@ extern "C" {
 
 // Protocol constants
 #define SOFTETHER_SIGNATURE     0x53455448  // 'SETH'
-#define SOFTETHER_VERSION       0x0001
+#define SOFTETHER_VERSION       0x0200
 
 // Command types
 #define CMD_CONNECT             0x0001

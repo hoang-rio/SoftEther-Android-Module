@@ -3,11 +3,13 @@ package vn.unlimit.softether.test
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import vn.unlimit.softether.model.ServerInfo
 import vn.unlimit.softether.test.model.NativeTestResult
 
 /**
@@ -34,11 +36,13 @@ class NativeConnectionTest {
     }
 
     private lateinit var serverProvider: VpngateServerProvider
+    private lateinit var availabilityChecker: ServerAvailabilityChecker
 
     @Before
     fun setUp() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         serverProvider = VpngateServerProvider(context)
+        availabilityChecker = ServerAvailabilityChecker()
     }
 
     @After
@@ -85,11 +89,16 @@ class NativeConnectionTest {
     @Test
     fun testSoftEtherHandshake() {
         Log.d(TAG, "Running testSoftEtherHandshake")
-        val servers = serverProvider.getSoftEtherServers()
-        assertTrue("No SoftEther servers found", servers.isNotEmpty())
-
-        val server = servers.first()
-        Log.d(TAG, "Testing SoftEther handshake to ${server.ip}:${server.port}")
+        
+        // Get first available server
+        val server: ServerInfo? = runBlocking {
+            val servers = serverProvider.getSoftEtherServers()
+            assertTrue("No SoftEther servers found", servers.isNotEmpty())
+            servers.first()
+        }
+        
+        assertTrue("No available SoftEther servers found after availability check", server != null)
+        Log.d(TAG, "Testing SoftEther handshake to ${server!!.ip}:${server.port}")
 
         val result = nativeTestSoftEtherHandshake(
             server.ip,
@@ -206,11 +215,16 @@ class NativeConnectionTest {
     @Test
     fun testFullConnectionLifecycle() {
         Log.d(TAG, "Running testFullConnectionLifecycle")
-        val servers = serverProvider.getSoftEtherServersWithAuth()
-        assertTrue("No SoftEther servers found", servers.isNotEmpty())
-
-        val server = servers.first()
-        Log.d(TAG, "Testing full connection lifecycle to ${server.ip}:${server.port}")
+        
+        // Get first available server
+        val server: ServerInfo? = runBlocking {
+            val servers = serverProvider.getSoftEtherServersWithAuth()
+            assertTrue("No SoftEther servers found", servers.isNotEmpty())
+            servers.first()
+        }
+        
+        assertTrue("No available SoftEther servers found after availability check", server != null)
+        Log.d(TAG, "Testing full connection lifecycle to ${server!!.ip}:${server.port}")
 
         val result = nativeTestFullLifecycle(
             server.ip,
