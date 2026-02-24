@@ -127,13 +127,17 @@ class ConnectionController(
 
         currentState = ConnectionState.TLS_HANDSHAKE
 
-        // Connect to server (includes TLS handshake, protocol handshake, auth, session setup)
-        val result = client.nativeConnect(
+        // Connect to server with hub name (includes TLS handshake, protocol handshake, auth, session setup)
+        // Use virtualHub from config, default to "VPN" if not set
+        val hubName = config.virtualHub.ifEmpty { "VPN" }
+        Log.d(TAG, "Connecting with hub: $hubName")
+        val result = client.nativeConnectWithHub(
             nativeHandle,
             config.serverHost,
             config.serverPort,
             config.username,
-            config.password
+            config.password,
+            hubName
         )
 
         // Check if cancelled during connection
@@ -435,12 +439,15 @@ class ConnectionController(
 
             client.setTimeout(config.connectTimeoutMs)
 
-            val result = client.nativeConnect(
+            // Use hub name for reconnection
+            val hubName = config.virtualHub.ifEmpty { "VPN" }
+            val result = client.nativeConnectWithHub(
                 nativeHandle,
                 config.serverHost,
                 config.serverPort,
                 config.username,
-                config.password
+                config.password,
+                hubName
             )
 
             if (result != 0) {

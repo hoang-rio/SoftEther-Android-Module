@@ -67,14 +67,14 @@ aes_context_t* aes_create(int mode, const uint8_t* key, size_t key_len,
             case 16: cipher = EVP_aes_128_cbc(); break;
             case 24: cipher = EVP_aes_192_cbc(); break;
             case 32: cipher = EVP_aes_256_cbc(); break;
-            default: cipher = EVP_aes_256_cbc(); break;
+            default: cipher = EVP_aes_256_cbc();
         }
     } else {
         switch (key_len) {
             case 16: cipher = EVP_aes_128_gcm(); break;
             case 24: cipher = EVP_aes_192_gcm(); break;
             case 32: cipher = EVP_aes_256_gcm(); break;
-            default: cipher = EVP_aes_256_gcm(); break;
+            default: cipher = EVP_aes_256_gcm();
         }
     }
     
@@ -321,11 +321,27 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
         return -1;
     }
     
+    // Check if there's pending data in the SSL buffer first
+    int pending = SSL_pending(ctx->ssl);
+    if (pending > 0) {
+        LOGD("SSL has %d bytes pending in buffer", pending);
+    }
+    
     int result = SSL_read(ctx->ssl, buffer, (int)len);
     if (result < 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
         if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
             LOGE("SSL read error: %d", ssl_error);
+        }
+    } else if (result == 0) {
+        // Check if connection was closed or just no data available
+        int ssl_error = SSL_get_error(ctx->ssl, result);
+        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+            LOGD("SSL connection closed by peer");
+        } else if (ssl_error == SSL_ERROR_SYSCALL) {
+            LOGE("SSL read syscall error");
+        } else {
+            LOGD("SSL read returned 0, error: %d", ssl_error);
         }
     }
     return result;

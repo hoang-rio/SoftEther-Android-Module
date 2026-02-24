@@ -53,6 +53,14 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         return -1;
     }
     
+    LOGD("Sending packet: cmd=%s(0x%04X), total_size=%d, session_id=0x%08X, seq=%u",
+         command_to_string(command), command, serialized_size, header.session_id, header.sequence_num - 1);
+    
+    // Log first few bytes for debugging
+    LOGD("Packet header hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+         packet[0], packet[1], packet[2], packet[3], packet[4], packet[5], packet[6], packet[7],
+         packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14], packet[15]);
+    
     // Send through SSL if available, otherwise through plain socket
     int bytes_sent = 0;
     if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
@@ -63,6 +71,7 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
             return -1;
         }
         bytes_sent = ssl_write((ssl_context_t*)conn->ssl, packet, serialized_size);
+        LOGD("SSL write result: %d", bytes_sent);
     } else {
         // Create a temporary socket wrapper for plain socket send
         softether_socket_t temp_sock;
@@ -79,8 +88,8 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         return -1;
     }
     
-    LOGD("Sent packet: cmd=%s(0x%04X), payload=%u bytes", 
-         command_to_string(command), command, payload_len);
+    LOGD("Sent packet: cmd=%s(0x%04X), payload=%u bytes, sent=%d", 
+         command_to_string(command), command, payload_len, bytes_sent);
     
     return bytes_sent;
 }
@@ -105,6 +114,8 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         return -1;
     }
     
+    LOGD("Waiting for packet response...");
+    
     // First, receive the header
     uint8_t header_buffer[SOFTETHER_HEADER_SIZE];
     int header_received = 0;
@@ -122,10 +133,11 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                               header_buffer + header_received, 
                               SOFTETHER_HEADER_SIZE - header_received);
             if (ret <= 0) {
-                LOGE("SSL read failed during header receive");
+                LOGE("SSL read failed during header receive, ret=%d", ret);
                 return -1;
             }
             header_received += ret;
+            LOGD("Header receive progress: %d/%d bytes", header_received, SOFTETHER_HEADER_SIZE);
         }
     } else {
         // Receive through plain socket
@@ -140,12 +152,25 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         }
     }
     
+    LOGD("Received header bytes: %d", header_received);
+    
+    // Log raw header bytes
+    LOGD("Received header hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+         header_buffer[0], header_buffer[1], header_buffer[2], header_buffer[3], 
+         header_buffer[4], header_buffer[5], header_buffer[6], header_buffer[7],
+         header_buffer[8], header_buffer[9], header_buffer[10], header_buffer[11], 
+         header_buffer[12], header_buffer[13], header_buffer[14], header_buffer[15]);
+    
     // Deserialize header
     softether_header_t header;
     if (deserialize_header(header_buffer, SOFTETHER_HEADER_SIZE, &header) < 0) {
         LOGE("Failed to deserialize header");
         return -1;
     }
+    
+    LOGD("Parsed header: sig=0x%08X, ver=0x%04X, cmd=0x%04X, payload_len=%u, session_id=0x%08X, seq=%u",
+         header.signature, header.version, header.command, header.payload_length, 
+         header.session_id, header.sequence_num);
     
     // Validate signature
     if (header.signature != SOFTETHER_SIGNATURE) {
@@ -189,10 +214,11 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                                   payload + payload_received,
                                   header.payload_length - payload_received);
                 if (ret <= 0) {
-                    LOGE("SSL read failed during payload receive");
+                    LOGE("SSL read failed during payload receive, ret=%d", ret);
                     return -1;
                 }
                 payload_received += ret;
+                LOGD("Payload receive progress: %d/%d bytes", payload_received, header.payload_length);
             }
         } else {
             // Receive payload through plain socket

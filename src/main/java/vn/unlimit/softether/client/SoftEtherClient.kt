@@ -30,7 +30,22 @@ class SoftEtherClient {
      */
     @Throws(ConnectionException::class)
     fun connect(host: String, port: Int, username: String, password: String) {
-        Log.d(tag, "Connecting to $host:$port as $username")
+        connect(host, port, username, password, DEFAULT_HUB_NAME)
+    }
+
+    /**
+     * Connect to SoftEther VPN server with hub name
+     *
+     * @param host Server hostname or IP address
+     * @param port Server port (typically 443, 992, or 5555)
+     * @param username Authentication username
+     * @param password Authentication password
+     * @param hubName Virtual hub name (default: "VPN" for VPNGate)
+     * @throws ConnectionException if connection fails
+     */
+    @Throws(ConnectionException::class)
+    fun connect(host: String, port: Int, username: String, password: String, hubName: String) {
+        Log.d(tag, "Connecting to $host:$port as $username (hub: $hubName)")
 
         // Create native connection
         nativeHandle = nativeCreate()
@@ -41,8 +56,8 @@ class SoftEtherClient {
         // Set default timeout
         nativeSetOption(nativeHandle, OPTION_TIMEOUT, 30000L)
 
-        // Connect to server
-        val result = nativeConnect(nativeHandle, host, port, username, password)
+        // Connect to server with hub name
+        val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName)
 
         if (result != SoftEtherError.ERR_NONE) {
             nativeDestroy(nativeHandle)
@@ -150,6 +165,14 @@ class SoftEtherClient {
         username: String,
         password: String
     ): Int
+    external fun nativeConnectWithHub(
+        handle: Long,
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        hubName: String
+    ): Int
     external fun nativeDisconnect(handle: Long)
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
@@ -160,6 +183,9 @@ class SoftEtherClient {
         const val OPTION_TIMEOUT = 1
         const val OPTION_KEEPALIVE_INTERVAL = 2
         const val OPTION_MTU = 3
+        
+        // Default hub name for VPNGate servers
+        const val DEFAULT_HUB_NAME = "VPN"
     }
 }
 

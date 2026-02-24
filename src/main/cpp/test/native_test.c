@@ -7,10 +7,135 @@
 #include <unistd.h>
 #include <time.h>
 #include <android/log.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 #define TAG "NativeTest"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// HTTP detection response patterns from official SoftEther source
+static const char* http_detect_startwith = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">";
+static const char* http_detect_tag = "9C37197CA7C2428388C2E6E59B829B30";
+
+// Helper: Send HTTP GET with X-VPN header to detect SoftEther server
+static int detect_softether_server(softether_connection_t* conn, const char* server_ip) {
+    // Build HTTP GET request with X-VPN header
+    char http_request[512];
+    int offset = 0;
+    
+    // HTTP GET request line
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "GET / HTTP/1.1\r\n");
+    
+    // Required headers
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "X-VPN: 1\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Host: %s\r\n", server_ip);
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Keep-Alive: timeout=15\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Connection: Keep-Alive\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Accept-Language: ja\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "User-Agent: SoftEther VPN Client\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Pragma: no-cache\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Cache-Control: no-cache\r\n");
+    
+    // End of headers
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset, "\r\n");
+    
+    LOGD("Sending HTTP detection request");
+    
+    // Send HTTP request over SSL
+    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_request, strlen(http_request));
+    if (sent <= 0) {
+        LOGE("Failed to send HTTP detection request");
+        return -1;
+    }
+    
+    // Receive HTTP response
+    uint8_t recv_buffer[2048];
+    int total_received = 0;
+    int received;
+    
+    // Set a timeout for receiving
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    while (total_received < (int)sizeof(recv_buffer) - 1) {
+        received = ssl_read((ssl_context_t*)conn->ssl, recv_buffer + total_received, 
+                           sizeof(recv_buffer) - total_received - 1);
+        
+        if (received <= 0) {
+            break;
+        }
+        total_received += received;
+        
+        // Check if we have complete HTTP headers
+        recv_buffer[total_received] = '\0';
+        if (strstr((char*)recv_buffer, "\r\n\r\n") != NULL) {
+            break;
+        }
+    }
+    
+    // Restore original timeout
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    if (total_received <= 0) {
+        LOGE("Failed to receive HTTP response");
+        return -1;
+    }
+    
+    recv_buffer[total_received] = '\0';
+    LOGD("HTTP detection response (%d bytes): %.256s", total_received, (char*)recv_buffer);
+    
+    // Check for SoftEther detection patterns
+    // Pattern 1: HTTP 403 Forbidden response (SoftEther returns this when accessed without proper protocol)
+    if (strstr((char*)recv_buffer, "HTTP/1.1 403") != NULL || 
+        strstr((char*)recv_buffer, "HTTP/1.0 403") != NULL) {
+        LOGD("Detected SoftEther VPN server (403 Forbidden response)");
+        return 1; // Detected
+    }
+    
+    // Pattern 2: DOCTYPE in response body
+    if (strncmp((char*)recv_buffer, http_detect_startwith, strlen(http_detect_startwith)) == 0) {
+        LOGD("Detected SoftEther VPN server (DOCTYPE response)");
+        return 1; // Detected
+    }
+    
+    // Pattern 3: Check anywhere in the response for DOCTYPE
+    if (strstr((char*)recv_buffer, http_detect_startwith) != NULL) {
+        LOGD("Detected SoftEther VPN server (DOCTYPE found in body)");
+        return 1; // Detected
+    }
+    
+    // Pattern 4: Magic tag
+    if (strstr((char*)recv_buffer, http_detect_tag) != NULL) {
+        LOGD("Detected SoftEther VPN server (magic tag found)");
+        return 1; // Detected
+    }
+    
+    // Pattern 5: Check for "VPN" in response which indicates SoftEther
+    if (strstr((char*)recv_buffer, "VPN") != NULL || 
+        strstr((char*)recv_buffer, "vpn") != NULL) {
+        LOGD("Detected potential VPN server");
+        return 1; // Possibly detected
+    }
+    
+    LOGD("Server does not appear to be SoftEther VPN");
+    return 0; // Not detected (or not a SoftEther server)
+}
 
 // Get current timestamp in milliseconds
 long get_test_timestamp_ms(void) {
@@ -187,6 +312,25 @@ native_test_result_t test_softether_handshake(const native_test_config_t* config
 
     conn->ssl = ssl_ctx;
     conn->ssl_ctx = ssl_ctx;
+    
+    // Step 1: HTTP detection - Send HTTP GET with X-VPN header
+    LOGD("Performing HTTP detection phase...");
+    int detect_result = detect_softether_server(conn, config->host);
+    
+    if (detect_result < 0) {
+        // Detection failed (connection issue)
+        softether_disconnect(conn);
+        softether_destroy(conn);
+        long duration = get_test_timestamp_ms() - start_time;
+        test_result_init(&result, false, ERR_TLS_HANDSHAKE,
+                        "HTTP detection failed", duration);
+        return result;
+    }
+    
+    LOGD("HTTP detection completed (result: %d)", detect_result);
+    
+    // Set connection state to protocol handshake
+    conn->state = STATE_PROTOCOL_HANDSHAKE;
 
     // Send protocol HELLO
     uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};  // Version 1
@@ -276,6 +420,13 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
 
     conn->ssl = ssl_ctx;
     conn->ssl_ctx = ssl_ctx;
+    
+    // HTTP detection phase
+    LOGD("Performing HTTP detection phase...");
+    int detect_result = detect_softether_server(conn, config->host);
+    
+    // Continue regardless of detection result
+    conn->state = STATE_CONNECTED;
 
     // Protocol handshake
     uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};
@@ -391,6 +542,10 @@ native_test_result_t test_session(const native_test_config_t* config) {
 
     conn->ssl = ssl_ctx;
     conn->ssl_ctx = ssl_ctx;
+
+    // HTTP detection phase
+    detect_softether_server(conn, config->host);
+    conn->state = STATE_CONNECTED;
 
     // Protocol handshake
     uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};

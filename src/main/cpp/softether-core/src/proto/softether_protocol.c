@@ -6,6 +6,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 // Forward declaration of command_to_string from serializer.c
 extern const char* command_to_string(uint16_t command);
@@ -15,6 +19,133 @@ extern const char* command_to_string(uint16_t command);
 #define TAG "SoftEtherProtocol"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// HTTP detection response patterns from official SoftEther source
+static const char* http_detect_startwith = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">";
+static const char* http_detect_tag = "9C37197CA7C2428388C2E6E59B829B30";
+
+// Perform HTTP detection - Send HTTP GET with X-VPN header to detect SoftEther server
+static int detect_softether_server(softether_connection_t* conn, const char* server_ip) {
+    if (conn == NULL || conn->ssl == NULL) {
+        return -1;
+    }
+
+    LOGD("Performing HTTP detection phase...");
+    
+    // Build HTTP GET request with X-VPN header
+    char http_request[512];
+    int offset = 0;
+    
+    // HTTP GET request line
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "GET / HTTP/1.1\r\n");
+    
+    // Required headers
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "X-VPN: 1\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Host: %s\r\n", server_ip);
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Keep-Alive: timeout=15\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Connection: Keep-Alive\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Accept-Language: ja\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "User-Agent: SoftEther VPN Client\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Pragma: no-cache\r\n");
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
+                       "Cache-Control: no-cache\r\n");
+    
+    // End of headers
+    offset += snprintf(http_request + offset, sizeof(http_request) - offset, "\r\n");
+    
+    LOGD("Sending HTTP detection request");
+    
+    // Send HTTP request over SSL
+    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_request, strlen(http_request));
+    if (sent <= 0) {
+        LOGE("Failed to send HTTP detection request");
+        return -1;
+    }
+    
+    // Receive HTTP response
+    uint8_t recv_buffer[2048];
+    int total_received = 0;
+    int received;
+    
+    // Set a timeout for receiving
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    while (total_received < (int)sizeof(recv_buffer) - 1) {
+        received = ssl_read((ssl_context_t*)conn->ssl, recv_buffer + total_received, 
+                           sizeof(recv_buffer) - total_received - 1);
+        
+        if (received <= 0) {
+            break;
+        }
+        total_received += received;
+        
+        // Check if we have complete HTTP headers
+        recv_buffer[total_received] = '\0';
+        if (strstr((char*)recv_buffer, "\r\n\r\n") != NULL) {
+            break;
+        }
+    }
+    
+    // Restore original timeout
+    tv.tv_sec = conn->timeout_ms / 1000;
+    tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    if (total_received <= 0) {
+        LOGE("Failed to receive HTTP response");
+        return -1;
+    }
+    
+    recv_buffer[total_received] = '\0';
+    LOGD("HTTP detection response (%d bytes): %.256s", total_received, (char*)recv_buffer);
+    
+    // Check for SoftEther detection patterns
+    // Pattern 1: HTTP 403 Forbidden response (SoftEther returns this when accessed without proper protocol)
+    if (strstr((char*)recv_buffer, "HTTP/1.1 403") != NULL || 
+        strstr((char*)recv_buffer, "HTTP/1.0 403") != NULL) {
+        LOGD("Detected SoftEther VPN server (403 Forbidden response)");
+        return 1; // Detected
+    }
+    
+    // Pattern 2: DOCTYPE in response body
+    if (strncmp((char*)recv_buffer, http_detect_startwith, strlen(http_detect_startwith)) == 0) {
+        LOGD("Detected SoftEther VPN server (DOCTYPE response)");
+        return 1; // Detected
+    }
+    
+    // Pattern 3: Check anywhere in the response for DOCTYPE
+    if (strstr((char*)recv_buffer, http_detect_startwith) != NULL) {
+        LOGD("Detected SoftEther VPN server (DOCTYPE found in body)");
+        return 1; // Detected
+    }
+    
+    // Pattern 4: Magic tag
+    if (strstr((char*)recv_buffer, http_detect_tag) != NULL) {
+        LOGD("Detected SoftEther VPN server (magic tag found)");
+        return 1; // Detected
+    }
+    
+    // Pattern 5: Check for "VPN" in response which indicates SoftEther
+    if (strstr((char*)recv_buffer, "VPN") != NULL || 
+        strstr((char*)recv_buffer, "vpn") != NULL) {
+        LOGD("Detected potential VPN server");
+        return 1; // Possibly detected
+    }
+    
+    LOGD("Server does not appear to be SoftEther VPN");
+    return 0; // Not detected (or not a SoftEther server)
+}
 
 // Helper function to get current time in milliseconds
 static long get_current_time_ms() {
@@ -38,6 +169,9 @@ softether_connection_t* softether_create(void) {
     conn->timeout_ms = 30000;  // Default 30 second timeout
     conn->ssl_ctx = NULL;
     conn->ssl = NULL;
+    
+    // Set default hub name
+    strncpy(conn->hub_name, "VPN", sizeof(conn->hub_name) - 1);
 
     // Initialize callbacks to NULL
     conn->on_connect = NULL;
@@ -146,26 +280,53 @@ static int perform_tls_handshake(softether_connection_t* conn, const char* hostn
     return ERR_NONE;
 }
 
-// Perform protocol handshake
-static int perform_protocol_handshake(softether_connection_t* conn) {
+// Perform protocol handshake with HubName support
+static int perform_protocol_handshake_ex(softether_connection_t* conn, const char* hub_name) {
     if (conn == NULL) {
         return ERR_PROTOCOL_VERSION;
     }
 
-    LOGD("Starting protocol handshake");
+    // Use provided hub name or default
+    const char* use_hub = hub_name;
+    if (use_hub == NULL || use_hub[0] == '\0') {
+        use_hub = conn->hub_name[0] != '\0' ? conn->hub_name : "VPN";
+    }
+    
+    size_t hub_name_len = strlen(use_hub);
+    
+    LOGD("Starting protocol handshake (hub: %s)", use_hub);
     conn->state = STATE_PROTOCOL_HANDSHAKE;
 
-    // Send HELLO packet
-    uint8_t hello_payload[4];
-    hello_payload[0] = (SOFTETHER_VERSION >> 8) & 0xFF;
-    hello_payload[1] = SOFTETHER_VERSION & 0xFF;
-    hello_payload[2] = 0;  // Reserved
-    hello_payload[3] = 0;  // Reserved
-
-    if (softether_send_packet(conn, CMD_CONNECT, hello_payload, sizeof(hello_payload)) < 0) {
-        LOGE("Failed to send HELLO packet");
+    // Build CONNECT packet payload:
+    // [protocol_version:2][hub_name_length:2][hub_name:hub_name_length]
+    size_t payload_len = 2 + 2 + hub_name_len;
+    uint8_t* hello_payload = (uint8_t*)malloc(payload_len);
+    if (hello_payload == NULL) {
+        LOGE("Failed to allocate hello payload");
         return ERR_PROTOCOL_VERSION;
     }
+    
+    // Protocol version (2 bytes) - big endian
+    hello_payload[0] = (SOFTETHER_VERSION >> 8) & 0xFF;
+    hello_payload[1] = SOFTETHER_VERSION & 0xFF;
+    
+    // Hub name length (2 bytes) - big endian
+    hello_payload[2] = (hub_name_len >> 8) & 0xFF;
+    hello_payload[3] = hub_name_len & 0xFF;
+    
+    // Hub name
+    memcpy(hello_payload + 4, use_hub, hub_name_len);
+    
+    LOGD("CONNECT payload: version=0x%04X, hub='%s' (len=%zu)", 
+         SOFTETHER_VERSION, use_hub, hub_name_len);
+
+    if (softether_send_packet(conn, CMD_CONNECT, hello_payload, (uint32_t)payload_len) < 0) {
+        LOGE("Failed to send HELLO packet");
+        free(hello_payload);
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    free(hello_payload);
 
     // Receive HELLO_ACK
     uint16_t command;
@@ -196,6 +357,11 @@ static int perform_protocol_handshake(softether_connection_t* conn) {
 
     LOGD("Protocol handshake successful");
     return ERR_NONE;
+}
+
+// Perform protocol handshake (legacy wrapper)
+static int perform_protocol_handshake(softether_connection_t* conn) {
+    return perform_protocol_handshake_ex(conn, NULL);
 }
 
 // Perform authentication
@@ -342,16 +508,29 @@ static int setup_session(softether_connection_t* conn) {
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
+    return softether_connect_with_hub(conn, host, port, username, password, "VPN");
+}
+
+// Connect with HubName
+int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
+                               const char* username, const char* password, const char* hub_name) {
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
 
-    LOGD("Connecting to %s:%d", host, port);
+    LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
     conn->state = STATE_CONNECTING;
 
     // Store server info
     strncpy(conn->server_ip, host, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
+    
+    // Store hub name
+    if (hub_name != NULL && hub_name[0] != '\0') {
+        strncpy(conn->hub_name, hub_name, sizeof(conn->hub_name) - 1);
+    } else {
+        strncpy(conn->hub_name, "VPN", sizeof(conn->hub_name) - 1);
+    }
 
     // Create socket and connect
     softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
@@ -384,8 +563,17 @@ int softether_connect(softether_connection_t* conn, const char* host, int port,
         return result;
     }
 
-    // Perform protocol handshake
-    result = perform_protocol_handshake(conn);
+    // Perform HTTP detection - SoftEther server detection
+    int detect_result = detect_softether_server(conn, host);
+    if (detect_result < 0) {
+        LOGE("HTTP detection failed");
+        softether_disconnect(conn);
+        return ERR_TLS_HANDSHAKE;
+    }
+    LOGD("HTTP detection completed (result: %d)", detect_result);
+
+    // Perform protocol handshake with hub name
+    result = perform_protocol_handshake_ex(conn, conn->hub_name);
     if (result != ERR_NONE) {
         LOGE("Protocol handshake failed");
         softether_disconnect(conn);
@@ -649,6 +837,6 @@ int softether_reconnect(softether_connection_t* conn) {
     }
 
     // Attempt reconnection with stored credentials
-    return softether_connect(conn, conn->server_ip, conn->server_port,
-                             conn->username, conn->password);
+    return softether_connect_with_hub(conn, conn->server_ip, conn->server_port,
+                                      conn->username, conn->password, conn->hub_name);
 }

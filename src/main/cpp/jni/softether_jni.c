@@ -74,6 +74,41 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
     return result;
 }
 
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeConnectWithHub(
+    JNIEnv *env, jobject thiz, jlong handle, jstring host, jint port, 
+    jstring username, jstring password, jstring hubName) {
+    LOGD("nativeConnectWithHub called");
+    
+    if (handle == 0) {
+        LOGE("Invalid handle");
+        return ERR_UNKNOWN;
+    }
+    
+    const char* host_str = (*env)->GetStringUTFChars(env, host, NULL);
+    const char* username_str = (*env)->GetStringUTFChars(env, username, NULL);
+    const char* password_str = (*env)->GetStringUTFChars(env, password, NULL);
+    const char* hub_name_str = (*env)->GetStringUTFChars(env, hubName, NULL);
+    
+    if (host_str == NULL || username_str == NULL || password_str == NULL || hub_name_str == NULL) {
+        LOGE("Failed to get string parameters");
+        if (host_str) (*env)->ReleaseStringUTFChars(env, host, host_str);
+        if (username_str) (*env)->ReleaseStringUTFChars(env, username, username_str);
+        if (password_str) (*env)->ReleaseStringUTFChars(env, password, password_str);
+        if (hub_name_str) (*env)->ReleaseStringUTFChars(env, hubName, hub_name_str);
+        return ERR_UNKNOWN;
+    }
+    
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    int result = softether_connect_with_hub(conn, host_str, port, username_str, password_str, hub_name_str);
+    
+    (*env)->ReleaseStringUTFChars(env, host, host_str);
+    (*env)->ReleaseStringUTFChars(env, username, username_str);
+    (*env)->ReleaseStringUTFChars(env, password, password_str);
+    (*env)->ReleaseStringUTFChars(env, hubName, hub_name_str);
+    
+    return result;
+}
+
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDisconnect(
     JNIEnv *env, jobject thiz, jlong handle) {
     LOGD("nativeDisconnect called");

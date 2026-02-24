@@ -81,6 +81,7 @@ typedef struct softether_connection {
     int server_port;
     char username[256];
     char password[256];
+    char hub_name[256];  // Virtual Hub name (required for CONNECT)
     int timeout_ms;
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
@@ -96,6 +97,8 @@ softether_connection_t* softether_create(void);
 void softether_destroy(softether_connection_t* conn);
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password);
+int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
+                               const char* username, const char* password, const char* hub_name);
 void softether_disconnect(softether_connection_t* conn);
 
 // State management
