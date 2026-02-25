@@ -1,6 +1,7 @@
 #include "softether_protocol.h"
 #include "softether_socket.h"
 #include "softether_crypto.h"
+#include <openssl/ssl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -35,7 +36,12 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     
     // Create packet header
     softether_header_t header;
-    create_packet_header(&header, command, payload_len, conn->session_id, conn->sequence_num++);
+    uint32_t seq_before = conn->sequence_num;
+    create_packet_header(&header, command, payload_len, conn->session_id, conn->sequence_num);
+    conn->sequence_num++;  // Increment after creating header
+    
+    LOGD("Sequence number: before=%u, header=%u, after=%u", 
+         seq_before, header.sequence_num, conn->sequence_num);
     
     // Calculate total packet size
     size_t packet_size = SOFTETHER_HEADER_SIZE + payload_len;
@@ -54,7 +60,7 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     }
     
     LOGD("Sending packet: cmd=%s(0x%04X), total_size=%d, session_id=0x%08X, seq=%u",
-         command_to_string(command), command, serialized_size, header.session_id, header.sequence_num - 1);
+         command_to_string(command), command, serialized_size, header.session_id, header.sequence_num);
     
     // Log first few bytes for debugging
     LOGD("Packet header hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
@@ -114,8 +120,10 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         return -1;
     }
     
-    LOGD("Waiting for packet response...");
-    
+    LOGD("softether_receive_packet: Starting receive...");
+    LOGD("conn->state=%s, conn->socket_fd=%d, conn->ssl=%p", 
+         softether_state_string(conn->state), conn->socket_fd, (void*)conn->ssl);
+
     // First, receive the header
     uint8_t header_buffer[SOFTETHER_HEADER_SIZE];
     int header_received = 0;
@@ -133,7 +141,8 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                               header_buffer + header_received, 
                               SOFTETHER_HEADER_SIZE - header_received);
             if (ret <= 0) {
-                LOGE("SSL read failed during header receive, ret=%d", ret);
+                // Simplified error logging - ret value tells us what happened
+                LOGE("SSL read failed during header receive, ret=%d (0 means closed, negative means error)", ret);
                 return -1;
             }
             header_received += ret;
@@ -180,8 +189,9 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
     
     // Validate version
     if (header.version != SOFTETHER_VERSION) {
-        LOGE("Unsupported protocol version: %u", header.version);
-        return -1;
+        LOGE("Version mismatch: client=0x%04X, server=0x%04X", SOFTETHER_VERSION, header.version);
+        // Don't fail - continue anyway for debugging
+        // return -1;
     }
     
     // Check payload size

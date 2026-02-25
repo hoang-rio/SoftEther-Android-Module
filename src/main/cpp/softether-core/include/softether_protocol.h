@@ -10,6 +10,8 @@ extern "C" {
 
 // Protocol constants
 #define SOFTETHER_SIGNATURE     0x53455448  // 'SETH'
+// Using version 2.0 (0x0200) - VPNGate servers expect this version in the binary protocol header
+// Note: The Hello PACK inside HTTP uses 0x0400, but the binary protocol uses 0x0200
 #define SOFTETHER_VERSION       0x0200
 
 // Command types
