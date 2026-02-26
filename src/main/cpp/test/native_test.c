@@ -797,16 +797,16 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
     // Send HTTP header with AUTH command prefixed
     uint8_t cmd_prefix[4] = {0x00, 0x03, (auth_len >> 8) & 0xFF, auth_len & 0xFF};  // AUTH command + length
     
-    int http_sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_auth, http_len);
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
+    int auth_sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_auth, http_len);
+    if (auth_sent > 0) {
+        auth_sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
     }
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, auth_payload, auth_len);
+    if (auth_sent > 0) {
+        auth_sent = ssl_write((ssl_context_t*)conn->ssl, auth_payload, auth_len);
     }
     free(auth_payload);
     
-    if (sent <= 0) {
+    if (auth_sent <= 0) {
         softether_disconnect(conn);
         softether_destroy(conn);
         long duration = get_test_timestamp_ms() - start_time;
@@ -886,8 +886,6 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
 
     test_result_init(&result, false, ERR_AUTHENTICATION,
                     "Authentication failed", duration);
-    return result;
-    LOGD("Authentication test passed in %ld ms", duration);
     return result;
 }
 

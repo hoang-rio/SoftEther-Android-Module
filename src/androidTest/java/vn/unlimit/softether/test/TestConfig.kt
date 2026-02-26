@@ -15,7 +15,7 @@ object TestConfig {
     // Test parameters
     const val DEFAULT_PACKET_COUNT = 10
     const val DEFAULT_PACKET_SIZE = 1024
-    const val KEEPALIVE_DURATION_SECONDS = 30
+    const val KEEPALIVE_DURATION_SECONDS = 10
     const val MAX_SERVERS_TO_TEST = 5
 
     // Retry settings

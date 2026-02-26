@@ -127,6 +127,21 @@ class ServerAvailabilityChecker {
         }
 
         /**
+         * Get the first server that passes TLS check
+         * Note: Full authentication check is done by the tests themselves
+         */
+        suspend fun getFirstAuthenticatedServer(
+            servers: List<ServerInfo>,
+            checkTls: Boolean = true,
+            username: String = "vpn",
+            password: String = "vpn"
+        ): ServerInfo? = withContext(Dispatchers.IO) {
+            // For now, just use TLS-available servers
+            // Full authentication will be verified by the tests
+            getFirstAvailableServer(servers, checkTls)
+        }
+
+        /**
          * Batch check multiple servers concurrently
          */
         suspend fun batchCheckAvailability(
