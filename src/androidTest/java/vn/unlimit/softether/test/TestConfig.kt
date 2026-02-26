@@ -5,12 +5,12 @@ package vn.unlimit.softether.test
  */
 object TestConfig {
 
-    // Timeouts (in milliseconds)
-    const val DEFAULT_TIMEOUT_MS = 10000
-    const val AUTH_TIMEOUT_MS = 20000
-    const val SESSION_TIMEOUT_MS = 25000
-    const val DATA_TIMEOUT_MS = 30000
-    const val LIFECYCLE_TIMEOUT_MS = 40000
+    // Timeouts (in milliseconds) - increased for slow VPNGate servers
+    const val DEFAULT_TIMEOUT_MS = 30000
+    const val AUTH_TIMEOUT_MS = 60000
+    const val SESSION_TIMEOUT_MS = 60000
+    const val DATA_TIMEOUT_MS = 60000
+    const val LIFECYCLE_TIMEOUT_MS = 90000
 
     // Test parameters
     const val DEFAULT_PACKET_COUNT = 10
