@@ -11,6 +11,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import vn.unlimit.softether.model.ServerInfo
 import vn.unlimit.softether.test.model.NativeTestResult
+import kotlin.random.Random
 
 /**
  * Instrumented tests for native SoftEther implementation
@@ -56,7 +57,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getServers()
         assertTrue("No servers available from vpngate.net", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing TCP connection to ${server.ip}:${server.port}")
 
         val result = nativeTestTcpConnection(server.ip, server.port, TestConfig.DEFAULT_TIMEOUT_MS)
@@ -74,7 +75,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getServers()
         assertTrue("No servers available", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing TLS handshake to ${server.ip}:${server.port}")
 
         val result = nativeTestTlsHandshake(server.ip, server.port, TestConfig.DEFAULT_TIMEOUT_MS)
@@ -94,7 +95,7 @@ class NativeConnectionTest {
         val server: ServerInfo? = runBlocking {
             val servers = serverProvider.getSoftEtherServers()
             assertTrue("No SoftEther servers found", servers.isNotEmpty())
-            servers.first()
+            servers.random()
         }
         
         assertTrue("No available SoftEther servers found after availability check", server != null)
@@ -119,7 +120,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getSoftEtherServersWithAuth()
         assertTrue("No SoftEther servers found", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing authentication to ${server.ip}:${server.port}")
 
         val result = nativeTestAuthentication(
@@ -143,7 +144,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getSoftEtherServersWithAuth()
         assertTrue("No SoftEther servers found", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing session establishment to ${server.ip}:${server.port}")
 
         val result = nativeTestSession(
@@ -167,7 +168,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getSoftEtherServersWithAuth()
         assertTrue("No SoftEther servers found", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing data transmission to ${server.ip}:${server.port}")
 
         val result = nativeTestDataTransmission(
@@ -193,7 +194,7 @@ class NativeConnectionTest {
         val servers = serverProvider.getSoftEtherServersWithAuth()
         assertTrue("No SoftEther servers found", servers.isNotEmpty())
 
-        val server = servers.first()
+        val server = servers.random()
         Log.d(TAG, "Testing keepalive to ${server.ip}:${server.port} for ${TestConfig.KEEPALIVE_DURATION_SECONDS}s")
 
         val result = nativeTestKeepalive(
@@ -220,7 +221,7 @@ class NativeConnectionTest {
         val server: ServerInfo? = runBlocking {
             val servers = serverProvider.getSoftEtherServersWithAuth()
             assertTrue("No SoftEther servers found", servers.isNotEmpty())
-            servers.first()
+            servers.random()
         }
         
         assertTrue("No available SoftEther servers found after availability check", server != null)
