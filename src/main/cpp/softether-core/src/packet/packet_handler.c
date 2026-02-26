@@ -183,7 +183,23 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
     
     // Validate signature
     if (header.signature != SOFTETHER_SIGNATURE) {
-        LOGE("Invalid packet signature: 0x%08X", header.signature);
+        // Check if we got an HTTP response instead of binary protocol
+        if (header_buffer[0] == 'H' && header_buffer[1] == 'T' && 
+            header_buffer[2] == 'T' && header_buffer[3] == 'P') {
+            // Read the rest of the HTTP response
+            uint8_t http_response[1024];
+            int http_len = 0;
+            if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
+                http_len = ssl_read((ssl_context_t*)conn->ssl, http_response, sizeof(http_response) - 1);
+            }
+            if (http_len > 0) {
+                http_response[http_len] = '\0';
+                LOGE("Received HTTP response (%d bytes): %.500s", http_len, (char*)http_response);
+            }
+            LOGE("Received HTTP response instead of binary protocol - server may require HTTP mode");
+        } else {
+            LOGE("Invalid packet signature: 0x%08X", header.signature);
+        }
         return -1;
     }
     

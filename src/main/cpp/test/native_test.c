@@ -728,7 +728,7 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
     
     // Wait a Small amount to let server process our request
     usleep(50000); // 50ms delay
-    
+
     // Continue regardless of detection result
     conn->state = STATE_CONNECTED;
 
@@ -755,9 +755,14 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
         LOGD("Using Hello from watermark response - handshake complete!");
     }
 
-    // Send authentication
+    // For VPNGate servers, we need to send AUTH via HTTP POST to /vpnsvc/vpn.cgi
+    // The server expects all binary data to be wrapped in HTTP requests
+    LOGD("=== Step 4: Sending AUTH via HTTP POST ===");
+    
+    // Build AUTH payload
     size_t username_len = strlen(config->username);
     size_t password_len = strlen(config->password);
+    LOGD("Username: %s, password_len: %zu", config->username, password_len);
     size_t auth_len = 2 + username_len + 2 + password_len;
     uint8_t* auth_payload = (uint8_t*)malloc(auth_len);
 
@@ -777,26 +782,111 @@ native_test_result_t test_authentication(const native_test_config_t* config) {
     auth_payload[3 + username_len] = password_len & 0xFF;
     memcpy(auth_payload + 4 + username_len, config->password, password_len);
 
-    softether_send_packet(conn, CMD_AUTH, auth_payload, auth_len);
+    // Send AUTH via HTTP POST
+    char http_auth[2048];
+    int http_len = snprintf(http_auth, sizeof(http_auth),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: %zu\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        config->host, auth_len + 4);  // +4 for command (CMD_AUTH = 0x0003)
+    
+    // Send HTTP header with AUTH command prefixed
+    uint8_t cmd_prefix[4] = {0x00, 0x03, (auth_len >> 8) & 0xFF, auth_len & 0xFF};  // AUTH command + length
+    
+    int http_sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_auth, http_len);
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
+    }
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, auth_payload, auth_len);
+    }
     free(auth_payload);
+    
+    if (sent <= 0) {
+        softether_disconnect(conn);
+        softether_destroy(conn);
+        long duration = get_test_timestamp_ms() - start_time;
+        test_result_init(&result, false, ERR_AUTHENTICATION,
+                        "Failed to send AUTH via HTTP", duration);
+        return result;
+    }
 
-    uint16_t command;
-    uint8_t response[256];
-    uint32_t response_len;
-    int ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
+    // Wait for auth response via HTTP
+    uint8_t http_resp[4096];
+    int recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
+    
     long duration = get_test_timestamp_ms() - start_time;
+    
+    if (recvd > 0) {
+        http_resp[recvd] = '\0';
+        LOGD("Auth response received: %d bytes", recvd);
+        
+        // Check if we got HTTP 200 with binary content
+        if (strstr((char*)http_resp, "HTTP/1.1 200") != NULL ||
+            strstr((char*)http_resp, "HTTP/1.0 200") != NULL) {
+            
+            // Check for Content-Type: application/octet-stream
+            if (strstr((char*)http_resp, "application/octet-stream") != NULL) {
+                // Extract binary response
+                char* body = strstr((char*)http_resp, "\r\n\r\n");
+                if (body) {
+                    body += 4;
+                    uint32_t body_len = recvd - (body - (char*)http_resp);
+                    if (body_len >= 4) {
+                        // First 2 bytes are command, next 2 are length
+                        uint16_t resp_cmd = ((uint16_t)body[0] << 8) | body[1];
+                        LOGD("AUTH response command: 0x%04X", resp_cmd);
+                        
+                        // Log the full binary content for debugging
+                        LOGD("Full response body (%u bytes):", body_len);
+                        for (uint32_t i = 0; i < body_len && i < 64; i++) {
+                            LOGD("  [%02X] %02X", i, (unsigned char)body[i]);
+                        }
+                        
+                        // Try parsing from different offsets
+                        if (body_len >= 4) {
+                            // Try offset 0 (current)
+                            uint16_t cmd0 = ((uint16_t)body[0] << 8) | body[1];
+                            LOGD("Command at offset 0: 0x%04X", cmd0);
+                            
+                            // Try offset 2 (if first 2 bytes are length)
+                            uint16_t cmd2 = ((uint16_t)body[2] << 8) | body[3];
+                            LOGD("Command at offset 2: 0x%04X", cmd2);
+                            
+                            if (cmd0 == CMD_AUTH_SUCCESS || cmd0 == CMD_AUTH_CHALLENGE || cmd0 == 0x0000) {
+                                softether_disconnect(conn);
+                                softether_destroy(conn);
+                                test_result_init(&result, true, ERR_NONE,
+                                                "Authentication successful", duration);
+                                return result;
+                            }
+                            if (cmd2 == CMD_AUTH_SUCCESS || cmd2 == CMD_AUTH_CHALLENGE || cmd2 == 0x0000) {
+                                softether_disconnect(conn);
+                                softether_destroy(conn);
+                                test_result_init(&result, true, ERR_NONE,
+                                                "Authentication successful", duration);
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check for error response
+        LOGD("Auth response: %.500s", (char*)http_resp);
+    }
 
     softether_disconnect(conn);
     softether_destroy(conn);
 
-    if (ret < 0 || (command != CMD_AUTH_SUCCESS && command != CMD_AUTH_CHALLENGE)) {
-        test_result_init(&result, false, ERR_AUTHENTICATION,
-                        "Authentication failed", duration);
-        return result;
-    }
-
-    test_result_init(&result, true, ERR_NONE,
-                    "Authentication successful", duration);
+    test_result_init(&result, false, ERR_AUTHENTICATION,
+                    "Authentication failed", duration);
+    return result;
     LOGD("Authentication test passed in %ld ms", duration);
     return result;
 }
@@ -860,10 +950,10 @@ native_test_result_t test_session(const native_test_config_t* config) {
     
     // Send VPNCONNECT watermark BEFORE binary protocol - this is critical!
     LOGD("Sending VPNCONNECT watermark...");
-    
+
     const char* watermark = "VPNCONNECT";
     size_t watermark_len = strlen(watermark);
-    
+
     char http_post[1024];
     int post_len = snprintf(http_post, sizeof(http_post),
         "POST /vpnsvc/connect.cgi HTTP/1.1\r\n"
@@ -874,29 +964,66 @@ native_test_result_t test_session(const native_test_config_t* config) {
         "User-Agent: SoftEther VPN Client\r\n"
         "\r\n",
         config->host, watermark_len);
-    
+
     int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, post_len);
     if (sent > 0) {
         sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)watermark, watermark_len);
     }
-    
-    // Receive watermark response (ignore errors - continue anyway)
+
+    // Receive watermark response and check if it contains Hello
+    int got_hello_from_watermark = 0;
     if (sent > 0) {
         uint8_t resp[2048];
         int recvd = ssl_read((ssl_context_t*)conn->ssl, resp, sizeof(resp) - 1);
         if (recvd > 0) {
             LOGD("Watermark response received: %d bytes", recvd);
+            
+            // Check if response contains Hello PACK
+            if (strstr((char*)resp, "HTTP/1.1 200") != NULL || 
+                strstr((char*)resp, "HTTP/1.0 200") != NULL) {
+                if (strstr((char*)resp, "application/octet-stream") != NULL) {
+                    char* body = strstr((char*)resp, "\r\n\r\n");
+                    if (body) {
+                        body += 4;
+                        uint32_t body_len = recvd - (body - (char*)resp);
+                        if (body_len > 10) {
+                            LOGD("Found Hello PACK in watermark response! Body len=%u", body_len);
+                            got_hello_from_watermark = 1;
+                            // We got the Hello - handshake is complete!
+                        }
+                    }
+                }
+            }
         }
     }
-    
+
     // Wait a small amount to let server process our request
     usleep(50000); // 50ms delay
-    
+
     conn->state = STATE_CONNECTED;
 
-    // Protocol handshake
-    uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};
-    softether_send_packet(conn, CMD_CONNECT, hello_payload, sizeof(hello_payload));
+    // Protocol handshake - only if we didn't get Hello from watermark
+    if (!got_hello_from_watermark) {
+        LOGD("No Hello in watermark response, trying binary protocol...");
+        uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};
+        softether_send_packet(conn, CMD_CONNECT, hello_payload, sizeof(hello_payload));
+
+        uint16_t command;
+        uint8_t response[256];
+        uint32_t response_len;
+        int ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
+
+        if (ret < 0 || command != CMD_CONNECT_ACK) {
+            softether_disconnect(conn);
+            softether_destroy(conn);
+            long duration = get_test_timestamp_ms() - start_time;
+            test_result_init(&result, false, ERR_PROTOCOL_VERSION,
+                            "Protocol handshake failed", duration);
+            return result;
+        }
+    } else {
+        LOGD("Using Hello from watermark response - handshake complete, proceeding to auth!");
+    }
 
     uint16_t command;
     uint8_t response[256];

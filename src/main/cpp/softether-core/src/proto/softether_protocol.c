@@ -283,9 +283,10 @@ static int send_vpnconnect_watermark(softether_connection_t* conn, const char* s
                 if (parse_server_hello((const uint8_t*)body, body_len, &hello_info) == 0) {
                     LOGD("Successfully parsed server Hello!");
                     // Server hello parsed - we have the server's version and random
+                    return 1;  // Return 1 to indicate Hello was received
                 }
                 
-                return 0;  // Success - we got the server's Hello
+                return 1;  // Return 1 if we got HTTP 200 with body (likely Hello)
             }
         }
     }
@@ -293,7 +294,7 @@ static int send_vpnconnect_watermark(softether_connection_t* conn, const char* s
     // Even if we didn't get the Hello in the response, continue
     // The server might send it in a separate message or expect us to wait
     LOGD("No Hello in watermark response, proceeding anyway");
-    return 0;
+    return 0;  // Return 0 when no Hello found
 }
 
 // Perform HTTP detection - Send HTTP GET with X-VPN header to detect SoftEther server
@@ -672,6 +673,7 @@ static int perform_authentication(softether_connection_t* conn, const char* user
     memcpy(auth_payload + offset, password, password_len);
 
     // Send AUTH_REQUEST
+    LOGD("Sending AUTH_REQUEST with username='%s', password_len=%zu", username, password_len);
     if (softether_send_packet(conn, CMD_AUTH, auth_payload, auth_payload_len) < 0) {
         LOGE("Failed to send AUTH packet");
         free(auth_payload);
@@ -685,11 +687,14 @@ static int perform_authentication(softether_connection_t* conn, const char* user
     uint8_t response[256];
     uint32_t response_len;
 
+    LOGD("Waiting for auth response...");
     if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
         LOGE("Failed to receive auth response");
         return ERR_AUTHENTICATION;
     }
 
+    LOGD("Received auth response: command=0x%04X (%s), len=%u", command, command_to_string(command), response_len);
+    
     if (command == CMD_AUTH_CHALLENGE) {
         // Handle challenge-response authentication if needed
         LOGD("Received authentication challenge");
@@ -715,6 +720,109 @@ static int perform_authentication(softether_connection_t* conn, const char* user
 
     LOGD("Authentication successful");
     return ERR_NONE;
+}
+
+// Send authentication via HTTP POST to vpn.cgi (for VPNGate servers behind HTTP proxy)
+static int perform_authentication_http(softether_connection_t* conn, const char* username, const char* password) {
+    if (conn == NULL || username == NULL || password == NULL) {
+        return ERR_AUTHENTICATION;
+    }
+
+    LOGD("Starting HTTP authentication for user: %s", username);
+    conn->state = STATE_AUTHENTICATING;
+
+    // Store credentials
+    strncpy(conn->username, username, sizeof(conn->username) - 1);
+    strncpy(conn->password, password, sizeof(conn->password) - 1);
+
+    // Build AUTH_REQUEST payload
+    size_t username_len = strlen(username);
+    size_t password_len = strlen(password);
+    size_t auth_payload_len = 2 + username_len + 2 + password_len;
+    uint8_t* auth_payload = (uint8_t*)malloc(auth_payload_len);
+
+    if (auth_payload == NULL) {
+        LOGE("Failed to allocate auth payload");
+        return ERR_AUTHENTICATION;
+    }
+
+    // Format: [username_len:2][username][password_len:2][password]
+    uint32_t offset = 0;
+    auth_payload[offset++] = (username_len >> 8) & 0xFF;
+    auth_payload[offset++] = username_len & 0xFF;
+    memcpy(auth_payload + offset, username, username_len);
+    offset += username_len;
+    auth_payload[offset++] = (password_len >> 8) & 0xFF;
+    auth_payload[offset++] = password_len & 0xFF;
+    memcpy(auth_payload + offset, password, password_len);
+
+    // Build HTTP POST to /vpnsvc/vpn.cgi
+    char http_auth[2048];
+    int http_len = snprintf(http_auth, sizeof(http_auth),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: %zu\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        conn->server_ip, auth_payload_len + 4);  // +4 for command prefix
+
+    // Send HTTP header with AUTH command prefixed
+    uint8_t cmd_prefix[4] = {0x00, 0x03, (auth_payload_len >> 8) & 0xFF, auth_payload_len & 0xFF};
+
+    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_auth, http_len);
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
+    }
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, auth_payload, auth_payload_len);
+    }
+    free(auth_payload);
+
+    if (sent <= 0) {
+        LOGE("Failed to send AUTH via HTTP");
+        return ERR_AUTHENTICATION;
+    }
+
+    // Wait for auth response via HTTP
+    uint8_t http_resp[4096];
+    int recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
+
+    if (recvd > 0) {
+        http_resp[recvd] = '\0';
+        LOGD("Auth response received: %d bytes", recvd);
+
+        // Check if we got HTTP 200 with binary content
+        if (strstr((char*)http_resp, "HTTP/1.1 200") != NULL ||
+            strstr((char*)http_resp, "HTTP/1.0 200") != NULL) {
+
+            // Check for Content-Type: application/octet-stream
+            if (strstr((char*)http_resp, "application/octet-stream") != NULL) {
+                // Extract binary response
+                char* body = strstr((char*)http_resp, "\r\n\r\n");
+                if (body) {
+                    body += 4;
+                    uint32_t body_len = recvd - (body - (char*)http_resp);
+                    if (body_len >= 4) {
+                        // Try parsing from offset 2 (CMD_AUTH is at body[2:3])
+                        uint16_t cmd = ((uint16_t)body[2] << 8) | body[3];
+                        LOGD("AUTH response command: 0x%04X", cmd);
+
+                        if (cmd == CMD_AUTH_SUCCESS || cmd == CMD_AUTH_CHALLENGE || cmd == 0x0000) {
+                            LOGD("Authentication successful via HTTP");
+                            return ERR_NONE;
+                        }
+                    }
+                }
+            }
+        }
+
+        LOGD("Auth response: %.500s", (char*)http_resp);
+    }
+
+    LOGE("Authentication failed via HTTP");
+    return ERR_AUTHENTICATION;
 }
 
 // Setup session
@@ -849,8 +957,13 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // The native test does this and it's required for VPNGate servers
     LOGD("Calling send_vpnconnect_watermark...");
     int watermark_result = send_vpnconnect_watermark(conn, host);
-    if (watermark_result != 0) {
-        LOGW("VPNCONNECT watermark failed (result: %d), continuing anyway", watermark_result);
+    int got_hello_in_watermark = 0;
+    
+    // Check if we got Hello in watermark response
+    if (watermark_result == 0) {
+        // We successfully parsed the watermark response - this means we got the Hello!
+        got_hello_in_watermark = 1;
+        LOGD("Got server Hello in watermark response - skipping binary CONNECT");
     }
     
     // Wait a small amount to let server process our request
@@ -860,24 +973,25 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     conn->state = STATE_CONNECTED;
     LOGD("Set conn->state = STATE_CONNECTED for binary protocol");
 
-    // Try protocol handshake (CONNECT) - simplified format matching native test
-    // Note: The watermark response may contain the server Hello, so we proceed to 
-    // authentication which handles both cases
-    result = perform_protocol_handshake_ex(conn, conn->hub_name, username, password);
-    
-    if (result == ERR_TIMEOUT) {
-        // Binary protocol timed out - this is expected for VPNGate servers
-        // that send Hello in watermark response but don't respond to binary CONNECT
-        LOGW("Binary protocol timed out, but watermark was sent - continuing to auth");
-        result = ERR_NONE;  // Consider this OK if watermark succeeded
-    }
-    
-    if (result != ERR_NONE) {
-        // Binary protocol failed - this is expected for VPNGate servers that only support HTTP
-        // For now, return a more descriptive error
-        LOGE("Binary protocol handshake failed - server may require HTTP-only mode");
-        softether_disconnect(conn);
-        return ERR_PROTOCOL_VERSION;
+    // Only try binary protocol if we didn't get Hello from watermark
+    if (!got_hello_in_watermark) {
+        LOGD("No Hello in watermark, trying binary CONNECT...");
+        result = perform_protocol_handshake_ex(conn, conn->hub_name, username, password);
+        
+        if (result == ERR_TIMEOUT) {
+            // Binary protocol timed out - this is expected for VPNGate servers
+            LOGW("Binary protocol timed out, but watermark was sent - continuing to auth");
+            result = ERR_NONE;  // Consider this OK if watermark succeeded
+        }
+        
+        if (result != ERR_NONE) {
+            // Binary protocol failed
+            LOGE("Binary protocol handshake failed - server may require HTTP-only mode");
+            softether_disconnect(conn);
+            return ERR_PROTOCOL_VERSION;
+        }
+    } else {
+        LOGD("Using Hello from watermark - handshake complete, proceeding to auth");
     }
 
     LOGD("CONNECT successful, proceeding to authentication");
@@ -888,8 +1002,15 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     strncpy(conn->password, password, sizeof(conn->password) - 1);
     conn->password[sizeof(conn->password) - 1] = '\0';
 
-    // Perform authentication (since we removed username/password from CONNECT payload)
-    result = perform_authentication(conn, username, password);
+    // Try HTTP authentication first (for VPNGate servers behind HTTP proxy)
+    LOGD("Trying HTTP authentication first...");
+    result = perform_authentication_http(conn, username, password);
+    
+    // If HTTP auth fails, try binary authentication
+    if (result != ERR_NONE) {
+        LOGD("HTTP auth failed, trying binary authentication...");
+        result = perform_authentication(conn, username, password);
+    }
     if (result != ERR_NONE) {
         LOGE("Authentication failed with result: %d", result);
         softether_disconnect(conn);

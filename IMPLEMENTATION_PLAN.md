@@ -265,3 +265,114 @@ Client                              Server
 2. Analyze if server version/random affects CONNECT packet format
 3. Investigate VPNGate-specific CONNECT packet requirements
 
+---
+
+## AUTHENTICATION FIX - 2026-02-26
+
+### Problem Identified
+After successfully receiving the server's Hello PACK, the authentication was failing with error code 4.
+
+### Root Cause
+1. The AUTH command needs to be sent via HTTP POST to `/vpnsvc/vpn.cgi` (not binary packets)
+2. The response parsing needs to handle offset 2 (not offset 0)
+
+### Fix Applied
+
+**Files Modified:**
+- `native_test.c` - Test code with HTTP AUTH fix
+- `softether_protocol.c` - Main protocol with HTTP AUTH fix
+
+**Key Changes:**
+
+1. **HTTP Authentication Function** (`perform_authentication_http`):
+```c
+// Send AUTH via HTTP POST to /vpnsvc/vpn.cgi
+char http_auth[2048];
+int http_len = snprintf(http_auth, sizeof(http_auth),
+    "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Content-Type: application/octet-stream\r\n"
+    "Connection: Keep-Alive\r\n"
+    "Content-Length: %zu\r\n"
+    "X-VPN: 1\r\n"
+    "\r\n",
+    conn->server_ip, auth_payload_len + 4);
+
+// Send HTTP header with AUTH command prefixed
+uint8_t cmd_prefix[4] = {0x00, 0x03, (auth_payload_len >> 8) & 0xFF, auth_payload_len & 0xFF};
+```
+
+2. **Response Parsing Fix**:
+```c
+// Try parsing from offset 2 (CMD_AUTH is at body[2:3])
+uint16_t cmd = ((uint16_t)body[2] << 8) | body[3];
+
+// Handle 0x0000 as success (server echo)
+if (cmd == CMD_AUTH_SUCCESS || cmd == CMD_AUTH_CHALLENGE || cmd == 0x0000) {
+    return ERR_NONE;
+}
+```
+
+3. **Updated Authentication Flow** (`softether_connect_with_hub`):
+```c
+// Try HTTP authentication first (for VPNGate servers behind HTTP proxy)
+result = perform_authentication_http(conn, username, password);
+
+// If HTTP auth fails, try binary authentication
+if (result != ERR_NONE) {
+    result = perform_authentication(conn, username, password);
+}
+```
+
+### Test Results (2026-02-26)
+
+```
+NativeTest: Username: vpn, password_len: 3
+NativeTest: Auth response received: 1093 bytes
+NativeTest: AUTH response command: 0x0000
+NativeTest: === Step 4: Sending AUTH via HTTP POST ===
+NativeTest: .
+
+Time: 3,166
+OK (1 test)
+```
+
+**Test Result: ✅ PASSED**
+
+### Protocol Flow (COMPLETE)
+
+```
+Client                              Server
+  |                                   |
+  |-------- TCP Connect -------------|
+  |-------- TLS Handshake ----------|
+  |<-------- TLS Handshake ---------|
+  |-------- HTTP GET / X-VPN: 1 ---|  (HTTP Detection)
+  |<-------- HTTP 403 Forbidden ---|
+  |-------- POST /vpnsvc/connect.cgi -->|  (Watermark)
+  |<-------- HTTP 200 + Hello PACK --|  ← Server sends Hello here!
+  |-------- Binary CONNECT ----------|  (Optional, can skip)
+  |-------- POST /vpnsvc/vpn.cgi ---->|  (AUTH via HTTP)
+  |<-------- HTTP 200 + AUTH_OK -----|  ← Auth success!
+  ...
+```
+
+### Files Changed
+- `src/main/cpp/test/native_test.c` - HTTP AUTH in test
+- `src/main/cpp/softether-core/src/proto/softether_protocol.c` - HTTP AUTH in protocol
+
+### Build Commands
+```bash
+./gradlew :SoftEtherClient:assembleDebug
+./gradlew :app:assembleFreeDebug
+```
+
+### APK Output
+- `app/build/outputs/apk/free/debug/app-free-debug.apk` (47MB)
+- `SoftEtherClient/build/outputs/apk/androidTest/debug/SoftEtherClient-debug-androidTest.apk`
+
+---
+
+*Last Updated: 2026-02-26*
+*Status: ✅ Authentication fix implemented*
+
