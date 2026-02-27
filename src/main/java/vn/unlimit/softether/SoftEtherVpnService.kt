@@ -22,6 +22,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import vn.unlimit.softether.controller.ConnectionController
 import vn.unlimit.softether.model.ConnectionConfig
+import vn.unlimit.softether.model.ConnectionState
 
 /**
  * SoftEther VPN Service - Main VPN service implementation for Android
@@ -44,6 +45,12 @@ class SoftEtherVpnService : VpnService() {
         const val STATE_CONNECTED = "CONNECTED"
         const val STATE_DISCONNECTED = "DISCONNECTED"
         const val STATE_ERROR = "ERROR"
+        const val STATE_CONNECTING = "CONNECTING"
+        const val STATE_TLS_HANDSHAKE = "TLS_HANDSHAKE"
+        const val STATE_PROTOCOL_HANDSHAKE = "PROTOCOL_HANDSHAKE"
+        const val STATE_AUTHENTICATING = "AUTHENTICATING"
+        const val STATE_SESSION_SETUP = "SESSION_SETUP"
+        const val STATE_DISCONNECTING = "DISCONNECTING"
 
         // Extras
         const val EXTRA_CONFIG = "config"
@@ -154,7 +161,7 @@ class SoftEtherVpnService : VpnService() {
                     service = this@SoftEtherVpnService,
                     config = config,
                     onStateChange = { state ->
-                        updateNotification("State: $state")
+                        handleConnectionState(state, config.serverHost)
                     },
                     onError = { error ->
                         Log.e(TAG, "VPN Error: $error")
@@ -348,6 +355,35 @@ class SoftEtherVpnService : VpnService() {
         val notification = createNotification(content)
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun handleConnectionState(state: ConnectionState, hostname: String) {
+        val message = when (state) {
+            ConnectionState.CONNECTING -> "Connecting..."
+            ConnectionState.TLS_HANDSHAKE -> "Establishing TLS handshake..."
+            ConnectionState.PROTOCOL_HANDSHAKE -> "Negotiating SoftEther protocol..."
+            ConnectionState.AUTHENTICATING -> "Authenticating..."
+            ConnectionState.SESSION_SETUP -> "Establishing VPN session..."
+            ConnectionState.CONNECTED -> "Connected to $hostname"
+            ConnectionState.DISCONNECTING -> "Disconnecting..."
+            ConnectionState.DISCONNECTED -> "Disconnected"
+        }
+        updateNotification(message)
+
+        val stateValue = when (state) {
+            ConnectionState.CONNECTING -> STATE_CONNECTING
+            ConnectionState.TLS_HANDSHAKE -> STATE_TLS_HANDSHAKE
+            ConnectionState.PROTOCOL_HANDSHAKE -> STATE_PROTOCOL_HANDSHAKE
+            ConnectionState.AUTHENTICATING -> STATE_AUTHENTICATING
+            ConnectionState.SESSION_SETUP -> STATE_SESSION_SETUP
+            ConnectionState.CONNECTED -> STATE_CONNECTED
+            ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
+            ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
+        }
+        sendConnectionStateBroadcast(
+            stateValue,
+            if (state == ConnectionState.CONNECTED) hostname else ""
+        )
     }
 
     private fun registerNetworkReceiver() {

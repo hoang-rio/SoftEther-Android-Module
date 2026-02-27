@@ -133,6 +133,16 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDi
     LOGD("nativeDisconnect completed");
 }
 
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetState(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) {
+        return STATE_DISCONNECTED;
+    }
+
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    return (jint)softether_get_state(conn);
+}
+
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSend(
     JNIEnv *env, jobject thiz, jlong handle, jbyteArray data, jint length) {
     if (handle == 0) {

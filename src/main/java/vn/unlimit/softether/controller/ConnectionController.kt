@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -46,6 +47,7 @@ class ConnectionController(
     private val isReconnecting = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
     private val connectionMutex = Mutex()
+    private var stateMonitorJob: Job? = null
 
     // Statistics
     private val bytesSent = AtomicLong(0)
@@ -131,14 +133,19 @@ class ConnectionController(
         // Use virtualHub from config, default to "VPN" if not set
         val hubName = config.virtualHub.ifEmpty { "VPN" }
         Log.d(TAG, "Connecting with hub: $hubName")
-        val result = client.nativeConnectWithHub(
-            nativeHandle,
-            config.serverHost,
-            config.serverPort,
-            config.username,
-            config.password,
-            hubName
-        )
+        startNativeStateMonitor()
+        val result = try {
+            client.nativeConnectWithHub(
+                nativeHandle,
+                config.serverHost,
+                config.serverPort,
+                config.username,
+                config.password,
+                hubName
+            )
+        } finally {
+            stopNativeStateMonitor()
+        }
 
         // Check if cancelled during connection
         if (isCancelled.get()) {
@@ -156,6 +163,13 @@ class ConnectionController(
             client.nativeDestroy(handle)
             throw Exception("Connection failed with error code: $result")
         }
+
+        // Make session-establishment phase explicit in app state/notification flow
+        // even if native transitions happen very quickly.
+        if (currentState != ConnectionState.SESSION_SETUP) {
+            currentState = ConnectionState.SESSION_SETUP
+        }
+        delay(120)
 
         currentState = ConnectionState.CONNECTED
         reconnectAttempts.set(0) // Reset on successful connection
@@ -454,6 +468,11 @@ class ConnectionController(
                 throw Exception("Reconnection failed with error code: $result")
             }
 
+            if (currentState != ConnectionState.SESSION_SETUP) {
+                currentState = ConnectionState.SESSION_SETUP
+            }
+            delay(120)
+
             currentState = ConnectionState.CONNECTED
             reconnectAttempts.set(0) // Reset on successful reconnection
             Log.d(TAG, "Reconnection successful")
@@ -511,6 +530,52 @@ class ConnectionController(
                     break
                 }
             }
+        }
+    }
+
+    private fun startNativeStateMonitor() {
+        stateMonitorJob?.cancel()
+        stateMonitorJob = scope.launch {
+            while (!isCancelled.get() && nativeHandle != 0L) {
+                try {
+                    val mapped = mapNativeState(client.nativeGetState(nativeHandle))
+                    if (mapped != null &&
+                        mapped != ConnectionState.DISCONNECTED &&
+                        mapped != currentState
+                    ) {
+                        currentState = mapped
+                    }
+
+                    if (currentState == ConnectionState.CONNECTED ||
+                        currentState == ConnectionState.DISCONNECTING ||
+                        currentState == ConnectionState.DISCONNECTED
+                    ) {
+                        break
+                    }
+                    delay(80)
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+    }
+
+    private suspend fun stopNativeStateMonitor() {
+        stateMonitorJob?.cancel()
+        stateMonitorJob = null
+    }
+
+    private fun mapNativeState(nativeState: Int): ConnectionState? {
+        return when (nativeState) {
+            0 -> ConnectionState.DISCONNECTED
+            1 -> ConnectionState.CONNECTING
+            2 -> ConnectionState.TLS_HANDSHAKE
+            3 -> ConnectionState.PROTOCOL_HANDSHAKE
+            4 -> ConnectionState.AUTHENTICATING
+            5 -> ConnectionState.SESSION_SETUP
+            6 -> ConnectionState.CONNECTED
+            7 -> ConnectionState.DISCONNECTING
+            else -> null
         }
     }
 }

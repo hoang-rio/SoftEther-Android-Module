@@ -46,23 +46,23 @@ Tests run in SoftEther VPN protocol order:
 | test02TlsHandshake | TLS Handshake | ✅ PASS |
 | test03SoftEtherHandshake | Protocol Handshake | ✅ PASS |
 | test04Authentication | Authentication | ✅ PASS |
-| test05SessionEstablishment | Session Setup | ❌ FAIL (session setup issue) |
-| test06DataTransmission | Data Transmission | ❌ FAIL (depends on test05) |
-| test07Keepalive | Keepalive | ❌ FAIL (depends on test05) |
-| test08FullConnectionLifecycle | Full Lifecycle | ❌ FAIL (depends on test05) |
-| test09MultipleServers | Multiple Servers | ❌ FAIL (depends on test05) |
+| test05SessionEstablishment | Session Setup | ✅ PASS (targeted rerun) |
+| test06DataTransmission | Data Transmission | ⏳ NOT RERUN |
+| test07Keepalive | Keepalive | ⏳ NOT RERUN |
+| test08FullConnectionLifecycle | Full Lifecycle | ⏳ NOT RERUN |
+| test09MultipleServers | Multiple Servers | ⏳ NOT RERUN |
 
 ### Analysis
 
-**Passing Tests (4/9):**
+**Passing Tests (5/9 confirmed):**
 - TCP Connection: Direct TCP connection to VPNGate servers works
 - TLS Handshake: SSL/TLS handshake completes successfully
 - SoftEther Handshake: HTTP detection + watermark + Hello reception works
 - Authentication: HTTP AUTH to /vpnsvc/vpn.cgi works
+- Session Establishment: PASS after PACK-auth session flow fix
 
-**Failing Tests (5/9):**
-- Session Establishment and subsequent tests fail at session setup
-- The VPNGate server requires HTTP for session commands, not binary protocol
+**Pending verification:**
+- Tests 06-09 are pending rerun after session flow updates
 
 ### Key Fixes Applied (2026-02-27)
 
@@ -78,8 +78,23 @@ Tests run in SoftEther VPN protocol order:
 - Added `goto skip_receive` when Hello is received from watermark to avoid duplicate packet receive
 
 **4. Main App Session Fix (softether_protocol.c):**
-- Added `setup_session_http()` function to send SESSION_REQUEST and CONFIG_REQUEST via HTTP POST
-- The main app now tries HTTP first, then falls back to binary protocol
+- Updated HTTP/PACK auth flow handling to avoid legacy SESSION/CONFIG commands after successful HTTP login
+- Added explicit native state transition to `STATE_SESSION_SETUP` before final `STATE_CONNECTED`
+
+**5. Native Test Session Fix (native_test.c):**
+- Marked successful HTTP auth responses (`CMD_AUTH_SUCCESS`, `CMD_AUTH_CHALLENGE`, `0x0000`, HTTP 200 fallback) as PACK-auth flow
+- Skip legacy `SESSION_REQUEST/CONFIG_REQUEST` when HTTP/PACK login already established the session context
+
+**6. JNI/Kotlin State Visibility & Notification Updates:**
+- Added `nativeGetState()` JNI method (`softether_jni.h/.c`, `SoftEtherClient.kt`)
+- Added native-state monitoring in `ConnectionController.kt` to propagate phase transitions
+- Updated `SoftEtherVpnService.kt` to broadcast and display granular state notifications:
+  - `CONNECTING`
+  - `TLS_HANDSHAKE`
+  - `PROTOCOL_HANDSHAKE`
+  - `AUTHENTICATING`
+  - `SESSION_SETUP`
+  - `CONNECTED` / `DISCONNECTING` / `DISCONNECTED`
 
 ```c
 // New function added to softether_protocol.c
@@ -117,19 +132,25 @@ Client                              Server
 
 ### Native C Code (Main App)
 - `SoftEtherClient/src/main/cpp/softether-core/src/proto/softether_protocol.c`
-  - Added `setup_session_http()` function for HTTP session setup
-  - Added forward declaration `static int setup_session_http(softether_connection_t* conn);`
-  - Modified `setup_session()` to try HTTP first, fall back to binary
+  - Updated session establishment behavior for HTTP/PACK auth flow
+  - Added explicit `STATE_SESSION_SETUP` transition before `STATE_CONNECTED`
+
+### JNI Bridge
+- `SoftEtherClient/src/main/cpp/jni/softether_jni.h`
+- `SoftEtherClient/src/main/cpp/jni/softether_jni.c`
+  - Added `nativeGetState()`
 
 ### Native C Code (Test)
 - `SoftEtherClient/src/main/cpp/test/native_test.c`
-  - Fixed authentication to use HTTP POST (same as test_authentication)
-  - Added `goto skip_receive` to avoid duplicate packet receive after watermark
-  - Added HTTP response handling for authentication
+  - Updated HTTP auth success branches to correctly mark PACK-auth flow
+  - Skip legacy session/config exchange when HTTP/PACK login already succeeded
 
-### Test Code
-- `SoftEtherClient/src/androidTest/java/vn/unlimit/softether/test/NativeConnectionTest.kt`
-  - Test order fixed with numeric prefixes
+### Kotlin Layer
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/client/SoftEtherClient.kt`
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/controller/ConnectionController.kt`
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/SoftEtherVpnService.kt`
+  - Added native state monitoring + app-state mapping
+  - Added explicit session-establishment UI/broadcast state updates
 
 ### Documentation
 - `SoftEtherClient/IMPLEMENTATION_PLAN.md` (this file)
@@ -150,19 +171,17 @@ Client                              Server
 
 ## Remaining Tasks
 
-1. **Fix Test Session Establishment**
-   - Apply same HTTP session fix to test code as main app
-   - Tests 5-9 should pass after fix
+1. **Run Full Instrumentation Suite (Tests 06-09)**
+   - Validate data transmission / keepalive / lifecycle / multi-server flows after session fix
 
-2. **Data Transmission Tests**
-   - Once session works, test data transmission
-   - Implement proper packet handling
-
-3. **VPNGate Server Compatibility**
+2. **Stability Validation**
    - Some VPNGate servers may have different requirements
-   - May need to handle various authentication methods
+   - Validate behavior across multiple server profiles
+
+3. **Cleanup Warnings (Optional)**
+   - Address non-blocking compiler warnings (unused helpers / deprecated connectivity broadcast)
 
 ---
 
 *Last Updated: 2026-02-27*
-*Status: ✅ Core protocol implementation complete, authentication tests passing, session setup fixed in main app*
+*Status: ✅ Core protocol implementation complete, test05 session establishment passing, main-app session state + notifications updated*

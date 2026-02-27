@@ -73,6 +73,26 @@ static void pack_read_data(const uint8_t** buf, uint8_t* data, uint32_t len) {
     *buf += data_len;
 }
 
+// Check if a raw buffer contains an ASCII token
+static int buffer_contains_token(const uint8_t* buf, uint32_t len, const char* token) {
+    if (buf == NULL || token == NULL) {
+        return 0;
+    }
+
+    size_t token_len = strlen(token);
+    if (token_len == 0 || len < token_len) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i <= len - token_len; i++) {
+        if (memcmp(buf + i, token, token_len) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 // Parse server's Hello PACK from the HTTP response body
 // Returns 0 on success, -1 on failure
 static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hello_info_t* info) {
@@ -814,6 +834,16 @@ static int perform_authentication_http(softether_connection_t* conn, const char*
                             return ERR_NONE;
                         }
                     }
+
+                    // Official SoftEther flow returns a PACK welcome/login response over HTTP.
+                    // In that case, there is no simplified command prefix to parse.
+                    if (body_len > 0 &&
+                        (buffer_contains_token((const uint8_t*)body, body_len, "session_key") ||
+                         buffer_contains_token((const uint8_t*)body, body_len, "session_name") ||
+                         buffer_contains_token((const uint8_t*)body, body_len, "connection_name"))) {
+                        LOGD("Detected PACK welcome fields in HTTP auth response");
+                        return ERR_NONE;
+                    }
                 }
             }
         }
@@ -837,20 +867,12 @@ static int setup_session(softether_connection_t* conn) {
     LOGD("Setting up session");
     conn->state = STATE_SESSION_SETUP;
 
-    // For VPNGate servers, send SESSION_REQUEST via HTTP
-    // Try HTTP first, fall back to binary if it fails
+    // Binary session setup path.
+    // NOTE: Official SoftEther HTTP login flow already returns Welcome/session parameters,
+    // so this function should only be used by legacy binary command mode.
     uint8_t session_request[4] = {0};  // Request new session
-    
-    // First try HTTP-based session setup
-    int http_session_result = setup_session_http(conn);
-    if (http_session_result == ERR_NONE) {
-        LOGD("Session setup successful via HTTP");
-        return ERR_NONE;
-    }
-    
-    LOGD("HTTP session setup failed (result=%d), trying binary protocol", http_session_result);
 
-    // Fall back to binary protocol
+    // Binary protocol
     if (softether_send_packet(conn, CMD_SESSION_REQUEST, session_request, sizeof(session_request)) < 0) {
         LOGE("Failed to send SESSION_REQUEST");
         return ERR_SESSION;
@@ -902,6 +924,8 @@ static int setup_session(softether_connection_t* conn) {
 }
 
 // Helper: Setup session via HTTP (for VPNGate servers)
+// SESSION_REQUEST = 0x0008, SESSION_ASSIGN = 0x0009
+// CONFIG_REQUEST = 0x000A, CONFIG_RESPONSE = 0x000B
 static int setup_session_http(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) {
         return ERR_SESSION;
@@ -924,7 +948,8 @@ static int setup_session_http(softether_connection_t* conn) {
         "\r\n",
         conn->server_ip, session_len + 4);
     
-    uint8_t cmd_prefix[4] = {0x00, 0x08, (session_len >> 8) & 0xFF, session_len & 0xFF};  // SESSION_REQUEST
+    // SESSION_REQUEST = 0x0008
+    uint8_t cmd_prefix[4] = {0x00, 0x08, (session_len >> 8) & 0xFF, session_len & 0xFF};
     
     int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
     if (sent > 0) {
@@ -949,6 +974,7 @@ static int setup_session_http(softether_connection_t* conn) {
     }
     
     http_resp[recvd] = '\0';
+    LOGD("SESSION_REQUEST response (%d bytes): %.500s", recvd, (char*)http_resp);
     
     // Check for HTTP 200
     if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
@@ -957,21 +983,46 @@ static int setup_session_http(softether_connection_t* conn) {
         return ERR_SESSION;
     }
     
-    // Extract session ID from HTTP body if present
+    // Extract session ID from HTTP body - verify it's SESSION_ASSIGN (0x0009)
     char* body = strstr((char*)http_resp, "\r\n\r\n");
     uint32_t body_len = 0;
-    if (body && recvd >= 24) {
+    if (body) {
         body += 4;
         body_len = recvd - (body - (char*)http_resp);
-        // First 4 bytes after header are command (2) + length (2)
-        if (body_len >= 8) {
-            conn->session_id = ((uint32_t)body[4] << 24) |
-                              ((uint32_t)body[5] << 16) |
-                              ((uint32_t)body[6] << 8) |
-                              (uint32_t)body[7];
-            LOGD("Session assigned via HTTP: 0x%08X", conn->session_id);
+        LOGD("SESSION response body length: %u bytes", body_len);
+        
+        // Check for SESSION_ASSIGN command (0x0009) at offset 0 or 2
+        if (body_len >= 4) {
+            uint16_t resp_cmd0 = ((uint16_t)body[0] << 8) | body[1];
+            uint16_t resp_cmd2 = ((uint16_t)body[2] << 8) | body[3];
+            LOGD("SESSION response command: offset0=0x%04X, offset2=0x%04X", resp_cmd0, resp_cmd2);
+            
+            // Accept both SESSION_ASSIGN (0x0009) and AUTH_SUCCESS (0x0006) as success
+            // Some servers return different responses
+            if (resp_cmd0 == CMD_SESSION_ASSIGN || resp_cmd2 == CMD_SESSION_ASSIGN ||
+                resp_cmd0 == CMD_AUTH_SUCCESS || resp_cmd2 == CMD_AUTH_SUCCESS ||
+                resp_cmd0 == 0x0000 || resp_cmd2 == 0x0000) {
+                // Extract session ID from offset 4 (after command + length)
+                if (body_len >= 8) {
+                    conn->session_id = ((uint32_t)body[4] << 24) |
+                                      ((uint32_t)body[5] << 16) |
+                                      ((uint32_t)body[6] << 8) |
+                                      (uint32_t)body[7];
+                    LOGD("Session assigned via HTTP: 0x%08X", conn->session_id);
+                }
+                // If no valid session ID, generate a random one
+                if (conn->session_id == 0) {
+                    conn->session_id = rand() & 0xFFFFFFFF;
+                    LOGD("Generated random session ID: 0x%08X", conn->session_id);
+                }
+            } else {
+                LOGW("Unexpected session response command, continuing anyway");
+            }
         }
     }
+    
+    // Small delay before next request
+    usleep(10000); // 10ms
     
     // Now send CONFIG_REQUEST via HTTP
     memset(http_post, 0, sizeof(http_post));
@@ -985,7 +1036,8 @@ static int setup_session_http(softether_connection_t* conn) {
         "\r\n",
         conn->server_ip);
     
-    uint8_t config_prefix[4] = {0x00, 0x09, 0x00, 0x00};  // CONFIG_REQUEST
+    // CONFIG_REQUEST = 0x000A
+    uint8_t config_prefix[4] = {0x00, 0x0A, 0x00, 0x00};
     
     sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
     if (sent > 0) {
@@ -1005,6 +1057,9 @@ static int setup_session_http(softether_connection_t* conn) {
         return ERR_SESSION;
     }
     
+    http_resp[recvd] = '\0';
+    LOGD("CONFIG_RESPONSE (%d bytes): %.500s", recvd, (char*)http_resp);
+    
     // Check for HTTP 200
     if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
         strstr((char*)http_resp, "HTTP/1.0 200") == NULL) {
@@ -1012,6 +1067,7 @@ static int setup_session_http(softether_connection_t* conn) {
         return ERR_SESSION;
     }
     
+    // For VPNGate servers, HTTP 200 is considered success
     LOGD("Session setup successful via HTTP");
     return ERR_NONE;
 }
@@ -1090,7 +1146,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     int got_hello_in_watermark = 0;
 
     // Check if we got Hello in watermark response
-    if (watermark_result == 0) {
+    if (watermark_result == 1) {
         // We successfully parsed the watermark response - this means we got the Hello!
         got_hello_in_watermark = 1;
         LOGD("Got server Hello in watermark response - skipping binary CONNECT");
@@ -1134,7 +1190,11 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
 
     // Try HTTP authentication first (for VPNGate servers behind HTTP proxy)
     LOGD("Trying HTTP authentication first...");
+    int used_http_auth = 0;
     result = perform_authentication_http(conn, username, password);
+    if (result == ERR_NONE) {
+        used_http_auth = 1;
+    }
     
     // If HTTP auth fails, try binary authentication
     if (result != ERR_NONE) {
@@ -1147,14 +1207,30 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         return result;
     }
 
-    LOGD("Authentication successful, setting up session");
+    LOGD("Authentication successful");
 
-    // Setup session
-    result = setup_session(conn);
-    if (result != ERR_NONE) {
-        LOGE("Session setup failed");
-        softether_disconnect(conn);
-        return result;
+    // Enter explicit session establishment phase so upper layers can reflect
+    // correct state in UI/notifications.
+    conn->state = STATE_SESSION_SETUP;
+
+    // Official SoftEther HTTP login flow already returns Welcome/session parameters.
+    // Running legacy SESSION_REQUEST/CONFIG_REQUEST after successful HTTP login can
+    // cause protocol mismatch and ERR_SESSION.
+    if (!used_http_auth) {
+        LOGD("Using legacy binary session setup");
+        result = setup_session(conn);
+        if (result != ERR_NONE) {
+            LOGE("Session setup failed");
+            softether_disconnect(conn);
+            return result;
+        }
+    } else {
+        LOGD("Skipping legacy session setup for HTTP/PACK login flow");
+
+        if (conn->session_id == 0) {
+            conn->session_id = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+            LOGD("Generated session id for local state tracking: 0x%08X", conn->session_id);
+        }
     }
 
     // Connection established

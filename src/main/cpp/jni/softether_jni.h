@@ -22,6 +22,9 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDisconnect(
     JNIEnv *env, jobject thiz, jlong handle);
 
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetState(
+    JNIEnv *env, jobject thiz, jlong handle);
+
 // Data I/O
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSend(
     JNIEnv *env, jobject thiz, jlong handle, jbyteArray data, jint length);

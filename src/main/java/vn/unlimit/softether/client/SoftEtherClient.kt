@@ -174,6 +174,7 @@ class SoftEtherClient {
         hubName: String
     ): Int
     external fun nativeDisconnect(handle: Long)
+    external fun nativeGetState(handle: Long): Int
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
