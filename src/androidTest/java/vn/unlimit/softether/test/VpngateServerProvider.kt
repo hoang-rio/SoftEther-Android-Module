@@ -135,12 +135,15 @@ class VpngateServerProvider(private val context: Context) {
         val logType = fields.getOrNull(11)?.trim() ?: ""
         val operator = fields.getOrNull(12)?.trim() ?: ""
         val message = fields.getOrNull(13)?.trim() ?: ""
+        val configDataBase64 = fields.getOrNull(14)?.trim() ?: ""
+        
+        // Decode config and extract port
+        val port = extractPortFromConfig(configDataBase64)
+        
+        Log.d(TAG, "Server $ip: using port=$port")
 
-        // Check if SoftEther is supported (usually port 443 or 992)
-        val supportsSoftEther = true // VPNGate servers typically support SoftEther
-
-        // Determine port (usually 443 for SoftEther SSL-VPN)
-        val port = 443
+        // SoftEther can use any port - always support it if we have a valid port
+        val supportsSoftEther = port > 0
 
         return ServerInfo(
             ip = ip,
@@ -156,6 +159,55 @@ class VpngateServerProvider(private val context: Context) {
             message = message,
             supportsSoftEther = supportsSoftEther
         )
+    }
+
+    /**
+     * Extract port from VPNGate configData (after base64 decode)
+     * Format: "remote IP PORT proto..." or "remote IP PORT..."
+     */
+    private fun extractPortFromConfig(configDataBase64: String): Int {
+        if (configDataBase64.isBlank()) {
+            return 443 // Default port
+        }
+        
+        // Decode base64 config
+        val configData = try {
+            android.util.Base64.decode(configDataBase64, android.util.Base64.DEFAULT).toString(charset("UTF-8"))
+        } catch (e: Exception) {
+            Log.w(TAG, "Error decoding config: ${e.message}")
+            return 443
+        }
+        
+        if (configData.isBlank()) {
+            return 443
+        }
+        
+        try {
+            // Look for "remote " pattern in config - OpenVPN format
+            val remotePattern = Regex("""remote\s+([\d.]+)\s+(\d+)""")
+            val match = remotePattern.find(configData)
+            if (match != null) {
+                val port = match.groupValues[2].toIntOrNull()
+                if (port != null && port > 0) {
+                    Log.d(TAG, "Extracted port from decoded config: $port")
+                    return port
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error extracting port from config: ${e.message}")
+        }
+        
+        // Try to find common SoftEther ports in config
+        val commonPorts = listOf(443, 992, 1194, 500, 4500, 5555, 8888)
+        for (port in commonPorts) {
+            if (configData.contains(" $port ") || configData.contains("\t$port ")) {
+                Log.d(TAG, "Found common port in config: $port")
+                return port
+            }
+        }
+        
+        Log.d(TAG, "Using default port 443")
+        return 443
     }
 
     /**

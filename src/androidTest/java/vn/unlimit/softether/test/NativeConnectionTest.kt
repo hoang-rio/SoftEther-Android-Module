@@ -208,7 +208,7 @@ class NativeConnectionTest {
      * Test 5: Session Establishment
      * Create VPN session after authentication
      */
-    // @Test - Disabled due to native crash issues
+    @Test
     fun test05SessionEstablishment() {
         Log.d(TAG, "Running testSessionEstablishment")
         
@@ -280,7 +280,7 @@ class NativeConnectionTest {
      * Test 7: Keepalive
      * Test VPN connection stability with keepalive packets
      */
-    // @Test - Temporarily disabled due to native crash issues
+    @Test
     fun test07Keepalive() {
         Log.d(TAG, "Running testKeepalive")
         

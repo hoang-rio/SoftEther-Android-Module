@@ -825,6 +825,9 @@ static int perform_authentication_http(softether_connection_t* conn, const char*
     return ERR_AUTHENTICATION;
 }
 
+// Forward declaration
+static int setup_session_http(softether_connection_t* conn);
+
 // Setup session
 static int setup_session(softether_connection_t* conn) {
     if (conn == NULL) {
@@ -834,8 +837,20 @@ static int setup_session(softether_connection_t* conn) {
     LOGD("Setting up session");
     conn->state = STATE_SESSION_SETUP;
 
-    // Send SESSION_REQUEST
+    // For VPNGate servers, send SESSION_REQUEST via HTTP
+    // Try HTTP first, fall back to binary if it fails
     uint8_t session_request[4] = {0};  // Request new session
+    
+    // First try HTTP-based session setup
+    int http_session_result = setup_session_http(conn);
+    if (http_session_result == ERR_NONE) {
+        LOGD("Session setup successful via HTTP");
+        return ERR_NONE;
+    }
+    
+    LOGD("HTTP session setup failed (result=%d), trying binary protocol", http_session_result);
+
+    // Fall back to binary protocol
     if (softether_send_packet(conn, CMD_SESSION_REQUEST, session_request, sizeof(session_request)) < 0) {
         LOGE("Failed to send SESSION_REQUEST");
         return ERR_SESSION;
@@ -883,6 +898,121 @@ static int setup_session(softether_connection_t* conn) {
     }
 
     LOGD("Session setup successful");
+    return ERR_NONE;
+}
+
+// Helper: Setup session via HTTP (for VPNGate servers)
+static int setup_session_http(softether_connection_t* conn) {
+    if (conn == NULL || conn->ssl == NULL) {
+        return ERR_SESSION;
+    }
+
+    LOGD("Setting up session via HTTP");
+    
+    // Send SESSION_REQUEST via HTTP POST to vpn.cgi
+    uint8_t session_request[4] = {0};
+    size_t session_len = 4;
+    
+    char http_post[1024];
+    int http_len = snprintf(http_post, sizeof(http_post),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: %zu\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        conn->server_ip, session_len + 4);
+    
+    uint8_t cmd_prefix[4] = {0x00, 0x08, (session_len >> 8) & 0xFF, session_len & 0xFF};  // SESSION_REQUEST
+    
+    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
+    }
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, session_request, session_len);
+    }
+    
+    if (sent <= 0) {
+        LOGE("Failed to send SESSION_REQUEST via HTTP");
+        return ERR_SESSION;
+    }
+    
+    // Receive response
+    uint8_t http_resp[4096];
+    int recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
+    
+    if (recvd <= 0) {
+        LOGE("Failed to receive SESSION_ASSIGN via HTTP");
+        return ERR_SESSION;
+    }
+    
+    http_resp[recvd] = '\0';
+    
+    // Check for HTTP 200
+    if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
+        strstr((char*)http_resp, "HTTP/1.0 200") == NULL) {
+        LOGE("SESSION_REQUEST via HTTP failed - not HTTP 200");
+        return ERR_SESSION;
+    }
+    
+    // Extract session ID from HTTP body if present
+    char* body = strstr((char*)http_resp, "\r\n\r\n");
+    uint32_t body_len = 0;
+    if (body && recvd >= 24) {
+        body += 4;
+        body_len = recvd - (body - (char*)http_resp);
+        // First 4 bytes after header are command (2) + length (2)
+        if (body_len >= 8) {
+            conn->session_id = ((uint32_t)body[4] << 24) |
+                              ((uint32_t)body[5] << 16) |
+                              ((uint32_t)body[6] << 8) |
+                              (uint32_t)body[7];
+            LOGD("Session assigned via HTTP: 0x%08X", conn->session_id);
+        }
+    }
+    
+    // Now send CONFIG_REQUEST via HTTP
+    memset(http_post, 0, sizeof(http_post));
+    http_len = snprintf(http_post, sizeof(http_post),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: 4\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        conn->server_ip);
+    
+    uint8_t config_prefix[4] = {0x00, 0x09, 0x00, 0x00};  // CONFIG_REQUEST
+    
+    sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
+    if (sent > 0) {
+        sent = ssl_write((ssl_context_t*)conn->ssl, config_prefix, 4);
+    }
+    
+    if (sent <= 0) {
+        LOGE("Failed to send CONFIG_REQUEST via HTTP");
+        return ERR_SESSION;
+    }
+    
+    // Receive CONFIG response
+    recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
+    
+    if (recvd <= 0) {
+        LOGE("Failed to receive CONFIG_RESPONSE via HTTP");
+        return ERR_SESSION;
+    }
+    
+    // Check for HTTP 200
+    if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
+        strstr((char*)http_resp, "HTTP/1.0 200") == NULL) {
+        LOGE("CONFIG_REQUEST via HTTP failed - not HTTP 200");
+        return ERR_SESSION;
+    }
+    
+    LOGD("Session setup successful via HTTP");
     return ERR_NONE;
 }
 
@@ -958,7 +1088,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     LOGD("Calling send_vpnconnect_watermark...");
     int watermark_result = send_vpnconnect_watermark(conn, host);
     int got_hello_in_watermark = 0;
-    
+
     // Check if we got Hello in watermark response
     if (watermark_result == 0) {
         // We successfully parsed the watermark response - this means we got the Hello!

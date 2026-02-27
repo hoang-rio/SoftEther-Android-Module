@@ -6,6 +6,7 @@
 #include <openssl/ssl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <android/log.h>
 
 #define TAG "SoftEtherCrypto"
@@ -301,18 +302,46 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     // Set connect state
     SSL_set_connect_state(ctx->ssl);
     
-    // Perform handshake
-    int result = SSL_do_handshake(ctx->ssl);
-    if (result != 1) {
+    // Perform handshake with retry loop - TLS handshake often requires multiple exchanges
+    int max_attempts = 100;  // Prevent infinite loop
+    int attempt = 0;
+    int result;
+    
+    while (attempt < max_attempts) {
+        result = SSL_do_handshake(ctx->ssl);
+        
+        if (result == 1) {
+            // Handshake successful
+            break;
+        }
+        
         int ssl_error = SSL_get_error(ctx->ssl, result);
-        LOGE("SSL handshake failed: %d", ssl_error);
+        
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            // Handshake needs more data - continue
+            LOGD("SSL handshake attempt %d: need more data (error=%d)", attempt + 1, ssl_error);
+            attempt++;
+            // Small delay to avoid busy-waiting
+            usleep(10000);  // 10ms
+            continue;
+        }
+        
+        // Other error - handshake failed
+        LOGE("SSL handshake failed: error=%d", ssl_error);
+        SSL_free(ctx->ssl);
+        ctx->ssl = NULL;
+        return -1;
+    }
+    
+    if (result != 1) {
+        LOGE("SSL handshake did not complete after %d attempts", max_attempts);
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
         return -1;
     }
     
     ctx->connected = 1;
-    LOGD("SSL handshake successful");
+    LOGD("SSL handshake successful after %d attempts", attempt + 1);
     return 0;
 }
 
