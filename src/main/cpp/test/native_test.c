@@ -1169,46 +1169,146 @@ session_setup:
         }
     }
 
-    // Session setup - Send SESSION_REQUEST
-    uint8_t session_request[8] = {0};  // Request new session with default parameters
-    softether_send_packet(conn, CMD_SESSION_REQUEST, session_request, sizeof(session_request));
-
-    // Receive SESSION_ASSIGN
-    ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
-
-    if (ret < 0 || command != CMD_SESSION_ASSIGN) {
-        softether_disconnect(conn);
-        softether_destroy(conn);
-        long duration = get_test_timestamp_ms() - start_time;
-        test_result_init(&result, false, ERR_SESSION,
-                        "Session assignment failed", duration);
-        return result;
+    // Try HTTP session setup first (for VPNGate servers)
+    LOGD("Trying HTTP session setup...");
+    
+    // Send SESSION_REQUEST via HTTP POST
+    uint8_t session_request[4] = {0};
+    size_t session_len = 4;
+    
+    char http_sess[1024];
+    int http_sess_len = snprintf(http_sess, sizeof(http_sess),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: %zu\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        config->host, session_len + 4);
+    
+    uint8_t sess_cmd_prefix[4] = {0x00, 0x08, (session_len >> 8) & 0xFF, session_len & 0xFF};
+    
+    int sess_sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_sess, http_sess_len);
+    if (sess_sent > 0) {
+        sess_sent = ssl_write((ssl_context_t*)conn->ssl, sess_cmd_prefix, 4);
     }
-
-    // Extract session ID from response
+    if (sess_sent > 0) {
+        sess_sent = ssl_write((ssl_context_t*)conn->ssl, session_request, session_len);
+    }
+    
     uint32_t session_id = 0;
-    if (response_len >= 4) {
-        session_id = ((uint32_t)response[0] << 24) |
-                    ((uint32_t)response[1] << 16) |
-                    ((uint32_t)response[2] << 8) |
-                    (uint32_t)response[3];
+    int http_session_ok = 0;
+    
+    if (sess_sent > 0) {
+        // Wait for session response
+        uint8_t http_sess_resp[4096];
+        int sess_recvd = ssl_read((ssl_context_t*)conn->ssl, http_sess_resp, sizeof(http_sess_resp) - 1);
+        
+        if (sess_recvd > 0) {
+            http_sess_resp[sess_recvd] = '\0';
+            
+            // Check for HTTP 200
+            if (strstr((char*)http_sess_resp, "HTTP/1.1 200") != NULL || 
+                strstr((char*)http_sess_resp, "HTTP/1.0 200") != NULL) {
+                LOGD("SESSION_ASSIGN via HTTP - OK");
+                http_session_ok = 1;
+                
+                // Extract session ID from HTTP body
+                char* body = strstr((char*)http_sess_resp, "\r\n\r\n");
+                if (body && sess_recvd >= 24) {
+                    body += 4;
+                    if (sess_recvd - (body - (char*)http_sess_resp) >= 8) {
+                        session_id = ((uint32_t)body[4] << 24) |
+                                    ((uint32_t)body[5] << 16) |
+                                    ((uint32_t)body[6] << 8) |
+                                    (uint32_t)body[7];
+                        LOGD("Session ID from HTTP: 0x%08X", session_id);
+                    }
+                }
+            }
+        }
+    }
+    
+    // If HTTP didn't work, try binary protocol
+    if (!http_session_ok) {
+        LOGD("HTTP session failed, trying binary protocol...");
+        
+        // Session setup - Send SESSION_REQUEST
+        uint8_t session_request[8] = {0};  // Request new session with default parameters
+        softether_send_packet(conn, CMD_SESSION_REQUEST, session_request, sizeof(session_request));
+
+        // Receive SESSION_ASSIGN
+        ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
+
+        if (ret < 0 || command != CMD_SESSION_ASSIGN) {
+            softether_disconnect(conn);
+            softether_destroy(conn);
+            long duration = get_test_timestamp_ms() - start_time;
+            test_result_init(&result, false, ERR_SESSION,
+                            "Session assignment failed", duration);
+            return result;
+        }
+
+        // Extract session ID from response
+        if (response_len >= 4) {
+            session_id = ((uint32_t)response[0] << 24) |
+                        ((uint32_t)response[1] << 16) |
+                        ((uint32_t)response[2] << 8) |
+                        (uint32_t)response[3];
+        }
     }
 
-    // Send CONFIG_REQUEST
-    softether_send_packet(conn, CMD_CONFIG_REQUEST, NULL, 0);
+    // Send CONFIG_REQUEST via HTTP
+    LOGD("Sending CONFIG_REQUEST via HTTP...");
+    char http_config[1024];
+    int http_config_len = snprintf(http_config, sizeof(http_config),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Length: 4\r\n"
+        "X-VPN: 1\r\n"
+        "\r\n",
+        config->host);
+    
+    uint8_t config_cmd_prefix[4] = {0x00, 0x09, 0x00, 0x00};
+    
+    int config_sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_config, http_config_len);
+    if (config_sent > 0) {
+        config_sent = ssl_write((ssl_context_t*)conn->ssl, config_cmd_prefix, 4);
+    }
+    
+    int config_ok = 0;
+    if (config_sent > 0) {
+        uint8_t http_config_resp[4096];
+        int config_recvd = ssl_read((ssl_context_t*)conn->ssl, http_config_resp, sizeof(http_config_resp) - 1);
+        
+        if (config_recvd > 0 && (strstr((char*)http_config_resp, "HTTP/1.1 200") != NULL ||
+            strstr((char*)http_config_resp, "HTTP/1.0 200") != NULL)) {
+            LOGD("CONFIG_RESPONSE via HTTP - OK");
+            config_ok = 1;
+        }
+    }
+    
+    // If HTTP config didn't work, try binary
+    if (!config_ok) {
+        LOGD("HTTP config failed, trying binary protocol...");
+        
+        softether_send_packet(conn, CMD_CONFIG_REQUEST, NULL, 0);
+        ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
+        duration = get_test_timestamp_ms() - start_time;
 
-    // Receive CONFIG_RESPONSE
-    ret = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
-    duration = get_test_timestamp_ms() - start_time;
+        if (ret < 0 || command != CMD_CONFIG_RESPONSE) {
+            test_result_init(&result, false, ERR_SESSION,
+                            "Configuration failed", duration);
+            return result;
+        }
+    }
 
     softether_disconnect(conn);
     softether_destroy(conn);
-
-    if (ret < 0 || command != CMD_CONFIG_RESPONSE) {
-        test_result_init(&result, false, ERR_SESSION,
-                        "Configuration failed", duration);
-        return result;
-    }
+    duration = get_test_timestamp_ms() - start_time;
 
     char msg[256];
     snprintf(msg, sizeof(msg), "Session established successfully (session_id: 0x%08X)", session_id);
