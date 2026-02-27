@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- SoftEther VPN State Strings -->
+    <string name="softether_connecting">Đang kết nối SoftEther…</string>
+    <string name="softether_tls_handshake">Đang thiết lập bắt tay TLS SoftEther…</string>
+    <string name="softether_protocol_handshake">Đang thương lượng giao thức SoftEther…</string>
+    <string name="softether_authenticating">Đang xác thực phiên SoftEther…</string>
+    <string name="softether_session_setup">Đang thiết lập phiên VPN SoftEther…</string>
+    <string name="softether_connected">Đã kết nối SoftEther với IP: %1$s</string>
+    <string name="softether_disconnecting">Đang ngắt kết nối SoftEther…</string>
+    <string name="softether_disconnected">Đã ngắt kết nối SoftEther</string>
+    <string name="softether_disconnected_by_error">Đã ngắt kết nối SoftEther do gặp lỗi</string>
+    
+    <!-- Notification Strings -->
+    <string name="softether_vpn_service">SoftEther VPN</string>
+    <string name="softether_vpn_connection_status">Trạng thái kết nối SoftEther VPN</string>
+    <string name="softether_disconnect">Ngắt kết nối</string>
+    
+    <!-- Server Information Format -->
+    <string name="softether_notification_title">SoftEther VPN - %1$s</string>
+    <string name="softether_notification_title_notconnect">SoftEther VPN</string>
+</resources>

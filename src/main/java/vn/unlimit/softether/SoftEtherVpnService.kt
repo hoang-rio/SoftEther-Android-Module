@@ -60,6 +60,9 @@ class SoftEtherVpnService : VpnService() {
     private var controller: ConnectionController? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isRunning = false
+    private var lastStateUpdateTime = 0L
+    private var pendingStateUpdate: (() -> Unit)? = null
+    private var currentSessionName: String? = null
 
     private val networkReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -151,8 +154,11 @@ class SoftEtherVpnService : VpnService() {
 
         Log.d(TAG, "Starting VPN with config: ${config.serverHost}:${config.serverPort}")
 
+        // Store session name for use in notifications
+        currentSessionName = config.sessionName
+        
         // Start as foreground service
-        startForeground(NOTIFICATION_ID, createNotification("Connecting..."))
+        startForeground(NOTIFICATION_ID, createNotification(getString(R.string.softether_connecting)))
 
         connectionJob = serviceScope.launch {
             try {
@@ -165,7 +171,7 @@ class SoftEtherVpnService : VpnService() {
                     },
                     onError = { error ->
                         Log.e(TAG, "VPN Error: $error")
-                        updateNotification("Error: $error")
+                        updateNotification(getString(R.string.softether_disconnected_by_error))
                         stopVpn()
                     }
                 )
@@ -175,7 +181,7 @@ class SoftEtherVpnService : VpnService() {
                 isRunning = true
 
                 Log.d(TAG, "VPN connection established")
-                updateNotification("Connected to ${config.serverHost}")
+                updateNotification(getString(R.string.softether_connected, config.serverHost))
                 
                 // Send connected broadcast
                 sendConnectionStateBroadcast(STATE_CONNECTED, config.serverHost)
@@ -244,8 +250,8 @@ class SoftEtherVpnService : VpnService() {
         )
 
         val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("SoftEther VPN")
-            .setContentText("Disconnected")
+            .setContentTitle(getString(R.string.softether_vpn_service))
+            .setContentText(getString(R.string.softether_disconnected))
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentPendingIntent)
             .setOngoing(false)  // Dismissable
@@ -340,14 +346,21 @@ class SoftEtherVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Create notification title with server information from instance variable
+        val notificationTitle = if (!currentSessionName.isNullOrEmpty()) {
+            getString(R.string.softether_notification_title, currentSessionName)
+        } else {
+            getString(R.string.softether_notification_title_notconnect)
+        }
+
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("SoftEther VPN")
+            .setContentTitle(notificationTitle)
             .setContentText(content)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
             .setAutoCancel(false)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", disconnectPendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.softether_disconnect), disconnectPendingIntent)
             .build()
     }
 
@@ -359,15 +372,41 @@ class SoftEtherVpnService : VpnService() {
 
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
         val message = when (state) {
-            ConnectionState.CONNECTING -> "Connecting..."
-            ConnectionState.TLS_HANDSHAKE -> "Establishing TLS handshake..."
-            ConnectionState.PROTOCOL_HANDSHAKE -> "Negotiating SoftEther protocol..."
-            ConnectionState.AUTHENTICATING -> "Authenticating..."
-            ConnectionState.SESSION_SETUP -> "Establishing VPN session..."
-            ConnectionState.CONNECTED -> "Connected to $hostname"
-            ConnectionState.DISCONNECTING -> "Disconnecting..."
-            ConnectionState.DISCONNECTED -> "Disconnected"
+            ConnectionState.CONNECTING -> getString(R.string.softether_connecting)
+            ConnectionState.TLS_HANDSHAKE -> getString(R.string.softether_tls_handshake)
+            ConnectionState.PROTOCOL_HANDSHAKE -> getString(R.string.softether_protocol_handshake)
+            ConnectionState.AUTHENTICATING -> getString(R.string.softether_authenticating)
+            ConnectionState.SESSION_SETUP -> getString(R.string.softether_session_setup)
+            ConnectionState.CONNECTED -> getString(R.string.softether_connected, hostname)
+            ConnectionState.DISCONNECTING -> getString(R.string.softether_disconnecting)
+            ConnectionState.DISCONNECTED -> getString(R.string.softether_disconnected)
         }
+        
+        // Add minimum delay between state updates to ensure UI can process them
+        val now = System.currentTimeMillis()
+        if (now - lastStateUpdateTime < 200) {
+            // Queue state update if too soon
+            pendingStateUpdate = { 
+                updateNotification(message)
+                val stateValue = when (state) {
+                    ConnectionState.CONNECTING -> STATE_CONNECTING
+                    ConnectionState.TLS_HANDSHAKE -> STATE_TLS_HANDSHAKE
+                    ConnectionState.PROTOCOL_HANDSHAKE -> STATE_PROTOCOL_HANDSHAKE
+                    ConnectionState.AUTHENTICATING -> STATE_AUTHENTICATING
+                    ConnectionState.SESSION_SETUP -> STATE_SESSION_SETUP
+                    ConnectionState.CONNECTED -> STATE_CONNECTED
+                    ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
+                    ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
+                }
+                sendConnectionStateBroadcast(
+                    stateValue,
+                    if (state == ConnectionState.CONNECTED) hostname else ""
+                )
+            }
+            return
+        }
+        
+        lastStateUpdateTime = now
         updateNotification(message)
 
         val stateValue = when (state) {
@@ -384,6 +423,12 @@ class SoftEtherVpnService : VpnService() {
             stateValue,
             if (state == ConnectionState.CONNECTED) hostname else ""
         )
+        
+        // Process any pending state update
+        pendingStateUpdate?.let {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(it, 200)
+            pendingStateUpdate = null
+        }
     }
 
     private fun registerNetworkReceiver() {

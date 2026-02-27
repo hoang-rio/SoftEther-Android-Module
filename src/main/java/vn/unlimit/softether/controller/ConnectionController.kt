@@ -536,6 +536,7 @@ class ConnectionController(
     private fun startNativeStateMonitor() {
         stateMonitorJob?.cancel()
         stateMonitorJob = scope.launch {
+            var lastBroadcastTime = 0L
             while (!isCancelled.get() && nativeHandle != 0L) {
                 try {
                     val mapped = mapNativeState(client.nativeGetState(nativeHandle))
@@ -543,7 +544,12 @@ class ConnectionController(
                         mapped != ConnectionState.DISCONNECTED &&
                         mapped != currentState
                     ) {
-                        currentState = mapped
+                        val now = System.currentTimeMillis()
+                        // Ensure minimum 100ms between state updates
+                        if (now - lastBroadcastTime >= 100) {
+                            currentState = mapped
+                            lastBroadcastTime = now
+                        }
                     }
 
                     if (currentState == ConnectionState.CONNECTED ||
@@ -552,7 +558,7 @@ class ConnectionController(
                     ) {
                         break
                     }
-                    delay(80)
+                    delay(50) // Reduced delay for better responsiveness
                 } catch (_: Exception) {
                     break
                 }

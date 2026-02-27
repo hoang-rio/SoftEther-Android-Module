@@ -23,7 +23,10 @@ data class ConnectionConfig(
     val useTcp: Boolean = true,
     val useUdp: Boolean = false,
     val connectTimeoutMs: Int = 30000,
-    val keepAliveIntervalMs: Int = 60000
+    val keepAliveIntervalMs: Int = 60000,
+    val country: String = "",
+    val isL2TPSupport: Boolean = false,
+    val isSSTPSupport: Boolean = false
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -43,7 +46,10 @@ data class ConnectionConfig(
         useTcp = parcel.readByte() != 0.toByte(),
         useUdp = parcel.readByte() != 0.toByte(),
         connectTimeoutMs = parcel.readInt(),
-        keepAliveIntervalMs = parcel.readInt()
+        keepAliveIntervalMs = parcel.readInt(),
+        country = parcel.readString() ?: "",
+        isL2TPSupport = parcel.readByte() != 0.toByte(),
+        isSSTPSupport = parcel.readByte() != 0.toByte()
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -64,6 +70,9 @@ data class ConnectionConfig(
         parcel.writeByte(if (useUdp) 1 else 0)
         parcel.writeInt(connectTimeoutMs)
         parcel.writeInt(keepAliveIntervalMs)
+        parcel.writeString(country)
+        parcel.writeByte(if (isL2TPSupport) 1 else 0)
+        parcel.writeByte(if (isSSTPSupport) 1 else 0)
     }
 
     override fun describeContents(): Int = 0
