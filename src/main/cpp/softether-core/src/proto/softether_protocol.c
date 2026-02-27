@@ -46,31 +46,92 @@ typedef struct {
     int has_random;
 } server_hello_info_t;
 
-// PACK deserialization helpers
-static uint32_t pack_read_uint32(const uint8_t** buf) {
-    uint32_t val = ((uint32_t)(*buf)[0] << 24) |
-                   ((uint32_t)(*buf)[1] << 16) |
-                   ((uint32_t)(*buf)[2] << 8) |
-                   (uint32_t)(*buf)[3];
-    *buf += 4;
-    return val;
+// PACK deserialization helpers (bounds-safe)
+static int pack_read_uint32_safe(const uint8_t** p, const uint8_t* end, uint32_t* out) {
+    if (p == NULL || *p == NULL || out == NULL || end == NULL || *p + 4 > end) {
+        return -1;
+    }
+
+    *out = ((uint32_t)(*p)[0] << 24) |
+           ((uint32_t)(*p)[1] << 16) |
+           ((uint32_t)(*p)[2] << 8) |
+           (uint32_t)(*p)[3];
+    *p += 4;
+    return 0;
 }
 
-static void pack_read_string(const uint8_t** buf, char* str, size_t max_len) {
-    uint32_t len = pack_read_uint32(buf);
-    if (len < max_len) {
-        memcpy(str, *buf, len);
-        str[len] = '\0';
+static int pack_skip_bytes_safe(const uint8_t** p, const uint8_t* end, uint32_t len) {
+    if (p == NULL || *p == NULL || end == NULL || *p + len > end) {
+        return -1;
     }
-    *buf += len;
+    *p += len;
+    return 0;
 }
 
-static void pack_read_data(const uint8_t** buf, uint8_t* data, uint32_t len) {
-    uint32_t data_len = pack_read_uint32(buf);
-    if (data_len <= len) {
-        memcpy(data, *buf, data_len);
+static int pack_read_string_safe(const uint8_t** p, const uint8_t* end,
+                                 char* out, size_t out_size) {
+    uint32_t len = 0;
+    if (pack_read_uint32_safe(p, end, &len) != 0) {
+        return -1;
     }
-    *buf += data_len;
+
+    if (*p + len > end) {
+        return -1;
+    }
+
+    if (out != NULL && out_size > 0) {
+        size_t copy_len = (len < (uint32_t)(out_size - 1)) ? (size_t)len : (out_size - 1);
+        memcpy(out, *p, copy_len);
+        out[copy_len] = '\0';
+    }
+
+    *p += len;
+    return 0;
+}
+
+static int pack_read_data_safe(const uint8_t** p, const uint8_t* end,
+                               uint8_t* out, uint32_t out_size) {
+    uint32_t data_len = 0;
+    if (pack_read_uint32_safe(p, end, &data_len) != 0) {
+        return -1;
+    }
+
+    if (*p + data_len > end) {
+        return -1;
+    }
+
+    if (out != NULL && out_size > 0) {
+        uint32_t copy_len = (data_len < out_size) ? data_len : out_size;
+        memcpy(out, *p, copy_len);
+    }
+
+    *p += data_len;
+    return 0;
+}
+
+static int pack_skip_value_safe(const uint8_t** p, const uint8_t* end, uint32_t type) {
+    uint32_t len = 0;
+
+    switch (type) {
+        case PACK_TYPE_INT:
+        case PACK_TYPE_BOOL:
+            return pack_skip_bytes_safe(p, end, 4);
+
+        case PACK_TYPE_INT64:
+        case PACK_TYPE_TIME:
+            return pack_skip_bytes_safe(p, end, 8);
+
+        case PACK_TYPE_STR:
+        case PACK_TYPE_UNISTR:
+        case PACK_TYPE_DATA:
+            if (pack_read_uint32_safe(p, end, &len) != 0) {
+                return -1;
+            }
+            return pack_skip_bytes_safe(p, end, len);
+
+        default:
+            return -1;
+    }
 }
 
 // Check if a raw buffer contains an ASCII token
@@ -103,14 +164,33 @@ static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hel
     memset(info, 0, sizeof(server_hello_info_t));
     
     const uint8_t* p = body;
+    const uint8_t* end = body + body_len;
     
     // Read number of elements
-    uint32_t num_elements = pack_read_uint32(&p);
+    uint32_t num_elements = 0;
+    if (pack_read_uint32_safe(&p, end, &num_elements) != 0) {
+        return -1;
+    }
+
+    // Defensive limit against malformed data causing very long loops
+    if (num_elements > 4096) {
+        LOGE("Malformed server Hello PACK: num_elements too large (%u)", num_elements);
+        return -1;
+    }
+
     LOGD("Server Hello PACK has %u elements", num_elements);
     
     for (uint32_t i = 0; i < num_elements; i++) {
         // Read element name
-        uint32_t name_len = pack_read_uint32(&p);
+        uint32_t name_len = 0;
+        if (pack_read_uint32_safe(&p, end, &name_len) != 0) {
+            return -1;
+        }
+
+        if (p + name_len > end) {
+            return -1;
+        }
+
         char element_name[64] = {0};
         if (name_len < sizeof(element_name)) {
             memcpy(element_name, p, name_len);
@@ -119,43 +199,67 @@ static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hel
         p += name_len;
         
         // Read element type
-        uint32_t type = pack_read_uint32(&p);
+        uint32_t type = 0;
+        if (pack_read_uint32_safe(&p, end, &type) != 0) {
+            return -1;
+        }
         
         // Read number of values
-        uint32_t num_values = pack_read_uint32(&p);
+        uint32_t num_values = 0;
+        if (pack_read_uint32_safe(&p, end, &num_values) != 0) {
+            return -1;
+        }
+
+        if (num_values > 65535) {
+            return -1;
+        }
         
         if (num_values > 0) {
             if (strcmp(element_name, "hello") == 0 && type == PACK_TYPE_STR) {
-                pack_read_string(&p, info->hello_string, sizeof(info->hello_string) - 1);
+                if (pack_read_string_safe(&p, end, info->hello_string,
+                                          sizeof(info->hello_string)) != 0) {
+                    return -1;
+                }
                 info->has_hello = 1;
                 LOGD("Server Hello: %s", info->hello_string);
+
+                for (uint32_t v = 1; v < num_values; v++) {
+                    if (pack_skip_value_safe(&p, end, type) != 0) {
+                        return -1;
+                    }
+                }
             }
             else if (strcmp(element_name, "version") == 0 && type == PACK_TYPE_INT) {
-                info->version = pack_read_uint32(&p);
+                if (pack_read_uint32_safe(&p, end, &info->version) != 0) {
+                    return -1;
+                }
                 info->has_version = 1;
                 LOGD("Server version: %u", info->version);
+
+                for (uint32_t v = 1; v < num_values; v++) {
+                    if (pack_skip_value_safe(&p, end, type) != 0) {
+                        return -1;
+                    }
+                }
             }
             else if (strcmp(element_name, "random") == 0 && type == PACK_TYPE_DATA) {
-                pack_read_data(&p, info->random, SHA1_SIZE);
+                if (pack_read_data_safe(&p, end, info->random, SHA1_SIZE) != 0) {
+                    return -1;
+                }
                 info->has_random = 1;
                 LOGD("Server random received (%d bytes)", SHA1_SIZE);
+
+                for (uint32_t v = 1; v < num_values; v++) {
+                    if (pack_skip_value_safe(&p, end, type) != 0) {
+                        return -1;
+                    }
+                }
             }
             else {
                 // Skip unknown element
                 for (uint32_t v = 0; v < num_values; v++) {
-                    if (type == PACK_TYPE_INT || type == PACK_TYPE_INT64) {
-                        pack_read_uint32(&p);
-                    }
-                    else if (type == PACK_TYPE_STR || type == PACK_TYPE_UNISTR) {
-                        uint32_t str_len = pack_read_uint32(&p);
-                        p += str_len;
-                    }
-                    else if (type == PACK_TYPE_DATA) {
-                        uint32_t data_len = pack_read_uint32(&p);
-                        p += data_len;
-                    }
-                    else {
-                        pack_read_uint32(&p);
+                    if (pack_skip_value_safe(&p, end, type) != 0) {
+                        return -1;
                     }
                 }
             }
