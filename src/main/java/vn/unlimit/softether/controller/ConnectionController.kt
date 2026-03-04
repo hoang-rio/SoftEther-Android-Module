@@ -161,6 +161,7 @@ class ConnectionController(
             val handle = nativeHandle
             nativeHandle = 0  // Clear handle first
             client.nativeDestroy(handle)
+            currentState = ConnectionState.ERROR
             throw Exception("Connection failed with error code: $result")
         }
 

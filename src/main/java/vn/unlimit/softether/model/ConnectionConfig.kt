@@ -148,5 +148,6 @@ enum class ConnectionState {
     AUTHENTICATING,
     SESSION_SETUP,
     CONNECTED,
-    DISCONNECTING
+    DISCONNECTING,
+    ERROR
 }

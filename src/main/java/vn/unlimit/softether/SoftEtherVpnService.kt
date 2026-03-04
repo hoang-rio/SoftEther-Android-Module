@@ -380,6 +380,7 @@ class SoftEtherVpnService : VpnService() {
             ConnectionState.CONNECTED -> getString(R.string.softether_connected, hostname)
             ConnectionState.DISCONNECTING -> getString(R.string.softether_disconnecting)
             ConnectionState.DISCONNECTED -> getString(R.string.softether_disconnected)
+            ConnectionState.ERROR -> getString(R.string.softether_disconnected_by_error)
         }
         
         // Add minimum delay between state updates to ensure UI can process them
@@ -397,6 +398,7 @@ class SoftEtherVpnService : VpnService() {
                     ConnectionState.CONNECTED -> STATE_CONNECTED
                     ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
                     ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
+                    ConnectionState.ERROR -> STATE_ERROR
                 }
                 sendConnectionStateBroadcast(
                     stateValue,
@@ -418,6 +420,7 @@ class SoftEtherVpnService : VpnService() {
             ConnectionState.CONNECTED -> STATE_CONNECTED
             ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
             ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
+            ConnectionState.ERROR -> STATE_ERROR
         }
         sendConnectionStateBroadcast(
             stateValue,
