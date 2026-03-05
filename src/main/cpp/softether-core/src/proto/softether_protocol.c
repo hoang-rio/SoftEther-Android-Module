@@ -689,13 +689,33 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
     LOGD("Starting protocol handshake (simple format)");
     conn->state = STATE_PROTOCOL_HANDSHAKE;
 
-    // Build CONNECT packet payload - EXACTLY matching native test
-    // Format: [version:2][hub_len:2] = {0x00, 0x01, 0x00, 0x00}
-    // This is version 0x0001 with empty hub name (hub_len = 0)
-    size_t payload_len = 4;
-    uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};
+    // Use provided hub_name or fallback to "vpngate"
+    const char* effective_hub_name = hub_name ? hub_name : "vpngate";
+    size_t hub_name_len = strlen(effective_hub_name);
     
-    LOGD("CONNECT payload: {0x00, 0x01, 0x00, 0x00} (version=0x0001, no hub)");
+    // Build CONNECT packet payload
+    // Format: [version:2][hub_len:2][hub_name]
+    // Total size: 4 + hub_name_len bytes
+    uint8_t hello_payload[256];
+    size_t payload_len = 4 + hub_name_len;
+    
+    if (payload_len > sizeof(hello_payload)) {
+        LOGE("Hub name too long: %zu bytes", hub_name_len);
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    // Version 0x0001 (big-endian)
+    hello_payload[0] = 0x00;
+    hello_payload[1] = 0x01;
+    
+    // Hub name length (big-endian)
+    hello_payload[2] = (hub_name_len >> 8) & 0xFF;
+    hello_payload[3] = hub_name_len & 0xFF;
+    
+    // Hub name
+    memcpy(hello_payload + 4, effective_hub_name, hub_name_len);
+    
+    LOGD("CONNECT packet: version=0x0001, hub_name='%s' (len=%zu)", effective_hub_name, hub_name_len);
 
     // Debug: print hex dump of payload
     LOGD("CONNECT payload hex dump (%zu bytes):", payload_len);
@@ -707,11 +727,11 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
     int send_result = softether_send_packet(conn, CMD_CONNECT, hello_payload, (uint32_t)payload_len);
     LOGD("softether_send_packet returned: %d", send_result);
     if (send_result < 0) {
-        LOGE("Failed to send HELLO packet");
+        LOGE("Failed to send CONNECT packet");
         return ERR_PROTOCOL_VERSION;
     }
 
-    // Receive HELLO_ACK
+    // Receive CONNECT_ACK
     uint16_t command;
     uint8_t response[256];
     uint32_t response_len;
@@ -723,7 +743,7 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
     setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive HELLO_ACK - server not responding (timeout after 10s)");
+        LOGE("Failed to receive CONNECT_ACK - server not responding (timeout after 10s)");
         // Restore timeout
         tv.tv_sec = conn->timeout_ms / 1000;
         tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
@@ -753,7 +773,7 @@ static int perform_protocol_handshake_ex(softether_connection_t* conn, const cha
         }
     }
 
-    LOGD("Protocol handshake successful");
+    LOGD("Protocol handshake successful with hub '%s'", effective_hub_name);
     return ERR_NONE;
 }
 
