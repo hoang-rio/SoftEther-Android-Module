@@ -607,7 +607,7 @@ test_softether_handshake(const native_test_config_t *config) {
   LOGD("Failed to receive server Hello, trying binary protocol...");
 
   // Build CONNECT packet: [version:2][hub_len:2][hub_name]
-  const char *hub_name = "VPN";
+  const char *hub_name = "vpngate";
   const char *username = config->username ? config->username : "vpn";
   const char *password = config->password ? config->password : "vpn";
 

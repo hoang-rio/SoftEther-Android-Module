@@ -1179,7 +1179,7 @@ static int setup_session_http(softether_connection_t* conn) {
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
-    return softether_connect_with_hub(conn, host, port, username, password, "VPN");
+    return softether_connect_with_hub(conn, host, port, username, password, "vpngate");
 }
 
 // Connect with HubName
