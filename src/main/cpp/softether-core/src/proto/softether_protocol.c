@@ -568,7 +568,7 @@ softether_connection_t* softether_create(void) {
     conn->ssl = NULL;
     
     // Set default hub name
-    strncpy(conn->hub_name, "VPN", sizeof(conn->hub_name) - 1);
+    strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
 
     // Initialize callbacks to NULL
     conn->on_connect = NULL;
@@ -1220,7 +1220,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     if (hub_name != NULL && hub_name[0] != '\0') {
         strncpy(conn->hub_name, hub_name, sizeof(conn->hub_name) - 1);
     } else {
-        strncpy(conn->hub_name, "VPN", sizeof(conn->hub_name) - 1);
+        strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
     }
 
     // Create socket and connect
