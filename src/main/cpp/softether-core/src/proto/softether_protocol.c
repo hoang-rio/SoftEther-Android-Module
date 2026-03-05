@@ -1259,10 +1259,6 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // Wait a small amount to let server process our request
     usleep(50000); // 50ms delay like native test does
 
-    // Set state to CONNECTED for packet operations
-    conn->state = STATE_CONNECTED;
-    LOGD("Set conn->state = STATE_CONNECTED for binary protocol");
-
     // Only try binary protocol if we didn't get Hello from watermark
     if (!got_hello_in_watermark) {
         LOGD("No Hello in watermark, trying binary CONNECT...");
@@ -1337,7 +1333,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         }
     }
 
-    // Connection established
+    // Connection established - only after ALL steps complete
     conn->state = STATE_CONNECTED;
     LOGD("Connection established successfully");
 
