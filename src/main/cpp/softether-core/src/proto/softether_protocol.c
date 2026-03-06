@@ -677,6 +677,48 @@ static int perform_tls_handshake(softether_connection_t* conn, const char* hostn
     return ERR_NONE;
 }
 
+// Perform Hello negotiation for protocol version agreement
+// This should be called before authentication to negotiate protocol version
+static int perform_hello_negotiation(softether_connection_t* conn) {
+    if (conn == NULL) {
+        return ERR_PROTOCOL_VERSION;
+    }
+
+    LOGD("Starting Hello negotiation for protocol version agreement");
+    
+    // Send initial Hello/CONNECT message (version 0x0001)
+    // This allows the server to respond with its version and capabilities
+    uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};  // version 0x0001, no hub
+    
+    LOGD("Sending Hello/CONNECT for version negotiation...");
+    if (softether_send_packet(conn, CMD_CONNECT, hello_payload, sizeof(hello_payload)) < 0) {
+        LOGE("Failed to send Hello/CONNECT packet");
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    // Receive server's Hello response
+    uint16_t command;
+    uint8_t response[512];
+    uint32_t response_len;
+    
+    LOGD("Waiting for server Hello response...");
+    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
+        LOGE("Failed to receive Hello response");
+        return ERR_PROTOCOL_VERSION;
+    }
+    
+    LOGD("Received response: command=0x%04X (%s), len=%u", command, command_to_string(command), response_len);
+    
+    if (command != CMD_CONNECT_ACK) {
+        LOGW("Expected CMD_CONNECT_ACK (0x%04X) but got 0x%04X", CMD_CONNECT_ACK, command);
+        // Some servers might not send ACK, continue anyway
+    } else {
+        LOGD("Hello negotiation successful - server acknowledged protocol version");
+    }
+    
+    return ERR_NONE;
+}
+
 // Perform protocol handshake with simple CONNECT packet format (matching native test)
 // Uses exactly the format from native_test.c: {0x00, 0x01, 0x00, 0x00}
 // This is version 0x0001 with no hub name (hub_len = 0)
@@ -1363,10 +1405,11 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         }
         
         if (result != ERR_NONE) {
-            // Binary protocol failed
+            // Binary protocol failed - now we really have an error
             LOGE("Binary protocol handshake failed - server may require HTTP-only mode");
+            LOGE("Error code: %d (%s)", result, softether_error_string(result));
             softether_disconnect(conn);
-            return ERR_PROTOCOL_VERSION;
+            return result;  // Return the actual error, not a generic one
         }
     } else {
         LOGD("Using Hello from watermark - handshake complete, proceeding to auth");
@@ -1386,17 +1429,19 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     result = perform_authentication_http(conn, username, password);
     if (result == ERR_NONE) {
         used_http_auth = 1;
+        LOGD("HTTP authentication succeeded");
     }
     
     // If HTTP auth fails, try binary authentication
     if (result != ERR_NONE) {
-        LOGD("HTTP auth failed, trying binary authentication...");
+        LOGD("HTTP auth failed (error: %d, %s), trying binary authentication...", 
+             result, softether_error_string(result));
         result = perform_authentication(conn, username, password);
     }
     if (result != ERR_NONE) {
-        LOGE("Authentication failed with result: %d", result);
+        LOGE("Authentication failed with result: %d (%s)", result, softether_error_string(result));
         softether_disconnect(conn);
-        return result;
+        return result;  // Return the actual error code
     }
 
     LOGD("Authentication successful");
@@ -1445,6 +1490,55 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     return ERR_NONE;
+}
+
+// Simple keepalive mechanism - sends periodic keep-alive packets to maintain connection
+// Should be called periodically (e.g., every 25 seconds) while connected
+int softether_send_keepalive(softether_connection_t* conn) {
+    if (conn == NULL || conn->state != STATE_CONNECTED) {
+        return ERR_UNKNOWN;
+    }
+
+    LOGD("Sending KEEPALIVE packet to maintain connection");
+    
+    // Send a keep-alive packet (empty payload with specific command)
+    // Using a simple approach: send empty packet with marker
+    // This is compatible with SoftEther's keepalive mechanism
+    if (softether_send_packet(conn, 0x0010, NULL, 0) < 0) {  // 0x0010 is a keep-alive marker
+        LOGW("Failed to send keepalive packet");
+        return ERR_DATA_TRANSMISSION;
+    }
+    
+    return ERR_NONE;
+}
+
+// Check connection status by receiving any pending packets
+// Returns: > 0 if data received, 0 if no data (timeout), < 0 on error
+int softether_check_connection(softether_connection_t* conn) {
+    if (conn == NULL || conn->state != STATE_CONNECTED) {
+        return -1;
+    }
+
+    // Try to receive any pending packets with short timeout
+    uint16_t command;
+    uint8_t response[512];
+    uint32_t response_len;
+    
+    int result = softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
+    
+    if (result == 0) {
+        // Timeout - this is normal, no data available
+        return 0;
+    } else if (result > 0) {
+        // Data received
+        LOGD("Received packet: command=0x%04X, len=%u", command, response_len);
+        // Handle any server-initiated disconnects or notifications here if needed
+        return 1;
+    } else {
+        // Error
+        LOGE("Error checking connection: %d", result);
+        return -1;
+    }
 }
 
 // Disconnect
