@@ -399,3 +399,93 @@ void ssl_shutdown(ssl_context_t* ctx) {
     SSL_shutdown(ctx->ssl);
     ctx->connected = 0;
 }
+
+// MD5 hashing
+void md5_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
+    if (data == NULL || hash == NULL) {
+        LOGE("md5_hash: Invalid parameters");
+        return;
+    }
+
+    unsigned int hash_len = 0;
+    unsigned char md_buf[EVP_MAX_MD_SIZE];
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    
+    if (mdctx == NULL) {
+        LOGE("md5_hash: Failed to create EVP_MD_CTX");
+        return;
+    }
+    
+    if (!EVP_DigestInit_ex(mdctx, EVP_md5(), NULL)) {
+        LOGE("md5_hash: EVP_DigestInit_ex failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    if (!EVP_DigestUpdate(mdctx, data, data_len)) {
+        LOGE("md5_hash: EVP_DigestUpdate failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    if (!EVP_DigestFinal_ex(mdctx, md_buf, &hash_len)) {
+        LOGE("md5_hash: EVP_DigestFinal_ex failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    EVP_MD_CTX_free(mdctx);
+    
+    if (hash_len != MD5_HASH_SIZE) {
+        LOGE("md5_hash: Unexpected hash length %u (expected %d)", hash_len, MD5_HASH_SIZE);
+        return;
+    }
+    
+    memcpy(hash, md_buf, MD5_HASH_SIZE);
+    LOGD("md5_hash: Successfully hashed %zu bytes", data_len);
+}
+
+// SHA1 hashing
+void sha1_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
+    if (data == NULL || hash == NULL) {
+        LOGE("sha1_hash: Invalid parameters");
+        return;
+    }
+
+    unsigned int hash_len = 0;
+    unsigned char md_buf[EVP_MAX_MD_SIZE];
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    
+    if (mdctx == NULL) {
+        LOGE("sha1_hash: Failed to create EVP_MD_CTX");
+        return;
+    }
+    
+    if (!EVP_DigestInit_ex(mdctx, EVP_sha1(), NULL)) {
+        LOGE("sha1_hash: EVP_DigestInit_ex failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    if (!EVP_DigestUpdate(mdctx, data, data_len)) {
+        LOGE("sha1_hash: EVP_DigestUpdate failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    if (!EVP_DigestFinal_ex(mdctx, md_buf, &hash_len)) {
+        LOGE("sha1_hash: EVP_DigestFinal_ex failed");
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    
+    EVP_MD_CTX_free(mdctx);
+    
+    if (hash_len != SHA1_HASH_SIZE) {
+        LOGE("sha1_hash: Unexpected hash length %u (expected %d)", hash_len, SHA1_HASH_SIZE);
+        return;
+    }
+    
+    memcpy(hash, md_buf, SHA1_HASH_SIZE);
+    LOGD("sha1_hash: Successfully hashed %zu bytes", data_len);
+}

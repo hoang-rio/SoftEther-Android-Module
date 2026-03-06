@@ -31,6 +31,14 @@ int aes_encrypt(aes_context_t* ctx, const uint8_t* plaintext, size_t plaintext_l
 int aes_decrypt(aes_context_t* ctx, const uint8_t* ciphertext, size_t ciphertext_len,
                 uint8_t* plaintext, size_t* plaintext_len);
 
+// MD5 hashing (16 bytes output)
+#define MD5_HASH_SIZE 16
+void md5_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
+
+// SHA1 hashing (20 bytes output)
+#define SHA1_HASH_SIZE 20
+void sha1_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
+
 // SHA256 hashing
 void sha256_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
 

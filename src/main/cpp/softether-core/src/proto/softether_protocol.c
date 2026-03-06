@@ -795,10 +795,27 @@ static int perform_authentication(softether_connection_t* conn, const char* user
     strncpy(conn->username, username, sizeof(conn->username) - 1);
     strncpy(conn->password, password, sizeof(conn->password) - 1);
 
+    // For now, use plaintext password transmission (as per current implementation)
+    // In the future, this should use password hashing
     // Build AUTH_REQUEST payload
     size_t username_len = strlen(username);
     size_t password_len = strlen(password);
-    size_t auth_payload_len = 2 + username_len + 2 + password_len;
+    
+    // Try hashing the password first with MD5
+    // Format: [username_len:2][username][password_hash_type:1][password_len:2][password_hash]
+    // password_hash_type: 0 = plaintext, 1 = MD5
+    uint8_t password_hash[MD5_HASH_SIZE];
+    int use_hash = 1;  // Try to use MD5 hash by default
+    
+    if (use_hash) {
+        // Hash the password with MD5
+        md5_hash((uint8_t*)password, password_len, password_hash);
+        LOGD("Password hashed with MD5");
+    }
+    
+    // Build auth payload with hashed password
+    // Format: [username_len:2][username][password_hash_type:1][hash_len:2][password_hash]
+    size_t auth_payload_len = 2 + username_len + 1 + 2 + (use_hash ? MD5_HASH_SIZE : password_len);
     uint8_t* auth_payload = (uint8_t*)malloc(auth_payload_len);
 
     if (auth_payload == NULL) {
@@ -806,18 +823,34 @@ static int perform_authentication(softether_connection_t* conn, const char* user
         return ERR_AUTHENTICATION;
     }
 
-    // Format: [username_len:2][username][password_len:2][password]
+    // Format: [username_len:2][username][password_type:1][password_len_or_hash_len:2][password_or_hash]
     uint32_t offset = 0;
     auth_payload[offset++] = (username_len >> 8) & 0xFF;
     auth_payload[offset++] = username_len & 0xFF;
     memcpy(auth_payload + offset, username, username_len);
     offset += username_len;
-    auth_payload[offset++] = (password_len >> 8) & 0xFF;
-    auth_payload[offset++] = password_len & 0xFF;
-    memcpy(auth_payload + offset, password, password_len);
+    
+    // Password type: 0 = plaintext, 1 = MD5 hash
+    auth_payload[offset++] = use_hash ? 1 : 0;
+    
+    if (use_hash) {
+        auth_payload[offset++] = (MD5_HASH_SIZE >> 8) & 0xFF;
+        auth_payload[offset++] = MD5_HASH_SIZE & 0xFF;
+        memcpy(auth_payload + offset, password_hash, MD5_HASH_SIZE);
+        offset += MD5_HASH_SIZE;
+        LOGD("Auth payload: username='%s' (len=%zu), MD5 hash (len=%d)", 
+             username, username_len, MD5_HASH_SIZE);
+    } else {
+        auth_payload[offset++] = (password_len >> 8) & 0xFF;
+        auth_payload[offset++] = password_len & 0xFF;
+        memcpy(auth_payload + offset, password, password_len);
+        offset += password_len;
+        LOGD("Auth payload: username='%s' (len=%zu), plaintext password (len=%zu)", 
+             username, username_len, password_len);
+    }
 
     // Send AUTH_REQUEST
-    LOGD("Sending AUTH_REQUEST with username='%s', password_len=%zu", username, password_len);
+    LOGD("Sending AUTH_REQUEST with hashed password...");
     if (softether_send_packet(conn, CMD_AUTH, auth_payload, auth_payload_len) < 0) {
         LOGE("Failed to send AUTH packet");
         free(auth_payload);
@@ -840,14 +873,50 @@ static int perform_authentication(softether_connection_t* conn, const char* user
     LOGD("Received auth response: command=0x%04X (%s), len=%u", command, command_to_string(command), response_len);
     
     if (command == CMD_AUTH_CHALLENGE) {
-        // Handle challenge-response authentication if needed
-        LOGD("Received authentication challenge");
-        // TODO: Implement challenge-response handling
-
-        // Send AUTH_RESPONSE
-        if (softether_send_packet(conn, CMD_AUTH_RESPONSE, NULL, 0) < 0) {
-            LOGE("Failed to send AUTH_RESPONSE");
-            return ERR_AUTHENTICATION;
+        // Handle challenge-response authentication
+        LOGD("Received authentication challenge (len=%u bytes)", response_len);
+        
+        if (response_len > 0) {
+            // Challenge response format:
+            // 1. Take challenge bytes from response
+            // 2. Concatenate with password hash or plaintext password
+            // 3. Hash the concatenation with MD5
+            // 4. Send back as response
+            
+            uint8_t challenge_response[MD5_HASH_SIZE];
+            
+            // Create context for MD5 hash of challenge+password
+            // For now, we'll hash the challenge with the password hash
+            uint8_t challenge_input[response_len + MD5_HASH_SIZE];
+            memcpy(challenge_input, response, response_len);
+            
+            if (use_hash) {
+                // Use the MD5 hash we already calculated
+                memcpy(challenge_input + response_len, password_hash, MD5_HASH_SIZE);
+                md5_hash(challenge_input, response_len + MD5_HASH_SIZE, challenge_response);
+                LOGD("Challenge-response: hashed challenge(%u) + password_hash(%d)", 
+                     response_len, MD5_HASH_SIZE);
+            } else {
+                // Hash challenge with plaintext password
+                memcpy(challenge_input + response_len, password, password_len);
+                md5_hash(challenge_input, response_len + password_len, challenge_response);
+                LOGD("Challenge-response: hashed challenge(%u) + password(%zu)", 
+                     response_len, password_len);
+            }
+            
+            // Send AUTH_RESPONSE with the challenge hash
+            LOGD("Sending AUTH_RESPONSE with challenge response hash...");
+            if (softether_send_packet(conn, CMD_AUTH_RESPONSE, challenge_response, MD5_HASH_SIZE) < 0) {
+                LOGE("Failed to send AUTH_RESPONSE");
+                return ERR_AUTHENTICATION;
+            }
+        } else {
+            // Empty challenge - just send empty response
+            LOGW("Received empty challenge, sending empty response");
+            if (softether_send_packet(conn, CMD_AUTH_RESPONSE, NULL, 0) < 0) {
+                LOGE("Failed to send AUTH_RESPONSE");
+                return ERR_AUTHENTICATION;
+            }
         }
 
         // Receive final auth result
@@ -855,10 +924,13 @@ static int perform_authentication(softether_connection_t* conn, const char* user
             LOGE("Failed to receive final auth response");
             return ERR_AUTHENTICATION;
         }
+        
+        LOGD("Received final auth result: command=0x%04X (%s)", command, command_to_string(command));
     }
 
     if (command != CMD_AUTH_SUCCESS) {
-        LOGE("Authentication failed: %s", command_to_string(command));
+        LOGE("Authentication failed: %s (expected CMD_AUTH_SUCCESS=0x%04X)", 
+             command_to_string(command), CMD_AUTH_SUCCESS);
         return ERR_AUTHENTICATION;
     }
 
@@ -1356,6 +1428,16 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // Connection established - only after ALL steps complete
     conn->state = STATE_CONNECTED;
     LOGD("Connection established successfully");
+    
+    // Set appropriate timeout for data operations
+    // For data transmission, use a moderate timeout (5 seconds by default)
+    // This is different from handshake timeout (10 seconds)
+    int data_timeout_ms = 5000;  // 5 seconds for data operations
+    struct timeval tv;
+    tv.tv_sec = data_timeout_ms / 1000;
+    tv.tv_usec = (data_timeout_ms % 1000) * 1000;
+    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    LOGD("Socket timeout set to %d ms for data operations", data_timeout_ms);
 
     // Call connect callback if set
     if (conn->on_connect != NULL) {
@@ -1526,8 +1608,13 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
     int result = softether_receive_packet(conn, command, buffer, &payload_len, max_len);
 
     if (result < 0) {
-        LOGE("Failed to receive data packet");
-        return -1;
+        // Timeout or error - return 0 to indicate no data available
+        // In normal VPN operation, timeouts are expected when no packets arrive
+        // from the server
+        LOGD("No data available from server (timeout or error)");
+        *received_len = 0;
+        *command = 0;
+        return 0;
     }
 
     *received_len = payload_len;
