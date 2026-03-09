@@ -297,7 +297,7 @@ class SoftEtherVpnService : VpnService() {
     private fun sendConnectionStateBroadcast(state: String, hostname: String = "") {
         val ip = if (hostname.isNotEmpty()) hostname else currentAssignedIp
         notifyListeners(state, if (state == STATE_DISCONNECTED || state == STATE_ERROR) "" else ip)
-        Log.d(TAG, "State changed: $state ip=$ip")
+        Log.d(TAG, if (ip.isNotEmpty()) "State changed: $state ip=$ip" else "State changed: $state")
     }
 
     /**

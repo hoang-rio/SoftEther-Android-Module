@@ -81,16 +81,20 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
         LOGE("Invalid socket");
         return -1;
     }
-    
+
     char ip_str[64];
-    if (resolve_hostname(host, ip_str, sizeof(ip_str)) != 0) {
+    // Try treating host as a literal IP first to avoid redundant DNS lookup
+    if (inet_pton(AF_INET, host, &(struct in_addr){0}) == 1) {
+        strncpy(ip_str, host, sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = '\0';
+    } else if (resolve_hostname(host, ip_str, sizeof(ip_str)) != 0) {
         return -1;
     }
-    
+
     memset(&sock->addr, 0, sizeof(sock->addr));
     sock->addr.sin_family = AF_INET;
     sock->addr.sin_port = htons(port);
-    
+
     if (inet_pton(AF_INET, ip_str, &sock->addr.sin_addr) <= 0) {
         LOGE("Invalid address: %s", ip_str);
         return -1;

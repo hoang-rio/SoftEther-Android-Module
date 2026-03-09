@@ -895,7 +895,7 @@ static int perform_tls_handshake(softether_connection_t* conn, const char* hostn
 
     conn->ssl_ctx = ssl_ctx;
 
-    // Perform SSL connect
+    // Perform SSL connect — pass hostname for SNI (server may require extension presence)
     if (ssl_connect(ssl_ctx, conn->socket_fd, hostname) != 0) {
         LOGE("SSL handshake failed");
         ssl_destroy(ssl_ctx);
@@ -1137,8 +1137,18 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
     conn->state = STATE_CONNECTING;
 
+    // Resolve hostname to IP upfront — use the IP for both TCP connect and TLS handshake.
+    // This ensures domain names are treated identically to IPs throughout the protocol.
+    char resolved_ip[64];
+    if (resolve_hostname(host, resolved_ip, sizeof(resolved_ip)) != 0) {
+        LOGE("Failed to resolve hostname: %s", host);
+        conn->state = STATE_DISCONNECTED;
+        return ERR_TCP_CONNECT;
+    }
+    const char* connect_host = resolved_ip;
+
     // Store server info
-    strncpy(conn->server_ip, host, sizeof(conn->server_ip) - 1);
+    strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
     
     // Store hub name
@@ -1156,8 +1166,8 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         return ERR_TCP_CONNECT;
     }
 
-    // Connect to server
-    if (socket_connect_timeout(sock, host, port, conn->timeout_ms) != 0) {
+    // Connect to server using resolved IP
+    if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
         LOGE("Failed to connect to server");
         socket_destroy(sock);
         conn->state = STATE_DISCONNECTED;
@@ -1169,8 +1179,8 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     sock->fd = -1;
     socket_destroy(sock);
 
-    // Perform TLS handshake
-    int result = perform_tls_handshake(conn, host);
+    // Perform TLS handshake using resolved IP (not domain) — avoids domain-SNI rejection
+    int result = perform_tls_handshake(conn, connect_host);
     if (result != ERR_NONE) {
         LOGE("TLS handshake failed");
         close(conn->socket_fd);

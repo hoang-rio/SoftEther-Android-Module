@@ -6,6 +6,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <android/log.h>
@@ -250,14 +251,13 @@ ssl_context_t* ssl_create_client(void) {
         return NULL;
     }
     
-    // Set TLS version — force TLS 1.2 for SoftEther compatibility
-    // Many VPNGate servers don't properly support TLS 1.3 data exchange
+    // Restrict to TLS 1.2 max — VPNGate servers reject TLS 1.3 ClientHellos with RST
     SSL_CTX_set_min_proto_version(ctx->ctx, TLS1_VERSION);
     SSL_CTX_set_max_proto_version(ctx->ctx, TLS1_2_VERSION);
-    
+
     // Auto-retry for renegotiation transparency
     SSL_CTX_set_mode(ctx->ctx, SSL_MODE_AUTO_RETRY);
-    
+
     // Disable verification for VPN connections (self-signed certs are common)
     SSL_CTX_set_verify(ctx->ctx, SSL_VERIFY_NONE, NULL);
     
@@ -292,7 +292,9 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
         return -1;
     }
     
-    // Set SNI hostname
+    // Set SNI hostname — hostname is always a resolved IP address at this point
+    // (domain names are resolved before TLS in softether_protocol.c).
+    // OpenSSL sends SNI with the IP string; VPNGate servers accept this.
     if (hostname != NULL) {
         SSL_set_tlsext_host_name(ctx->ssl, hostname);
     }
@@ -333,7 +335,16 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
         }
         
         // Other error - handshake failed
-        LOGE("SSL handshake failed: error=%d", ssl_error);
+        unsigned long err_detail = ERR_get_error();
+        if (ssl_error == SSL_ERROR_SYSCALL) {
+            // errno==0 means unexpected EOF (server closed connection)
+            LOGE("SSL handshake failed: error=%d SSL_ERROR_SYSCALL errno=%d (%s) detail=%lu (%s)",
+                 ssl_error, errno, strerror(errno), err_detail,
+                 err_detail ? ERR_error_string(err_detail, NULL) : "EOF/no-detail");
+        } else {
+            LOGE("SSL handshake failed: error=%d detail=%lu (%s)", ssl_error, err_detail,
+                 err_detail ? ERR_error_string(err_detail, NULL) : "none");
+        }
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
         return -1;
