@@ -1341,11 +1341,10 @@ void softether_disconnect(softether_connection_t* conn) {
 // Build an Ethernet frame around an IP packet
 static int build_ethernet_frame(uint8_t* frame, size_t max_frame_len,
                                 const uint8_t* ip_packet, size_t ip_len,
-                                const uint8_t* src_mac) {
+                                const uint8_t* src_mac,
+                                const uint8_t* dst_mac) {
     if (ip_len + ETH_HEADER_SIZE > max_frame_len) return -1;
-    // Destination: broadcast (for DHCP/ARP) or gateway MAC
-    // Using broadcast works universally with SecureNAT
-    memset(frame, 0xFF, 6);  // dst MAC = FF:FF:FF:FF:FF:FF
+    memcpy(frame, dst_mac, 6);  // dst MAC
     memcpy(frame + 6, src_mac, 6);  // src MAC
     // Determine EtherType from IP version
     uint16_t ethertype = ETH_TYPE_IPV4;
@@ -1369,9 +1368,13 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
         return -1;
     }
 
+    // Use gateway MAC if resolved, otherwise broadcast
+    const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const uint8_t* dst_mac = conn->gateway_mac_resolved ? conn->gateway_mac : broadcast_mac;
+
     // Wrap IP packet in Ethernet frame
     uint8_t frame[ETH_HEADER_SIZE + 65535];
-    int frame_len = build_ethernet_frame(frame, sizeof(frame), data, len, conn->client_mac);
+    int frame_len = build_ethernet_frame(frame, sizeof(frame), data, len, conn->client_mac, dst_mac);
     if (frame_len < 0) {
         LOGE("Failed to build Ethernet frame");
         return -1;
@@ -1388,6 +1391,7 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
 }
 
 // Receive data — uses queue to handle multi-block messages; strips Ethernet header
+// Also handles ARP requests automatically
 int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len) {
     if (conn == NULL || buffer == NULL || max_len == 0) {
         return -1;
@@ -1411,8 +1415,50 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
     queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
     uint32_t frame_len = entry->len;
 
+    // Handle ARP requests automatically (respond to server's ARP for our IP)
+    if (frame_len >= 42 && entry->data[12] == 0x08 && entry->data[13] == 0x06) {
+        if (entry->data[20] == 0x00 && entry->data[21] == 0x01 && conn->assigned_ip != 0) {
+            // ARP request — check if it's for our IP
+            uint32_t target_ip = ((uint32_t)entry->data[38] << 24) |
+                                 ((uint32_t)entry->data[39] << 16) |
+                                 ((uint32_t)entry->data[40] << 8) | entry->data[41];
+            if (target_ip == conn->assigned_ip) {
+                uint8_t reply[42];
+                memcpy(reply, entry->data + 6, 6);
+                memcpy(reply + 6, conn->client_mac, 6);
+                reply[12] = 0x08; reply[13] = 0x06;
+                reply[14] = 0x00; reply[15] = 0x01;
+                reply[16] = 0x08; reply[17] = 0x00;
+                reply[18] = 6; reply[19] = 4;
+                reply[20] = 0x00; reply[21] = 0x02;
+                memcpy(reply + 22, conn->client_mac, 6);
+                reply[28] = (conn->assigned_ip >> 24) & 0xFF;
+                reply[29] = (conn->assigned_ip >> 16) & 0xFF;
+                reply[30] = (conn->assigned_ip >> 8) & 0xFF;
+                reply[31] = conn->assigned_ip & 0xFF;
+                memcpy(reply + 32, entry->data + 22, 6);
+                memcpy(reply + 38, entry->data + 28, 4);
+                softether_send_raw(conn, reply, 42);
+                LOGD("Sent ARP reply for our IP");
+            }
+        }
+        // Skip ARP frames — not IP data for TUN
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
+        return 0;
+    }
+
     if (frame_len <= ETH_HEADER_SIZE) {
         // Too small for Ethernet — skip
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
+        return 0;
+    }
+
+    // Check EtherType — only pass IPv4/IPv6 to TUN
+    uint16_t ethertype = (entry->data[12] << 8) | entry->data[13];
+    if (ethertype != 0x0800 && ethertype != 0x86DD) {
+        // Not IP — skip (e.g., ARP already handled above)
         conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
         conn->recv_queue_count--;
         return 0;
@@ -1476,6 +1522,76 @@ int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t m
     return (int)entry->len;
 }
 
+// ARP resolution — resolves gateway MAC address after DHCP
+int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_host) {
+    if (conn == NULL || conn->state != STATE_CONNECTED) return -1;
+
+    conn->gateway_ip = gateway_ip_host;
+    LOGD("Resolving gateway MAC for IP %d.%d.%d.%d",
+         (gateway_ip_host >> 24) & 0xFF, (gateway_ip_host >> 16) & 0xFF,
+         (gateway_ip_host >> 8) & 0xFF, gateway_ip_host & 0xFF);
+
+    // Build ARP request
+    uint8_t arp_req[42];
+    memset(arp_req, 0xFF, 6);                    // dst: broadcast
+    memcpy(arp_req + 6, conn->client_mac, 6);    // src: our MAC
+    arp_req[12] = 0x08; arp_req[13] = 0x06;      // EtherType: ARP
+
+    arp_req[14] = 0x00; arp_req[15] = 0x01;      // Hardware: Ethernet
+    arp_req[16] = 0x08; arp_req[17] = 0x00;      // Protocol: IPv4
+    arp_req[18] = 6; arp_req[19] = 4;
+    arp_req[20] = 0x00; arp_req[21] = 0x01;      // Operation: request
+
+    memcpy(arp_req + 22, conn->client_mac, 6);   // Sender MAC
+    // Sender IP: our assigned IP
+    arp_req[28] = (conn->assigned_ip >> 24) & 0xFF;
+    arp_req[29] = (conn->assigned_ip >> 16) & 0xFF;
+    arp_req[30] = (conn->assigned_ip >> 8) & 0xFF;
+    arp_req[31] = conn->assigned_ip & 0xFF;
+
+    memset(arp_req + 32, 0, 6);                   // Target MAC: unknown
+    arp_req[38] = (gateway_ip_host >> 24) & 0xFF;
+    arp_req[39] = (gateway_ip_host >> 16) & 0xFF;
+    arp_req[40] = (gateway_ip_host >> 8) & 0xFF;
+    arp_req[41] = gateway_ip_host & 0xFF;
+
+    softether_send_raw(conn, arp_req, 42);
+
+    // Wait for ARP reply (up to 3 seconds, 3 attempts)
+    for (int attempt = 0; attempt < 3; attempt++) {
+        for (int i = 0; i < 40; i++) {  // 40 × 50ms = 2s per attempt
+            uint8_t frame[2048];
+            uint32_t frame_len = 0;
+            int ret = softether_receive_raw(conn, frame, sizeof(frame), &frame_len);
+            if (ret > 0 && frame_len >= 42) {
+                // Check for ARP reply
+                if (frame[12] == 0x08 && frame[13] == 0x06 &&
+                    frame[20] == 0x00 && frame[21] == 0x02) {
+                    uint32_t sender_ip = ((uint32_t)frame[28] << 24) |
+                                         ((uint32_t)frame[29] << 16) |
+                                         ((uint32_t)frame[30] << 8) | frame[31];
+                    if (sender_ip == gateway_ip_host) {
+                        memcpy(conn->gateway_mac, frame + 22, 6);
+                        conn->gateway_mac_resolved = 1;
+                        LOGD("Gateway MAC resolved: %02X:%02X:%02X:%02X:%02X:%02X",
+                             conn->gateway_mac[0], conn->gateway_mac[1],
+                             conn->gateway_mac[2], conn->gateway_mac[3],
+                             conn->gateway_mac[4], conn->gateway_mac[5]);
+                        return 0;
+                    }
+                }
+            } else if (ret == 0) {
+                usleep(50000);  // 50ms
+            }
+        }
+        // Resend ARP request
+        softether_send_raw(conn, arp_req, 42);
+        LOGD("Resending ARP request (attempt %d)", attempt + 1);
+    }
+
+    LOGE("Failed to resolve gateway MAC");
+    return -1;
+}
 // Data tunnel operations - Send data block
 int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint32_t data_len) {
     if (conn == NULL || data == NULL) {

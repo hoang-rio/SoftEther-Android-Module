@@ -81,6 +81,11 @@ typedef struct softether_connection {
     int session_established;    // 1 if Welcome PACK was parsed successfully
     // Client MAC address (for Ethernet L2 encapsulation)
     uint8_t client_mac[6];     // Locally-administered random MAC
+    // Gateway MAC address (resolved via ARP after DHCP)
+    uint8_t gateway_mac[6];    // Destination MAC for outgoing IP packets
+    int gateway_mac_resolved;  // 1 if gateway MAC has been resolved via ARP
+    uint32_t gateway_ip;       // Gateway IP in host byte order (from DHCP)
+    uint32_t assigned_ip;      // Our assigned IP in host byte order (from DHCP)
     // Receive frame queue (for multi-block messages)
     queued_frame_t recv_queue[RECV_QUEUE_SIZE];
     int recv_queue_head;       // read position
@@ -117,6 +122,9 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
 // Raw L2 I/O (sends/receives raw Ethernet frames — used by DHCP)
 int softether_send_raw(softether_connection_t* conn, const uint8_t* frame, size_t len);
 int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t max_len, uint32_t* frame_len);
+
+// ARP resolution — resolves gateway MAC after DHCP
+int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_host);
 
 // Protocol operations
 int softether_send_packet(softether_connection_t* conn, uint16_t command,

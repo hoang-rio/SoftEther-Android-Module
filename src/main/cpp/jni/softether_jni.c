@@ -6,6 +6,7 @@
 
 #define TAG "SoftEtherJNI"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // JNI Implementation for SoftEtherClient
@@ -241,6 +242,19 @@ JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nat
     memset(&result, 0, sizeof(result));
 
     int ret = softether_do_dhcp(conn, &result);
+
+    // After DHCP success, resolve gateway MAC via ARP
+    if (ret == 0 && result.success && result.gateway != 0) {
+        conn->assigned_ip = result.assigned_ip;
+        LOGD("DHCP success, resolving gateway MAC...");
+        int arp_ret = softether_resolve_gateway(conn, result.gateway);
+        if (arp_ret != 0) {
+            LOGW("Gateway ARP resolution failed, falling back to DNS server");
+            if (result.dns_server != 0) {
+                softether_resolve_gateway(conn, result.dns_server);
+            }
+        }
+    }
 
     // Return array: [success, assigned_ip, subnet_mask, gateway, dns_server, dns_server2, lease_time]
     jintArray arr = (*env)->NewIntArray(env, 7);
