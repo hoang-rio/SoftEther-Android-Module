@@ -18,7 +18,7 @@ data class ConnectionConfig(
     val dnsServer: String = "8.8.8.8",
     val mtu: Int = 1500,
     val routes: List<Route> = listOf(Route("0.0.0.0", 0)), // Default route all traffic
-    val allowedApps: List<String> = emptyList(), // Apps allowed to bypass VPN
+    val excludedApps: List<String> = emptyList(), // Apps excluded from VPN (bypass VPN tunnel)
     val isMetered: Boolean = false,
     val useTcp: Boolean = true,
     val useUdp: Boolean = false,
@@ -41,7 +41,7 @@ data class ConnectionConfig(
         dnsServer = parcel.readString() ?: "8.8.8.8",
         mtu = parcel.readInt(),
         routes = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("0.0.0.0", 0)),
-        allowedApps = parcel.createStringArrayList() ?: emptyList(),
+        excludedApps = parcel.createStringArrayList() ?: emptyList(),
         isMetered = parcel.readByte() != 0.toByte(),
         useTcp = parcel.readByte() != 0.toByte(),
         useUdp = parcel.readByte() != 0.toByte(),
@@ -64,7 +64,7 @@ data class ConnectionConfig(
         parcel.writeString(dnsServer)
         parcel.writeInt(mtu)
         parcel.writeTypedList(routes)
-        parcel.writeStringList(allowedApps)
+        parcel.writeStringList(excludedApps)
         parcel.writeByte(if (isMetered) 1 else 0)
         parcel.writeByte(if (useTcp) 1 else 0)
         parcel.writeByte(if (useUdp) 1 else 0)

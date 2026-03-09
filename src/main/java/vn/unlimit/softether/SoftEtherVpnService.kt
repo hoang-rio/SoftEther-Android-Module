@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
@@ -315,9 +316,13 @@ class SoftEtherVpnService : VpnService() {
             builder.addRoute(route.address, route.prefixLength)
         }
 
-        // Allow bypass for certain apps if configured
-        config.allowedApps.forEach { packageName ->
-            builder.addAllowedApplication(packageName)
+        // Exclude apps from VPN tunnel (they will use normal network instead)
+        config.excludedApps.forEach { packageName ->
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (e: PackageManager.NameNotFoundException) {
+                Log.w(TAG, "Excluded app not found, skipping: $packageName")
+            }
         }
 
         // Configure as metered/unmetered
