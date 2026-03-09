@@ -169,10 +169,10 @@ class ConnectionController(
             throw Exception("Connection failed with error code: $result")
         }
 
-        // Connection established — set CONNECTED state
-        // (State monitor may have already set CONNECTED; avoid downgrading to SESSION_SETUP)
+        // Connection established at protocol level — run DHCP before announcing CONNECTED
+        // Keep internal state as SESSION_SETUP (DHCP phase) until we have an IP
         if (currentState != ConnectionState.CONNECTED) {
-            currentState = ConnectionState.CONNECTED
+            currentState = ConnectionState.SESSION_SETUP
         }
         reconnectAttempts.set(0) // Reset on successful connection
         // Set external handle so send/receive work through ConnectionController
@@ -222,6 +222,9 @@ class ConnectionController(
             vpnInterface = service.establishVpnInterface(config)
                 ?: throw Exception("Failed to establish VPN interface")
         }
+
+        // Now that we have an IP and VPN interface, transition to CONNECTED
+        currentState = ConnectionState.CONNECTED
 
         // Start data forwarding loops
         startDataForwarding()

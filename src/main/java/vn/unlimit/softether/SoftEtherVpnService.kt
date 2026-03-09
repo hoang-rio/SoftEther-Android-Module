@@ -11,7 +11,9 @@ import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -29,19 +31,21 @@ import vn.unlimit.softether.model.ConnectionState
  */
 class SoftEtherVpnService : VpnService() {
 
+    /** Listener interface — same pattern as OpenVPN's VpnStatus.StateListener */
+    interface StateListener {
+        fun onSoftEtherStateChanged(state: String, assignedIp: String)
+    }
+
     companion object {
         private const val TAG = "SoftEtherVpnService"
         private const val NOTIFICATION_CHANNEL_ID = "SoftEtherVPN"
         private const val NOTIFICATION_ID = 1001
 
-        // Actions
+        // Actions (kept for service start/stop intents)
         const val ACTION_CONNECT = "vn.unlimit.softether.CONNECT"
         const val ACTION_DISCONNECT = "vn.unlimit.softether.DISCONNECT"
 
-        // Broadcast actions
-        const val ACTION_CONNECTION_STATE = "vn.unlimit.softether.CONNECTION_STATE"
-        const val EXTRA_STATE = "state"
-        const val EXTRA_HOSTNAME = "hostname"
+        // State string constants
         const val STATE_CONNECTED = "CONNECTED"
         const val STATE_DISCONNECTED = "DISCONNECTED"
         const val STATE_ERROR = "ERROR"
@@ -54,6 +58,35 @@ class SoftEtherVpnService : VpnService() {
 
         // Extras
         const val EXTRA_CONFIG = "config"
+
+        // Static state — survives Activity recreation, updated on every state change
+        var currentState: String = STATE_DISCONNECTED
+            private set
+        var currentAssignedIp: String = ""
+            private set
+
+        private val stateListeners = mutableListOf<StateListener>()
+        private val mainHandler = Handler(Looper.getMainLooper())
+
+        fun addStateListener(listener: StateListener) {
+            if (!stateListeners.contains(listener)) {
+                stateListeners.add(listener)
+                // Immediately deliver current state (same as OpenVPN's mLaststate replay)
+                listener.onSoftEtherStateChanged(currentState, currentAssignedIp)
+            }
+        }
+
+        fun removeStateListener(listener: StateListener) {
+            stateListeners.remove(listener)
+        }
+
+        private fun notifyListeners(state: String, assignedIp: String) {
+            currentState = state
+            currentAssignedIp = assignedIp
+            mainHandler.post {
+                stateListeners.forEach { it.onSoftEtherStateChanged(state, assignedIp) }
+            }
+        }
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -176,16 +209,10 @@ class SoftEtherVpnService : VpnService() {
                     }
                 )
 
-                // Establish connection
+                // Establish connection (fires onStateChange -> STATE_CONNECTED with IP after DHCP)
                 controller?.connect()
                 isRunning = true
-
                 Log.d(TAG, "VPN connection established")
-                val displayIp = controller?.assignedLocalIp ?: config.serverHost
-                updateNotification(getString(R.string.softether_connected, displayIp))
-                
-                // Send connected broadcast
-                sendConnectionStateBroadcast(STATE_CONNECTED, displayIp)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Connection was cancelled (user pressed cancel)
@@ -264,17 +291,13 @@ class SoftEtherVpnService : VpnService() {
     }
 
     /**
-     * Send connection state broadcast to update UI
+     * Notify listeners of state change and update notification.
+     * Uses in-process listener pattern (no broadcasts) — works on all Android versions.
      */
     private fun sendConnectionStateBroadcast(state: String, hostname: String = "") {
-        val intent = Intent(ACTION_CONNECTION_STATE).apply {
-            putExtra(EXTRA_STATE, state)
-            if (hostname.isNotEmpty()) {
-                putExtra(EXTRA_HOSTNAME, hostname)
-            }
-        }
-        sendBroadcast(intent)
-        Log.d(TAG, "Sent connection state broadcast: $state")
+        val ip = if (hostname.isNotEmpty()) hostname else currentAssignedIp
+        notifyListeners(state, if (state == STATE_DISCONNECTED || state == STATE_ERROR) "" else ip)
+        Log.d(TAG, "State changed: $state ip=$ip")
     }
 
     /**
@@ -411,7 +434,7 @@ class SoftEtherVpnService : VpnService() {
                 }
                 sendConnectionStateBroadcast(
                     stateValue,
-                    if (state == ConnectionState.CONNECTED) hostname else ""
+                    if (state == ConnectionState.CONNECTED) (controller?.assignedLocalIp ?: hostname) else ""
                 )
             }
             return
@@ -439,7 +462,7 @@ class SoftEtherVpnService : VpnService() {
         }
         sendConnectionStateBroadcast(
             stateValue,
-            if (state == ConnectionState.CONNECTED) hostname else ""
+            if (state == ConnectionState.CONNECTED) (controller?.assignedLocalIp ?: hostname) else ""
         )
         
         // Process any pending state update
