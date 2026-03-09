@@ -3,8 +3,8 @@
 ## Overview
 This document outlines the plan for implementing SoftEther VPN protocol in C language within the SoftEtherClient Android module.
 
-**Target Repository:** `git@github.com:hoang-rio/SoftEtherVPN_Stable.git`  
-**Submodule:** `SoftEtherClient/` (points to `git@github.com:hoang-rio/SoftEther-Android-Module.git`)  
+**Target Repository:** https://github.com/SoftEtherVPN/SoftEtherVPN_Stable  
+**Submodule:** `SoftEtherClient/` (points to `https://github.com/hoang-rio/SoftEther-Android-Module.git`)  
 **Integration:** Android VPN app with existing OpenVPN and SSTP support
 
 ---
@@ -25,85 +25,54 @@ This document outlines the plan for implementing SoftEther VPN protocol in C lan
 
 ---
 
-## Current Status (2026-02-27)
+## Current Status (2026-03-09)
 
 ### Implementation Complete ✅
 
-All core implementation phases are complete:
+All core implementation phases are complete and stable:
 - ✅ Protocol implementation with VPNGate HTTP POST steps
 - ✅ JNI bridge and native libraries
 - ✅ Kotlin/Java VPN service and controller
 - ✅ Android instrumentation tests
-- ✅ App integration
+- ✅ App integration with OpenVPN, SoftEther, and MS-SSTP
+- ✅ Domain-to-IP resolution before TLS handshake (matching SoftEther client behavior)
+- ✅ Redundant DNS lookup elimination in TCP socket layer
+- ✅ Enhanced SSL error logging with errno and OpenSSL error details
 
-### Test Results (2026-02-27)
+### Key Improvements (2026-02-27 → 2026-03-09)
 
-Tests run in SoftEther VPN protocol order:
+**1. TLS Domain Resolution (softether_protocol.c):**
+- Resolve domain to IP upfront in `softether_connect_with_hub()` 
+- Use resolved IP for both TCP connect and TLS handshake
+- Eliminates duplicate DNS lookups and matches original SoftEther client behavior
 
-| Test | Protocol Step | Result |
-|------|--------------|--------|
-| test01TcpConnection | TCP Connection | ✅ PASS |
-| test02TlsHandshake | TLS Handshake | ✅ PASS |
-| test03SoftEtherHandshake | Protocol Handshake | ✅ PASS |
-| test04Authentication | Authentication | ✅ PASS |
-| test05SessionEstablishment | Session Setup | ✅ PASS (targeted rerun) |
-| test06DataTransmission | Data Transmission | ⏳ NOT RERUN |
-| test07Keepalive | Keepalive | ⏳ NOT RERUN |
-| test08FullConnectionLifecycle | Full Lifecycle | ⏳ NOT RERUN |
-| test09MultipleServers | Multiple Servers | ⏳ NOT RERUN |
+**2. TCP Socket Optimization (tcp_socket.c):**
+- `socket_connect_timeout()` now uses `inet_pton()` to detect if host is already a dotted-decimal IP
+- Skips redundant `resolve_hostname()` call when host is pure IP string
+- Result: single "Resolved X to X" log for both IP and domain inputs
 
-### Analysis
+**3. SSL Error Diagnostics (aes_wrapper.c):**
+- Enhanced `SSL_ERROR_SYSCALL` logging with errno, strerror, and ERR_get_error() details
+- Helps identify handshake failures (connection reset, EOF, timeout, etc.)
 
-**Passing Tests (5/9 confirmed):**
-- TCP Connection: Direct TCP connection to VPNGate servers works
-- TLS Handshake: SSL/TLS handshake completes successfully
-- SoftEther Handshake: HTTP detection + watermark + Hello reception works
-- Authentication: HTTP AUTH to /vpnsvc/vpn.cgi works
-- Session Establishment: PASS after PACK-auth session flow fix
+**4. UI/State Logging Cleanup (SoftEtherVpnService.kt, DetailActivity.kt):**
+- Omit empty `ip=` suffix when assigned IP is not yet populated
+- Clean logs for CONNECTING/DISCONNECTING states (only show `ip=` in CONNECTED state)
 
-**Pending verification:**
-- Tests 06-09 are pending rerun after session flow updates
+**5. MS-SSTP Protocol Dialog Integration (VpnProtocolSelectionDialog.kt, DetailActivity.kt):**
+- Merged standalone MS-SSTP button into protocol selection dialog
+- Protocol order: SoftEther TCP → SoftEther UDP → OpenVPN TCP → OpenVPN UDP → MS-SSTP
+- Full button state lifecycle for SSTP (Cancel while connecting, Disconnect while connected)
+- Wired SSTP connect/disconnect through protocol dialog callback
 
-### Key Fixes Applied (2026-02-27)
+### Protocol Support
 
-**1. Port Extraction Fix (VpngateServerProvider.kt):**
-- Changed from hardcoded port 443 to dynamically extract port from the OpenVPN config data
-- Uses regex pattern `remote IP PORT` to extract the actual port
+| Transport | Status |
+|-----------|--------|
+| TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
+| UDP (SoftEther RUDP) | 🚧 Planned |
 
-**2. SSL Handshake Fix (aes_wrapper.c):**
-- Added retry loop for TLS negotiation to handle intermittent SSL failures
-
-**3. Test Session Fix (native_test.c):**
-- Changed test_session to use HTTP POST for authentication (same as test_authentication)
-- Added `goto skip_receive` when Hello is received from watermark to avoid duplicate packet receive
-
-**4. Main App Session Fix (softether_protocol.c):**
-- Updated HTTP/PACK auth flow handling to avoid legacy SESSION/CONFIG commands after successful HTTP login
-- Added explicit native state transition to `STATE_SESSION_SETUP` before final `STATE_CONNECTED`
-
-**5. Native Test Session Fix (native_test.c):**
-- Marked successful HTTP auth responses (`CMD_AUTH_SUCCESS`, `CMD_AUTH_CHALLENGE`, `0x0000`, HTTP 200 fallback) as PACK-auth flow
-- Skip legacy `SESSION_REQUEST/CONFIG_REQUEST` when HTTP/PACK login already established the session context
-
-**6. JNI/Kotlin State Visibility & Notification Updates:**
-- Added `nativeGetState()` JNI method (`softether_jni.h/.c`, `SoftEtherClient.kt`)
-- Added native-state monitoring in `ConnectionController.kt` to propagate phase transitions
-- Updated `SoftEtherVpnService.kt` to broadcast and display granular state notifications:
-  - `CONNECTING`
-  - `TLS_HANDSHAKE`
-  - `PROTOCOL_HANDSHAKE`
-  - `AUTHENTICATING`
-  - `SESSION_SETUP`
-  - `CONNECTED` / `DISCONNECTING` / `DISCONNECTED`
-
-```c
-// New function added to softether_protocol.c
-static int setup_session_http(softether_connection_t* conn) {
-    // Send SESSION_REQUEST via HTTP POST to vpn.cgi
-    // Send CONFIG_REQUEST via HTTP POST to vpn.cgi
-    // This is required for VPNGate servers
-}
-```
+**TCP** is the only currently supported transport. UDP (RUDP) support is planned and requires implementing ~5000+ lines of reliable-UDP layer with NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures.
 
 ---
 
@@ -128,32 +97,56 @@ Client                              Server
 
 ---
 
-## Files Modified
+## Files Modified (2026-03-09)
 
-### Native C Code (Main App)
+### Native C Code
 - `SoftEtherClient/src/main/cpp/softether-core/src/proto/softether_protocol.c`
-  - Updated session establishment behavior for HTTP/PACK auth flow
-  - Added explicit `STATE_SESSION_SETUP` transition before `STATE_CONNECTED`
+  - Resolve domain to IP upfront via `resolve_hostname()` in `softether_connect_with_hub()`
+  - Pass resolved IP (not domain) to both `socket_connect_timeout()` and `perform_tls_handshake()`
+  
+- `SoftEtherClient/src/main/cpp/softether-core/src/socket/tcp_socket.c`
+  - Add `inet_pton()` check before DNS lookup in `socket_connect_timeout()`
+  - Skip redundant `resolve_hostname()` when host is already a dotted-decimal IP
 
-### JNI Bridge
-- `SoftEtherClient/src/main/cpp/jni/softether_jni.h`
-- `SoftEtherClient/src/main/cpp/jni/softether_jni.c`
-  - Added `nativeGetState()`
-
-### Native C Code (Test)
-- `SoftEtherClient/src/main/cpp/test/native_test.c`
-  - Updated HTTP auth success branches to correctly mark PACK-auth flow
-  - Skip legacy session/config exchange when HTTP/PACK login already succeeded
+- `SoftEtherClient/src/main/cpp/softether-core/src/crypto/aes_wrapper.c`
+  - Enhanced `SSL_ERROR_SYSCALL` logging: errno, strerror, ERR_get_error() details
 
 ### Kotlin Layer
-- `SoftEtherClient/src/main/java/vn/unlimit/softether/client/SoftEtherClient.kt`
-- `SoftEtherClient/src/main/java/vn/unlimit/softether/controller/ConnectionController.kt`
 - `SoftEtherClient/src/main/java/vn/unlimit/softether/SoftEtherVpnService.kt`
-  - Added native state monitoring + app-state mapping
-  - Added explicit session-establishment UI/broadcast state updates
+  - Omit `ip=` suffix when assigned IP is empty in state logs
+  
+- `SoftEtherClient/src/main/java/vn/unlimit/softether/controller/ConnectionController.kt`
+  - (No changes in 2026-03-09; maintains existing state management)
+
+### App Module (Main App Integration)
+- `app/src/main/java/vn/unlimit/vpngate/dialog/VpnProtocolSelectionDialog.kt`
+  - Add MS-SSTP to protocol enum
+  - Reorder protocols: SoftEther TCP/UDP first, OpenVPN TCP/UDP second, MS-SSTP last
+  - Show/hide MS-SSTP card based on `connection.isSSTPSupport()`
+
+- `app/src/main/res/layout/dialog_vpn_protocol_selection.xml`
+  - Reorder protocol cards to match new preference order
+
+- `app/src/main/java/vn/unlimit/vpngate/activities/DetailActivity.kt`
+  - Update `connectSSTPVPN()`: set button state (Cancel + orange) while connecting
+  - Update `initSSTP()`: set button state on connection/disconnection in prefs listener
+  - Update `handleSSTPBtn()`: set button state (Connect) when disconnecting
+  - Handle SSTP connected state in `onClick()` → `handleSSTPBtn()`
+  - Handle SSTP cancel in `isConnecting` path → `startVpnSSTPService(DISCONNECT)`
+  - Remove standalone `btn_sstp_connect` button from `activity_detail.xml`
+
+- `app/src/main/res/layout/activity_detail.xml`
+  - Remove `ln_sstp_btn` LinearLayout and `btn_sstp_connect` Button
+
+- `app/src/main/res/values/strings.xml`
+  - Add `ms_sstp` string resource
 
 ### Documentation
+- `SoftEtherClient/README.md`
+  - Add Protocol Support section documenting TCP (supported) and UDP (planned)
+  
 - `SoftEtherClient/IMPLEMENTATION_PLAN.md` (this file)
+  - Updated status, key improvements, protocol support table
 
 ---
 
@@ -171,17 +164,20 @@ Client                              Server
 
 ## Remaining Tasks
 
-1. **Run Full Instrumentation Suite (Tests 06-09)**
-   - Validate data transmission / keepalive / lifecycle / multi-server flows after session fix
+1. **UDP (RUDP) Support**
+   - Implement reliable UDP transport layer with sequence numbers, ACKs, retransmission
+   - Add NAT traversal support
+   - Integrate with existing native layer
 
-2. **Stability Validation**
-   - Some VPNGate servers may have different requirements
-   - Validate behavior across multiple server profiles
+2. **Additional Stability & Testing**
+   - Run full instrumentation suite periodically
+   - Validate behavior across diverse VPNGate server profiles
+   - Monitor for any edge cases in domain resolution or SSL handshakes
 
-3. **Cleanup Warnings (Optional)**
-   - Address non-blocking compiler warnings (unused helpers / deprecated connectivity broadcast)
+3. **Optional Cleanup (Non-blocking)**
+   - Address compiler warnings (unused helpers, deprecated connectivity broadcast)
 
 ---
 
-*Last Updated: 2026-02-27*
-*Status: ✅ Core protocol implementation complete, test05 session establishment passing, main-app session state + notifications updated*
+*Last Updated: 2026-03-09*
+*Status: ✅ TCP protocol fully working, dialog merged, domain→IP resolution implemented, button states consistent with OpenVPN/SoftEther*
