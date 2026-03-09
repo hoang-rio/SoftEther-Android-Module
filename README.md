@@ -28,7 +28,8 @@ Key reference files used:
 
 # LICENSE
 
-This project is under Apache License 2.0 ([LICENSE](LICENSE))
+This project is under Apache License 2.0 ([LICENSE](LICENSE)) for all original code.
 
-This project use another open source project as library detail bellow.
+Third-party components retain their original licenses:
 * [**SoftEtherVPN**](https://github.com/SoftEtherVPN/SoftEtherVPN_Stable) under Apache License 2.0 (https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/blob/master/LICENSE)
+* [**OpenSSL**](https://github.com/openssl/openssl) under OpenSSL License and SSLeay License (https://github.com/openssl/openssl/blob/OpenSSL_1_1_1w/LICENSE)
