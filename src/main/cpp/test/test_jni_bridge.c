@@ -38,46 +38,6 @@ static jobject create_test_result(JNIEnv *env, const native_test_result_t* nativ
     return result;
 }
 
-// Helper function to convert Java strings to test config
-static int fill_test_config(JNIEnv *env, jstring host, jint port,
-                             jstring username, jstring password,
-                             jint timeoutMs, jint packetCount, jint packetSize,
-                             jint durationSeconds, native_test_config_t* config) {
-    
-    const char* host_str = (*env)->GetStringUTFChars(env, host, NULL);
-    const char* username_str = (*env)->GetStringUTFChars(env, username, NULL);
-    const char* password_str = (*env)->GetStringUTFChars(env, password, NULL);
-    
-    if (host_str == NULL || username_str == NULL || password_str == NULL) {
-        if (host_str) (*env)->ReleaseStringUTFChars(env, host, host_str);
-        if (username_str) (*env)->ReleaseStringUTFChars(env, username, username_str);
-        if (password_str) (*env)->ReleaseStringUTFChars(env, password, password_str);
-        return -1;
-    }
-    
-    // Note: The config stores pointers to the Java string data
-    // We need to copy them since we'll release the Java strings
-    // For simplicity, we'll use the direct pointers here but in production
-    // these should be properly duplicated
-    config->host = host_str;
-    config->port = port;
-    config->username = username_str;
-    config->password = password_str;
-    config->timeout_ms = timeoutMs;
-    config->packet_count = packetCount;
-    config->packet_size = packetSize;
-    config->duration_seconds = durationSeconds;
-    
-    return 0;
-}
-
-static void release_test_config(JNIEnv *env, jstring host, jstring username, jstring password,
-                                 native_test_config_t* config) {
-    if (config->host) (*env)->ReleaseStringUTFChars(env, host, config->host);
-    if (config->username) (*env)->ReleaseStringUTFChars(env, username, config->username);
-    if (config->password) (*env)->ReleaseStringUTFChars(env, password, config->password);
-}
-
 // JNI implementations for test functions
 
 JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestTcpConnection(
@@ -316,6 +276,72 @@ JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_na
     }
     
     native_test_result_t result = test_full_lifecycle(&config);
+    
+    (*env)->ReleaseStringUTFChars(env, host, config.host);
+    (*env)->ReleaseStringUTFChars(env, username, config.username);
+    (*env)->ReleaseStringUTFChars(env, password, config.password);
+    
+    return create_test_result(env, &result);
+}
+
+JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestDhcp(
+    JNIEnv *env, jobject thiz, jstring host, jint port,
+    jstring username, jstring password, jint timeoutMs) {
+    
+    LOGD("nativeTestDhcp called");
+    
+    native_test_config_t config = {0};
+    config.host = (*env)->GetStringUTFChars(env, host, NULL);
+    config.port = port;
+    config.username = (*env)->GetStringUTFChars(env, username, NULL);
+    config.password = (*env)->GetStringUTFChars(env, password, NULL);
+    config.timeout_ms = timeoutMs;
+    
+    if (config.host == NULL || config.username == NULL || config.password == NULL) {
+        if (config.host) (*env)->ReleaseStringUTFChars(env, host, config.host);
+        if (config.username) (*env)->ReleaseStringUTFChars(env, username, config.username);
+        if (config.password) (*env)->ReleaseStringUTFChars(env, password, config.password);
+        
+        native_test_result_t error_result = {0};
+        test_result_init(&error_result, false, ERR_SESSION,
+                        "Failed to get parameters", 0);
+        return create_test_result(env, &error_result);
+    }
+    
+    native_test_result_t result = test_dhcp(&config);
+    
+    (*env)->ReleaseStringUTFChars(env, host, config.host);
+    (*env)->ReleaseStringUTFChars(env, username, config.username);
+    (*env)->ReleaseStringUTFChars(env, password, config.password);
+    
+    return create_test_result(env, &result);
+}
+
+JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestInternetConnectivity(
+    JNIEnv *env, jobject thiz, jstring host, jint port,
+    jstring username, jstring password, jint timeoutMs) {
+    
+    LOGD("nativeTestInternetConnectivity called");
+    
+    native_test_config_t config = {0};
+    config.host = (*env)->GetStringUTFChars(env, host, NULL);
+    config.port = port;
+    config.username = (*env)->GetStringUTFChars(env, username, NULL);
+    config.password = (*env)->GetStringUTFChars(env, password, NULL);
+    config.timeout_ms = timeoutMs;
+    
+    if (config.host == NULL || config.username == NULL || config.password == NULL) {
+        if (config.host) (*env)->ReleaseStringUTFChars(env, host, config.host);
+        if (config.username) (*env)->ReleaseStringUTFChars(env, username, config.username);
+        if (config.password) (*env)->ReleaseStringUTFChars(env, password, config.password);
+        
+        native_test_result_t error_result = {0};
+        test_result_init(&error_result, false, ERR_DATA_TRANSMISSION,
+                        "Failed to get parameters", 0);
+        return create_test_result(env, &error_result);
+    }
+    
+    native_test_result_t result = test_internet_connectivity(&config);
     
     (*env)->ReleaseStringUTFChars(env, host, config.host);
     (*env)->ReleaseStringUTFChars(env, username, config.username);

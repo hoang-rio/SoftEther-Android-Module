@@ -3,35 +3,21 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Protocol constants
-#define SOFTETHER_SIGNATURE     0x53455448  // 'SETH'
-// Using version 2.0 (0x0200) - VPNGate servers expect this version in the binary protocol header
-// Note: The Hello PACK inside HTTP uses 0x0400, but the binary protocol uses 0x0200
-#define SOFTETHER_VERSION       0x0200
+// Real SoftEther data channel constants
+#define KEEP_ALIVE_MAGIC        0xFFFFFFFF
+#define SOFTETHER_MAX_BLOCK     (1600 * 1600)
 
-// Command types
-#define CMD_CONNECT             0x0001
-#define CMD_CONNECT_ACK         0x0002
-#define CMD_AUTH                0x0003
-#define CMD_AUTH_CHALLENGE      0x0004
-#define CMD_AUTH_RESPONSE       0x0005
-#define CMD_AUTH_SUCCESS        0x0006
-#define CMD_AUTH_FAIL           0x0007
-#define CMD_SESSION_REQUEST     0x0008
-#define CMD_SESSION_ASSIGN      0x0009
-#define CMD_CONFIG_REQUEST      0x000A
-#define CMD_CONFIG_RESPONSE     0x000B
+// Legacy command types (used internally for dispatch, not on wire)
 #define CMD_DATA                0x000C
 #define CMD_KEEPALIVE           0x000D
 #define CMD_KEEPALIVE_ACK       0x000E
 #define CMD_DISCONNECT          0x000F
-#define CMD_DISCONNECT_ACK      0x0010
-#define CMD_ERROR               0x00FF
 
 // Error codes
 #define ERR_NONE                0
@@ -44,21 +30,6 @@ extern "C" {
 #define ERR_TIMEOUT             7
 #define ERR_UNKNOWN             99
 
-// SoftEther packet header
-#pragma pack(push, 1)
-typedef struct {
-    uint32_t signature;          // 'SETH' = 0x53455448
-    uint16_t version;            // Protocol version
-    uint16_t command;            // Command type
-    uint32_t payload_length;     // Length of payload
-    uint32_t session_id;         // Session identifier
-    uint32_t sequence_num;       // Sequence number
-} softether_header_t;
-#pragma pack(pop)
-
-#define SOFTETHER_HEADER_SIZE   sizeof(softether_header_t)
-#define SOFTETHER_MAX_PAYLOAD   65535
-
 // Connection state
 typedef enum {
     STATE_DISCONNECTED = 0,
@@ -70,6 +41,15 @@ typedef enum {
     STATE_CONNECTED,
     STATE_DISCONNECTING
 } softether_state_t;
+
+// Receive queue for multi-block messages
+#define RECV_QUEUE_SIZE 64
+#define MAX_QUEUED_FRAME 1600
+
+typedef struct {
+    uint8_t data[MAX_QUEUED_FRAME];
+    uint32_t len;
+} queued_frame_t;
 
 // Connection context
 typedef struct softether_connection {
@@ -85,6 +65,29 @@ typedef struct softether_connection {
     char password[256];
     char hub_name[256];  // Virtual Hub name (required for CONNECT)
     int timeout_ms;
+    // Server Hello data (from /vpnsvc/connect.cgi response)
+    uint8_t server_random[20];  // 20-byte random from server Hello PACK
+    int has_server_random;
+    // Session data (from Welcome PACK after authentication)
+    char session_name[128];
+    char connection_name[128];
+    uint8_t session_key[20];    // SHA1_SIZE
+    uint32_t session_key_32;
+    uint32_t server_max_connection;
+    uint32_t server_use_encrypt;
+    uint32_t server_use_fast_rc4;
+    uint32_t server_timeout;
+    int use_ssl_data;  // 1 = SSL for data, 0 = raw TCP
+    int session_established;    // 1 if Welcome PACK was parsed successfully
+    // Client MAC address (for Ethernet L2 encapsulation)
+    uint8_t client_mac[6];     // Locally-administered random MAC
+    // Receive frame queue (for multi-block messages)
+    queued_frame_t recv_queue[RECV_QUEUE_SIZE];
+    int recv_queue_head;       // read position
+    int recv_queue_tail;       // write position
+    int recv_queue_count;      // number of queued frames
+    // Thread safety for concurrent send/receive
+    pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
     void (*on_disconnect)(struct softether_connection* conn);
@@ -107,18 +110,19 @@ void softether_disconnect(softether_connection_t* conn);
 softether_state_t softether_get_state(softether_connection_t* conn);
 const char* softether_state_string(softether_state_t state);
 
-// Data I/O
+// Data I/O (wraps IP packets in Ethernet frames for L2 tunnel)
 int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len);
 int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len);
+
+// Raw L2 I/O (sends/receives raw Ethernet frames — used by DHCP)
+int softether_send_raw(softether_connection_t* conn, const uint8_t* frame, size_t len);
+int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t max_len, uint32_t* frame_len);
 
 // Protocol operations
 int softether_send_packet(softether_connection_t* conn, uint16_t command,
                           const uint8_t* payload, uint32_t payload_len);
 int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                              uint8_t* payload, uint32_t* payload_len, uint32_t max_payload);
-
-// Protocol negotiation
-int perform_hello_negotiation(softether_connection_t* conn);
 
 // Data tunnel operations
 int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint32_t data_len);
@@ -130,9 +134,26 @@ int softether_send_keepalive(softether_connection_t* conn);
 int softether_check_connection(softether_connection_t* conn);
 int softether_process_keepalive(softether_connection_t* conn);
 
+// Multi-block receive queue (fills queue from one protocol message)
+int softether_fill_recv_queue(softether_connection_t* conn);
+
 // Reconnection support
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);
 int softether_reconnect(softether_connection_t* conn);
+
+// DHCP result
+typedef struct {
+    uint32_t assigned_ip;
+    uint32_t subnet_mask;
+    uint32_t gateway;
+    uint32_t dns_server;
+    uint32_t dns_server2;
+    uint32_t lease_time;
+    int success;
+} dhcp_result_t;
+
+// DHCP over SoftEther tunnel
+int softether_do_dhcp(softether_connection_t* conn, dhcp_result_t* result);
 
 // Utility
 const char* softether_error_string(int error_code);

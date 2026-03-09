@@ -39,6 +39,8 @@ native_test_result_t test_session(const native_test_config_t* config);
 native_test_result_t test_data_transmission(const native_test_config_t* config);
 native_test_result_t test_keepalive(const native_test_config_t* config);
 native_test_result_t test_full_lifecycle(const native_test_config_t* config);
+native_test_result_t test_dhcp(const native_test_config_t* config);
+native_test_result_t test_internet_connectivity(const native_test_config_t* config);
 
 // Utility functions
 void test_result_init(native_test_result_t* result, bool success, int error_code, 

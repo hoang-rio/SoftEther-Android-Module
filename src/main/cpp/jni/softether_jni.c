@@ -189,6 +189,16 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeRe
     return result;
 }
 
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetSocketFd(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) {
+        LOGE("Invalid handle for getSocketFd");
+        return -1;
+    }
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    return conn->socket_fd;
+}
+
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetOption(
     JNIEnv *env, jobject thiz, jlong handle, jint option, jlong value) {
     LOGD("nativeSetOption called: option=%d, value=%ld", option, (long)value);
@@ -217,4 +227,34 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
             LOGE("Unknown option: %d", option);
             break;
     }
+}
+
+JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDoDhcp(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) {
+        LOGE("Invalid handle for DHCP");
+        return NULL;
+    }
+
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    dhcp_result_t result;
+    memset(&result, 0, sizeof(result));
+
+    int ret = softether_do_dhcp(conn, &result);
+
+    // Return array: [success, assigned_ip, subnet_mask, gateway, dns_server, dns_server2, lease_time]
+    jintArray arr = (*env)->NewIntArray(env, 7);
+    if (arr == NULL) return NULL;
+
+    jint values[7];
+    values[0] = (ret == 0 && result.success) ? 1 : 0;
+    values[1] = (jint)result.assigned_ip;
+    values[2] = (jint)result.subnet_mask;
+    values[3] = (jint)result.gateway;
+    values[4] = (jint)result.dns_server;
+    values[5] = (jint)result.dns_server2;
+    values[6] = (jint)result.lease_time;
+
+    (*env)->SetIntArrayRegion(env, arr, 0, 7, values);
+    return arr;
 }

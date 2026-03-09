@@ -181,10 +181,11 @@ class SoftEtherVpnService : VpnService() {
                 isRunning = true
 
                 Log.d(TAG, "VPN connection established")
-                updateNotification(getString(R.string.softether_connected, config.serverHost))
+                val displayIp = controller?.assignedLocalIp ?: config.serverHost
+                updateNotification(getString(R.string.softether_connected, displayIp))
                 
                 // Send connected broadcast
-                sendConnectionStateBroadcast(STATE_CONNECTED, config.serverHost)
+                sendConnectionStateBroadcast(STATE_CONNECTED, displayIp)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Connection was cancelled (user pressed cancel)
@@ -377,15 +378,23 @@ class SoftEtherVpnService : VpnService() {
             ConnectionState.PROTOCOL_HANDSHAKE -> getString(R.string.softether_protocol_handshake)
             ConnectionState.AUTHENTICATING -> getString(R.string.softether_authenticating)
             ConnectionState.SESSION_SETUP -> getString(R.string.softether_session_setup)
-            ConnectionState.CONNECTED -> getString(R.string.softether_connected, hostname)
+            ConnectionState.CONNECTED -> {
+                val displayIp = controller?.assignedLocalIp ?: hostname
+                getString(R.string.softether_connected, displayIp)
+            }
             ConnectionState.DISCONNECTING -> getString(R.string.softether_disconnecting)
             ConnectionState.DISCONNECTED -> getString(R.string.softether_disconnected)
             ConnectionState.ERROR -> getString(R.string.softether_disconnected_by_error)
         }
         
+        // Terminal states (CONNECTED, DISCONNECTED, ERROR) always pass through immediately
+        val isTerminalState = state == ConnectionState.CONNECTED ||
+                state == ConnectionState.DISCONNECTED ||
+                state == ConnectionState.ERROR
+        
         // Add minimum delay between state updates to ensure UI can process them
         val now = System.currentTimeMillis()
-        if (now - lastStateUpdateTime < 200) {
+        if (!isTerminalState && now - lastStateUpdateTime < 200) {
             // Queue state update if too soon
             pendingStateUpdate = { 
                 updateNotification(message)
@@ -409,6 +418,12 @@ class SoftEtherVpnService : VpnService() {
         }
         
         lastStateUpdateTime = now
+        
+        // Terminal states clear any pending update to prevent stale state overwriting
+        if (isTerminalState) {
+            pendingStateUpdate = null
+        }
+        
         updateNotification(message)
 
         val stateValue = when (state) {

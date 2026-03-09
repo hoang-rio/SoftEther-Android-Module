@@ -10,9 +10,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-
-// Forward declaration of command_to_string from serializer.c
-extern const char* command_to_string(uint16_t command);
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <errno.h>
 
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
@@ -20,18 +20,13 @@ extern const char* command_to_string(uint16_t command);
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// HTTP detection response patterns from official SoftEther source
-static const char* http_detect_startwith = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">";
-static const char* http_detect_tag = "9C37197CA7C2428388C2E6E59B829B30";
-
 // PACK serialization types
-#define PACK_TYPE_INT      0
-#define PACK_TYPE_INT64    1
-#define PACK_TYPE_BOOL     2
-#define PACK_TYPE_STR      3
-#define PACK_TYPE_DATA     4
-#define PACK_TYPE_UNISTR  5
-#define PACK_TYPE_TIME    6
+// SoftEther PACK element types (from Pack.h VALUE_* constants)
+#define PACK_TYPE_INT      0    // VALUE_INT
+#define PACK_TYPE_DATA     1    // VALUE_DATA
+#define PACK_TYPE_STR      2    // VALUE_STR
+#define PACK_TYPE_UNISTR   3    // VALUE_UNISTR
+#define PACK_TYPE_INT64    4    // VALUE_INT64
 
 #define SHA1_SIZE 20
 
@@ -70,6 +65,7 @@ static int pack_skip_bytes_safe(const uint8_t** p, const uint8_t* end, uint32_t 
 
 static int pack_read_string_safe(const uint8_t** p, const uint8_t* end,
                                  char* out, size_t out_size) {
+    // STR value format: uint32(strlen) + strlen bytes (no +1, unlike WriteBufStr)
     uint32_t len = 0;
     if (pack_read_uint32_safe(p, end, &len) != 0) {
         return -1;
@@ -114,22 +110,22 @@ static int pack_skip_value_safe(const uint8_t** p, const uint8_t* end, uint32_t 
 
     switch (type) {
         case PACK_TYPE_INT:
-        case PACK_TYPE_BOOL:
             return pack_skip_bytes_safe(p, end, 4);
 
         case PACK_TYPE_INT64:
-        case PACK_TYPE_TIME:
             return pack_skip_bytes_safe(p, end, 8);
 
         case PACK_TYPE_STR:
         case PACK_TYPE_UNISTR:
         case PACK_TYPE_DATA:
+            // All use uint32(len) + len bytes format
             if (pack_read_uint32_safe(p, end, &len) != 0) {
                 return -1;
             }
             return pack_skip_bytes_safe(p, end, len);
 
         default:
+            LOGE("pack_skip_value_safe: unknown type %u", type);
             return -1;
     }
 }
@@ -181,21 +177,24 @@ static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hel
     LOGD("Server Hello PACK has %u elements", num_elements);
     
     for (uint32_t i = 0; i < num_elements; i++) {
-        // Read element name
-        uint32_t name_len = 0;
-        if (pack_read_uint32_safe(&p, end, &name_len) != 0) {
+        // Read element name (WriteBufStr format: uint32(strlen+1) + strlen bytes)
+        uint32_t name_len_plus1 = 0;
+        if (pack_read_uint32_safe(&p, end, &name_len_plus1) != 0) {
             return -1;
         }
+        if (name_len_plus1 == 0) {
+            return -1;
+        }
+        uint32_t name_len = name_len_plus1 - 1;
 
         if (p + name_len > end) {
             return -1;
         }
 
         char element_name[64] = {0};
-        if (name_len < sizeof(element_name)) {
-            memcpy(element_name, p, name_len);
-            element_name[name_len] = '\0';
-        }
+        uint32_t copy_len = (name_len < sizeof(element_name) - 1) ? name_len : (uint32_t)(sizeof(element_name) - 1);
+        memcpy(element_name, p, copy_len);
+        element_name[copy_len] = '\0';
         p += name_len;
         
         // Read element type
@@ -270,6 +269,13 @@ static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hel
 }
 
 // PACK serialization helpers
+// NOTE: SoftEther PACK format (from Pack.c / Memory.c in original source):
+//   Element NAME:  WriteBufStr → uint32(strlen+1) + strlen bytes (no null)
+//   INT value:     uint32 big-endian
+//   STR value:     uint32(strlen) + strlen bytes (no null)  [note: no +1]
+//   DATA value:    uint32(size) + size bytes
+
+// Write big-endian uint32
 static void pack_write_uint32(uint8_t** buf, uint32_t val) {
     (*buf)[0] = (val >> 24) & 0xFF;
     (*buf)[1] = (val >> 16) & 0xFF;
@@ -278,56 +284,396 @@ static void pack_write_uint32(uint8_t** buf, uint32_t val) {
     *buf += 4;
 }
 
-static void pack_write_string(uint8_t** buf, const char* str) {
-    uint32_t len = strlen(str);
-    pack_write_uint32(buf, len);
+// Write element NAME (WriteBufStr format: uint32(strlen+1) + strlen bytes)
+static void pack_write_elem_name(uint8_t** buf, const char* name) {
+    uint32_t len = (uint32_t)strlen(name);
+    pack_write_uint32(buf, len + 1);   // strlen+1
+    memcpy(*buf, name, len);           // strlen bytes (no null)
+    *buf += len;
+}
+
+// Write STR value (simple format: uint32(strlen) + strlen bytes)
+static void pack_write_str_val(uint8_t** buf, const char* str) {
+    uint32_t len = (uint32_t)strlen(str);
+    pack_write_uint32(buf, len);  // STR value: strlen (no +1)
     memcpy(*buf, str, len);
     *buf += len;
 }
 
-static void pack_write_data(uint8_t** buf, const uint8_t* data, uint32_t len) {
+// Write DATA value (uint32(size) + size bytes)
+static void pack_write_data_val(uint8_t** buf, const uint8_t* data, uint32_t len) {
     pack_write_uint32(buf, len);
-    memcpy(*buf, data, len);
+    if (data && len > 0) {
+        memcpy(*buf, data, len);
+    }
     *buf += len;
 }
 
-// Create a PACK buffer for Hello
-static uint8_t* pack_create_hello(const char* client_str, uint32_t ver, uint32_t build, 
-                                   const uint8_t* random, uint32_t* out_len) {
-    uint32_t num_elements = 4;
-    uint32_t size = 4 + 34 + 19 + 17 + 38;  // Pre-calculated
-    
-    uint8_t* buf = (uint8_t*)malloc(size);
+// Full element write helpers (name + type + num_values + 1 value)
+static void pack_add_int(uint8_t** buf, const char* name, uint32_t val) {
+    pack_write_elem_name(buf, name);
+    pack_write_uint32(buf, PACK_TYPE_INT);
+    pack_write_uint32(buf, 1);    // num_values = 1
+    pack_write_uint32(buf, val);
+}
+
+static void pack_add_str(uint8_t** buf, const char* name, const char* val) {
+    pack_write_elem_name(buf, name);
+    pack_write_uint32(buf, PACK_TYPE_STR);
+    pack_write_uint32(buf, 1);
+    pack_write_str_val(buf, val);
+}
+
+static void pack_add_data(uint8_t** buf, const char* name,
+                          const uint8_t* data, uint32_t dlen) {
+    pack_write_elem_name(buf, name);
+    pack_write_uint32(buf, PACK_TYPE_DATA);
+    pack_write_uint32(buf, 1);
+    pack_write_data_val(buf, data, dlen);
+}
+
+// Size calculation macros (WriteBufStr format)
+// Element name occupies: 4 + strlen bytes
+#define PACK_NAME_SZ(n)       (4 + (uint32_t)strlen(n))
+// Element header: name + type(4) + num_values(4)
+#define PACK_ELEM_HDR_SZ(n)   (PACK_NAME_SZ(n) + 8)
+// Full element sizes (1 value each)
+// STR value: 4-byte prefix (stores strlen+1) + strlen data bytes
+#define PACK_INT_SZ(n)        (PACK_ELEM_HDR_SZ(n) + 4)
+#define PACK_STR_SZ(n, v)     (PACK_ELEM_HDR_SZ(n) + 4 + (uint32_t)strlen(v))
+#define PACK_DATA_SZ(n, d)    (PACK_ELEM_HDR_SZ(n) + 4 + (d))
+
+// Parse an integer field from a PACK binary buffer.
+// Returns the value via out_val; returns 0 on success, -1 if not found or error.
+static int pack_get_int(const uint8_t* body, uint32_t body_len,
+                        const char* field_name, uint32_t* out_val) {
+    if (!body || body_len < 4 || !field_name || !out_val) return -1;
+
+    const uint8_t* p = body;
+    const uint8_t* end = body + body_len;
+
+    uint32_t num_elements = 0;
+    if (pack_read_uint32_safe(&p, end, &num_elements) != 0) return -1;
+    if (num_elements > 4096) return -1;
+
+    for (uint32_t i = 0; i < num_elements; i++) {
+        // Element name: uint32(strlen+1) + strlen bytes
+        uint32_t name_len_plus1 = 0;
+        if (pack_read_uint32_safe(&p, end, &name_len_plus1) != 0) return -1;
+        if (name_len_plus1 == 0) return -1;
+        uint32_t name_len = name_len_plus1 - 1;
+        if (p + name_len > end) return -1;
+
+        char elem[64] = {0};
+        uint32_t cp = (name_len < 63) ? name_len : 63;
+        memcpy(elem, p, cp);
+        p += name_len;
+
+        uint32_t type = 0, num_values = 0;
+        if (pack_read_uint32_safe(&p, end, &type) != 0) return -1;
+        if (pack_read_uint32_safe(&p, end, &num_values) != 0) return -1;
+        if (num_values > 65535) return -1;
+
+        if (strcmp(elem, field_name) == 0 && type == PACK_TYPE_INT && num_values >= 1) {
+            if (pack_read_uint32_safe(&p, end, out_val) != 0) return -1;
+            return 0;  // found
+        }
+        // Skip all values for this element
+        for (uint32_t v = 0; v < num_values; v++) {
+            if (pack_skip_value_safe(&p, end, type) != 0) return -1;
+        }
+    }
+    return -1;  // not found
+}
+
+// Parse a string field from a PACK binary buffer.
+// Copies up to out_size-1 chars into out_str (null-terminated).
+// Returns 0 on success, -1 if not found or error.
+static int pack_get_str(const uint8_t* body, uint32_t body_len,
+                        const char* field_name, char* out_str, uint32_t out_size) {
+    if (!body || body_len < 4 || !field_name || !out_str || out_size == 0) return -1;
+
+    const uint8_t* p = body;
+    const uint8_t* end = body + body_len;
+
+    uint32_t num_elements = 0;
+    if (pack_read_uint32_safe(&p, end, &num_elements) != 0) return -1;
+    if (num_elements > 4096) return -1;
+
+    for (uint32_t i = 0; i < num_elements; i++) {
+        uint32_t name_len_plus1 = 0;
+        if (pack_read_uint32_safe(&p, end, &name_len_plus1) != 0) return -1;
+        if (name_len_plus1 == 0) return -1;
+        uint32_t name_len = name_len_plus1 - 1;
+        if (p + name_len > end) return -1;
+
+        char elem[64] = {0};
+        uint32_t cp = (name_len < 63) ? name_len : 63;
+        memcpy(elem, p, cp);
+        p += name_len;
+
+        uint32_t type = 0, num_values = 0;
+        if (pack_read_uint32_safe(&p, end, &type) != 0) return -1;
+        if (pack_read_uint32_safe(&p, end, &num_values) != 0) return -1;
+        if (num_values > 65535) return -1;
+
+        if (strcmp(elem, field_name) == 0 && type == PACK_TYPE_STR && num_values >= 1) {
+            // Read string value: uint32(strlen) + strlen bytes
+            uint32_t str_len = 0;
+            if (pack_read_uint32_safe(&p, end, &str_len) != 0) return -1;
+            if (p + str_len > end) return -1;
+            uint32_t copy_len = (str_len < out_size - 1) ? str_len : (out_size - 1);
+            memcpy(out_str, p, copy_len);
+            out_str[copy_len] = '\0';
+            return 0;
+        }
+        for (uint32_t v = 0; v < num_values; v++) {
+            if (pack_skip_value_safe(&p, end, type) != 0) return -1;
+        }
+    }
+    return -1;
+}
+
+// Parse a DATA field from a PACK binary buffer.
+// Copies up to out_size bytes into out_data, sets *out_len to actual size.
+// Returns 0 on success, -1 if not found or error.
+static int pack_get_data(const uint8_t* body, uint32_t body_len,
+                         const char* field_name, uint8_t* out_data,
+                         uint32_t out_size, uint32_t* out_len) {
+    if (!body || body_len < 4 || !field_name || !out_data || out_size == 0) return -1;
+
+    const uint8_t* p = body;
+    const uint8_t* end = body + body_len;
+
+    uint32_t num_elements = 0;
+    if (pack_read_uint32_safe(&p, end, &num_elements) != 0) return -1;
+    if (num_elements > 4096) return -1;
+
+    for (uint32_t i = 0; i < num_elements; i++) {
+        uint32_t name_len_plus1 = 0;
+        if (pack_read_uint32_safe(&p, end, &name_len_plus1) != 0) return -1;
+        if (name_len_plus1 == 0) return -1;
+        uint32_t name_len = name_len_plus1 - 1;
+        if (p + name_len > end) return -1;
+
+        char elem[64] = {0};
+        uint32_t cp = (name_len < 63) ? name_len : 63;
+        memcpy(elem, p, cp);
+        p += name_len;
+
+        uint32_t type = 0, num_values = 0;
+        if (pack_read_uint32_safe(&p, end, &type) != 0) return -1;
+        if (pack_read_uint32_safe(&p, end, &num_values) != 0) return -1;
+        if (num_values > 65535) return -1;
+
+        if (strcmp(elem, field_name) == 0 && type == PACK_TYPE_DATA && num_values >= 1) {
+            uint32_t data_len = 0;
+            if (pack_read_uint32_safe(&p, end, &data_len) != 0) return -1;
+            if (p + data_len > end) return -1;
+            uint32_t copy_len = (data_len < out_size) ? data_len : out_size;
+            memcpy(out_data, p, copy_len);
+            if (out_len) *out_len = copy_len;
+            return 0;
+        }
+        for (uint32_t v = 0; v < num_values; v++) {
+            if (pack_skip_value_safe(&p, end, type) != 0) return -1;
+        }
+    }
+    return -1;
+}
+// auth_type: 0 = anonymous, 1 = password
+// For password auth, secure_password must be 20 bytes:
+//   secure_password = SHA1( SHA1(password + UPPER(username)) + server_random )
+static uint8_t* build_login_pack(const char* hub_name, const char* username,
+                                  int auth_type, const uint8_t* secure_password,
+                                  uint32_t* out_len) {
+    if (!hub_name || !username || !out_len) return NULL;
+
+    const char* client_hello = "SoftEther VPN Client";
+    const uint32_t client_ver = 420;
+    const uint32_t client_build = 9699;
+
+    // Generate a dummy "pencore" random data (matching CreateDummyValue)
+    uint32_t pencore_size = (uint32_t)(rand() % 1000);  // HTTP_PACK_RAND_SIZE_MAX
+    uint8_t* pencore_data = (uint8_t*)malloc(pencore_size > 0 ? pencore_size : 1);
+    if (pencore_data && pencore_size > 0) {
+        for (uint32_t i = 0; i < pencore_size; i++) {
+            pencore_data[i] = (uint8_t)(rand() & 0xFF);
+        }
+    }
+
+    // Generate unique_id (SHA1 of a machine-specific value)
+    uint8_t unique_id[SHA1_SIZE];
+    {
+        const char* machine_str = "SoftEtherVPN_Android_Client";
+        sha1_hash((const uint8_t*)machine_str, strlen(machine_str), unique_id);
+    }
+
+    // Count elements and calculate buffer size
+    // Base: method, hubname, username, authtype, hello, version, build,
+    //       client_str, client_ver, client_build, client_id,
+    //       protocol, max_connection, use_encrypt, use_compress, half_connection,
+    //       require_bridge_routing_mode, require_monitor_mode, qos,
+    //       support_bulk_on_rudp, support_hmac_on_bulk_of_rudp,
+    //       support_udp_recovery, unique_id, rudp_bulk_max_version,
+    //       pencore
+    uint32_t num_elems = 25;
+    uint32_t size = 4;        // num_elements field
+
+    size += PACK_STR_SZ("method", "login");
+    size += PACK_STR_SZ("hubname", hub_name);
+    size += PACK_STR_SZ("username", username);
+    size += PACK_INT_SZ("authtype");
+    size += PACK_STR_SZ("hello", client_hello);
+    size += PACK_INT_SZ("version");
+    size += PACK_INT_SZ("build");
+    size += PACK_STR_SZ("client_str", client_hello);
+    size += PACK_INT_SZ("client_ver");
+    size += PACK_INT_SZ("client_build");
+    size += PACK_INT_SZ("client_id");
+    size += PACK_INT_SZ("protocol");
+    size += PACK_INT_SZ("max_connection");
+    size += PACK_INT_SZ("use_encrypt");
+    size += PACK_INT_SZ("use_compress");
+    size += PACK_INT_SZ("half_connection");
+    size += PACK_INT_SZ("require_bridge_routing_mode");
+    size += PACK_INT_SZ("require_monitor_mode");
+    size += PACK_INT_SZ("qos");
+    size += PACK_INT_SZ("support_bulk_on_rudp");
+    size += PACK_INT_SZ("support_hmac_on_bulk_of_rudp");
+    size += PACK_INT_SZ("support_udp_recovery");
+    size += PACK_DATA_SZ("unique_id", SHA1_SIZE);
+    size += PACK_INT_SZ("rudp_bulk_max_version");
+    size += PACK_DATA_SZ("pencore", pencore_size);
+
+    if (auth_type == 1 && secure_password) {
+        num_elems++;
+        size += PACK_DATA_SZ("secure_password", SHA1_SIZE);
+    }
+
+    uint8_t* buf = (uint8_t*)calloc(1, size + 64);  // +64 safety margin
+    if (!buf) { free(pencore_data); return NULL; }
     uint8_t* p = buf;
-    
-    pack_write_uint32(&p, num_elements);
-    
-    // Element 1: hello (string)
-    pack_write_string(&p, "hello");
-    pack_write_uint32(&p, PACK_TYPE_STR);
-    pack_write_uint32(&p, 1);
-    pack_write_string(&p, client_str);
-    
-    // Element 2: version (int)
-    pack_write_string(&p, "version");
-    pack_write_uint32(&p, PACK_TYPE_INT);
-    pack_write_uint32(&p, 1);
-    pack_write_uint32(&p, ver);
-    
-    // Element 3: build (int)
-    pack_write_string(&p, "build");
-    pack_write_uint32(&p, PACK_TYPE_INT);
-    pack_write_uint32(&p, 1);
-    pack_write_uint32(&p, build);
-    
-    // Element 4: random (data)
-    pack_write_string(&p, "random");
-    pack_write_uint32(&p, PACK_TYPE_DATA);
-    pack_write_uint32(&p, 1);
-    pack_write_data(&p, random, SHA1_SIZE);
-    
-    *out_len = p - buf;
+
+    pack_write_uint32(&p, num_elems);
+
+    pack_add_str(&p, "method", "login");
+    pack_add_str(&p, "hubname", hub_name);
+    pack_add_str(&p, "username", username);
+    pack_add_int(&p, "authtype", (uint32_t)auth_type);
+    pack_add_str(&p, "hello", client_hello);
+    pack_add_int(&p, "version", client_ver);
+    pack_add_int(&p, "build", client_build);
+    pack_add_str(&p, "client_str", client_hello);
+    pack_add_int(&p, "client_ver", client_ver);
+    pack_add_int(&p, "client_build", client_build);
+    pack_add_int(&p, "client_id", 0);
+    pack_add_int(&p, "protocol", 0);          // 0 = TCP
+    pack_add_int(&p, "max_connection", 1);
+    pack_add_int(&p, "use_encrypt", 1);
+    pack_add_int(&p, "use_compress", 0);
+    pack_add_int(&p, "half_connection", 0);
+    pack_add_int(&p, "require_bridge_routing_mode", 0);
+    pack_add_int(&p, "require_monitor_mode", 0);
+    pack_add_int(&p, "qos", 1);
+    pack_add_int(&p, "support_bulk_on_rudp", 1);
+    pack_add_int(&p, "support_hmac_on_bulk_of_rudp", 1);
+    pack_add_int(&p, "support_udp_recovery", 1);
+    pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
+    pack_add_int(&p, "rudp_bulk_max_version", 2);
+    pack_add_data(&p, "pencore", pencore_data, pencore_size);
+
+    if (auth_type == 1 && secure_password) {
+        pack_add_data(&p, "secure_password", secure_password, SHA1_SIZE);
+    }
+
+    free(pencore_data);
+    *out_len = (uint32_t)(p - buf);
     return buf;
+}
+
+// Read an HTTP response precisely: headers byte-by-byte until \r\n\r\n,
+// then exactly Content-Length bytes for the body.
+// This prevents over-reading into the data channel protocol that follows.
+// Returns total bytes in buf (headers + body), or -1 on error.
+// Sets *body_offset to the start of body data, *body_len to body length.
+static int read_http_response(softether_connection_t* conn,
+                              uint8_t* buf, int buf_size,
+                              int* body_offset, int* body_len) {
+    // Read headers byte-by-byte until we find \r\n\r\n
+    int hdr_len = 0;
+    int found_end = 0;
+    while (hdr_len < buf_size - 1 && !found_end) {
+        int r = ssl_read((ssl_context_t*)conn->ssl, buf + hdr_len, 1);
+        if (r <= 0) {
+            LOGE("read_http_response: failed reading headers at byte %d", hdr_len);
+            return -1;
+        }
+        hdr_len++;
+        // Check for \r\n\r\n at the end
+        if (hdr_len >= 4 &&
+            buf[hdr_len-4] == '\r' && buf[hdr_len-3] == '\n' &&
+            buf[hdr_len-2] == '\r' && buf[hdr_len-1] == '\n') {
+            found_end = 1;
+        }
+    }
+    if (!found_end) {
+        LOGE("read_http_response: headers too large or no terminator found");
+        return -1;
+    }
+    buf[hdr_len] = '\0';
+    *body_offset = hdr_len;
+
+    // Parse Content-Length from headers
+    uint32_t content_length = 0;
+    const char* cl_str = strstr((char*)buf, "Content-Length: ");
+    if (!cl_str) cl_str = strstr((char*)buf, "content-length: ");
+    if (cl_str) {
+        content_length = (uint32_t)atoi(cl_str + 16);
+    }
+    LOGD("read_http_response: headers=%d bytes, Content-Length=%u", hdr_len, content_length);
+    // Log HTTP status line and key headers
+    {
+        char* line_start = (char*)buf;
+        char* line_end;
+        int line_num = 0;
+        while (line_start < (char*)buf + hdr_len && (line_end = strstr(line_start, "\r\n")) != NULL) {
+            int line_len = (int)(line_end - line_start);
+            if (line_len == 0) break; // empty line = end of headers
+            if (line_num < 8) { // log first 8 header lines
+                LOGD("  Header[%d]: %.*s", line_num, line_len, line_start);
+            }
+            line_start = line_end + 2;
+            line_num++;
+        }
+    }
+
+    // Read exactly content_length bytes for the body
+    if (content_length > 0) {
+        if (hdr_len + (int)content_length > buf_size) {
+            LOGE("read_http_response: buffer too small for body (%d + %u > %d)",
+                 hdr_len, content_length, buf_size);
+            return -1;
+        }
+        // Read body using ssl_read in a loop until we have all bytes
+        uint32_t body_read = 0;
+        while (body_read < content_length) {
+            int r = ssl_read((ssl_context_t*)conn->ssl,
+                             buf + hdr_len + body_read,
+                             (int)(content_length - body_read));
+            if (r <= 0) {
+                LOGE("read_http_response: failed reading body (%u/%u bytes)",
+                     body_read, content_length);
+                return -1;
+            }
+            body_read += (uint32_t)r;
+        }
+        *body_len = (int)content_length;
+    } else {
+        *body_len = 0;
+    }
+
+    return hdr_len + *body_len;
 }
 
 // Send VPNCONNECT watermark POST - This is CRITICAL for SoftEther protocol
@@ -348,207 +694,80 @@ static int send_vpnconnect_watermark(softether_connection_t* conn, const char* s
     int post_len = snprintf(http_post, sizeof(http_post),
         "POST /vpnsvc/connect.cgi HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
+        "Content-Type: image/jpeg\r\n"
         "Connection: Keep-Alive\r\n"
         "Content-Length: %zu\r\n"
-        "User-Agent: SoftEther VPN Client\r\n"
         "\r\n",
         server_ip, watermark_len);
     
     LOGD("Sending POST to connect.cgi: %.200s", http_post);
     
-    // Send HTTP POST header
-    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, post_len);
-    if (sent <= 0) {
-        LOGE("Failed to send VPNCONNECT POST header");
+    // Send HTTP POST header + body as single SSL_write (matching reference PostHttp)
+    size_t combined_len = post_len + watermark_len;
+    uint8_t* combined = (uint8_t*)malloc(combined_len);
+    if (combined == NULL) {
+        LOGE("Failed to allocate combined buffer");
         return -1;
     }
+    memcpy(combined, http_post, post_len);
+    memcpy(combined + post_len, watermark, watermark_len);
     
-    // Send VPNCONNECT body
-    sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)watermark, watermark_len);
+    int sent = ssl_write((ssl_context_t*)conn->ssl, combined, (int)combined_len);
+    free(combined);
+    
     if (sent <= 0) {
-        LOGE("Failed to send VPNCONNECT watermark body");
+        LOGE("Failed to send VPNCONNECT POST");
         return -1;
     }
     
     LOGD("VPNCONNECT watermark sent, waiting for server Hello response...");
     
-    // Receive server's response (should contain Hello PACK)
+    // Read HTTP response precisely — no over-reading into data channel
     uint8_t resp[4096];
-    int recvd = ssl_read((ssl_context_t*)conn->ssl, resp, sizeof(resp) - 1);
+    int body_offset = 0, body_len = 0;
+    int total = read_http_response(conn, resp, sizeof(resp), &body_offset, &body_len);
     
-    if (recvd <= 0) {
+    if (total <= 0) {
         LOGE("Failed to receive watermark response");
         return -1;
     }
     
-    resp[recvd] = '\0';
-    LOGD("Watermark response received: %d bytes", recvd);
-    LOGD("Watermark response: %.700s", (char*)resp);
+    LOGD("Watermark response: %d total bytes (headers=%d, body=%d)", total, body_offset, body_len);
     
-    // Check if response contains Hello PACK (binary data)
-    // Look for HTTP 200 with application/octet-stream
-    if (strstr((char*)resp, "HTTP/1.1 200") != NULL || 
-        strstr((char*)resp, "HTTP/1.0 200") != NULL) {
-        
-        // Check Content-Type - should be application/octet-stream for Hello PACK
-        if (strstr((char*)resp, "application/octet-stream") != NULL) {
-            LOGD("Got HTTP 200 with application/octet-stream - server sent Hello!");
-            
-            // Extract the PACK data from HTTP response body
-            char* body = strstr((char*)resp, "\r\n\r\n");
-            if (body) {
-                body += 4;  // Skip \r\n\r\n
-                uint32_t body_len = recvd - (body - (char*)resp);
-                LOGD("Hello PACK body length: %u bytes", body_len);
-                
-                // Parse the server Hello to extract version info
-                server_hello_info_t hello_info;
-                if (parse_server_hello((const uint8_t*)body, body_len, &hello_info) == 0) {
-                    LOGD("Successfully parsed server Hello!");
-                    // Server hello parsed - we have the server's version and random
-                    return 1;  // Return 1 to indicate Hello was received
-                }
-                
-                return 1;  // Return 1 if we got HTTP 200 with body (likely Hello)
-            }
+    // Check for HTTP 200
+    if (strstr((char*)resp, "HTTP/1.1 200") == NULL &&
+        strstr((char*)resp, "HTTP/1.0 200") == NULL) {
+        LOGD("Watermark response not HTTP 200: %.200s", (char*)resp);
+        return 0;
+    }
+    
+    if (strstr((char*)resp, "application/octet-stream") == NULL) {
+        LOGD("Watermark response not octet-stream");
+        return 0;
+    }
+    
+    LOGD("Got HTTP 200 with application/octet-stream - server sent Hello!");
+    
+    if (body_len < 4) {
+        LOGD("Hello body too short: %d bytes", body_len);
+        return 0;
+    }
+    
+    // Parse the server Hello to extract version info and random
+    const uint8_t* body_start = resp + body_offset;
+    server_hello_info_t hello_info;
+    if (parse_server_hello(body_start, (uint32_t)body_len, &hello_info) == 0) {
+        LOGD("Successfully parsed server Hello!");
+        if (hello_info.has_random) {
+            memcpy(conn->server_random, hello_info.random, SHA1_SIZE);
+            conn->has_server_random = 1;
+            LOGD("Server random stored for authentication");
         }
+    } else {
+        LOGW("Failed to parse server Hello PACK");
     }
     
-    // Even if we didn't get the Hello in the response, continue
-    // The server might send it in a separate message or expect us to wait
-    LOGD("No Hello in watermark response, proceeding anyway");
-    return 0;  // Return 0 when no Hello found
-}
-
-// Perform HTTP detection - Send HTTP GET with X-VPN header to detect SoftEther server
-static int detect_softether_server(softether_connection_t* conn, const char* server_ip) {
-    if (conn == NULL || conn->ssl == NULL) {
-        return -1;
-    }
-
-    LOGD("Performing HTTP detection phase...");
-    
-    // Build HTTP GET request with X-VPN header
-    char http_request[512];
-    int offset = 0;
-    
-    // HTTP GET request line
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "GET / HTTP/1.1\r\n");
-    
-    // Required headers
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "X-VPN: 1\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Host: %s\r\n", server_ip);
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Keep-Alive: timeout=15\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Connection: Keep-Alive\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Accept-Language: ja\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "User-Agent: SoftEther VPN Client\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Pragma: no-cache\r\n");
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset,
-                       "Cache-Control: no-cache\r\n");
-    
-    // End of headers
-    offset += snprintf(http_request + offset, sizeof(http_request) - offset, "\r\n");
-    
-    LOGD("Sending HTTP detection request");
-    
-    // Send HTTP request over SSL
-    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_request, strlen(http_request));
-    if (sent <= 0) {
-        LOGE("Failed to send HTTP detection request");
-        return -1;
-    }
-    
-    // Receive HTTP response
-    uint8_t recv_buffer[2048];
-    int total_received = 0;
-    int received;
-    
-    // Set a longer timeout for HTTP detection (servers can be slow)
-    struct timeval tv;
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    while (total_received < (int)sizeof(recv_buffer) - 1) {
-        received = ssl_read((ssl_context_t*)conn->ssl, recv_buffer + total_received, 
-                           sizeof(recv_buffer) - total_received - 1);
-        
-        if (received <= 0) {
-            break;
-        }
-        total_received += received;
-        
-        // Check if we have complete HTTP headers
-        recv_buffer[total_received] = '\0';
-        if (strstr((char*)recv_buffer, "\r\n\r\n") != NULL) {
-            break;
-        }
-    }
-    
-    // Restore original timeout
-    tv.tv_sec = conn->timeout_ms / 1000;
-    tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
-    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    if (total_received <= 0) {
-        LOGE("Failed to receive HTTP response");
-        return -1;
-    }
-    
-    recv_buffer[total_received] = '\0';
-    LOGD("HTTP detection response (%d bytes): %.256s", total_received, (char*)recv_buffer);
-    
-    // Check for SoftEther detection patterns
-    // Pattern 1: HTTP 403 Forbidden response (SoftEther returns this when accessed without proper protocol)
-    if (strstr((char*)recv_buffer, "HTTP/1.1 403") != NULL || 
-        strstr((char*)recv_buffer, "HTTP/1.0 403") != NULL) {
-        LOGD("Detected SoftEther VPN server (403 Forbidden response)");
-        return 1; // Detected
-    }
-    
-    // Pattern 2: DOCTYPE in response body
-    if (strncmp((char*)recv_buffer, http_detect_startwith, strlen(http_detect_startwith)) == 0) {
-        LOGD("Detected SoftEther VPN server (DOCTYPE response)");
-        return 1; // Detected
-    }
-    
-    // Pattern 3: Check anywhere in the response for DOCTYPE
-    if (strstr((char*)recv_buffer, http_detect_startwith) != NULL) {
-        LOGD("Detected SoftEther VPN server (DOCTYPE found in body)");
-        return 1; // Detected
-    }
-    
-    // Pattern 4: Magic tag
-    if (strstr((char*)recv_buffer, http_detect_tag) != NULL) {
-        LOGD("Detected SoftEther VPN server (magic tag found)");
-        return 1; // Detected
-    }
-    
-    // Pattern 5: Check for "VPN" in response which indicates SoftEther
-    if (strstr((char*)recv_buffer, "VPN") != NULL || 
-        strstr((char*)recv_buffer, "vpn") != NULL) {
-        LOGD("Detected potential VPN server");
-        return 1; // Possibly detected
-    }
-    
-    LOGD("Server does not appear to be SoftEther VPN");
-    return 0; // Not detected (or not a SoftEther server)
-}
-
-// Helper function to get current time in milliseconds
-static long get_current_time_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return 1;
 }
 
 // Create a new connection context
@@ -567,6 +786,12 @@ softether_connection_t* softether_create(void) {
     conn->ssl_ctx = NULL;
     conn->ssl = NULL;
     
+    // Generate random locally-administered MAC address (02:XX:XX:XX:XX:XX)
+    conn->client_mac[0] = 0x5E;  // SE prefix (SoftEther), locally administered + unicast
+    for (int i = 1; i < 6; i++) {
+        conn->client_mac[i] = (uint8_t)(rand() & 0xFF);
+    }
+
     // Set default hub name
     strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
 
@@ -575,6 +800,9 @@ softether_connection_t* softether_create(void) {
     conn->on_disconnect = NULL;
     conn->on_data = NULL;
     conn->on_error = NULL;
+
+    // Initialize write mutex for thread-safe SSL writes
+    pthread_mutex_init(&conn->write_mutex, NULL);
 
     LOGD("Connection created");
     return conn;
@@ -600,6 +828,9 @@ void softether_destroy(softether_connection_t* conn) {
     if (conn->password[0] != '\0') {
         memset(conn->password, 0, sizeof(conn->password));
     }
+
+    // Destroy write mutex
+    pthread_mutex_destroy(&conn->write_mutex);
 
     free(conn);
     LOGD("Connection destroyed");
@@ -673,640 +904,220 @@ static int perform_tls_handshake(softether_connection_t* conn, const char* hostn
     }
 
     conn->ssl = ssl_ctx;
+    
+    // Set TCP_NODELAY to match reference SoftEther (disables Nagle's algorithm)
+    int nodelay = 1;
+    setsockopt(conn->socket_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    
     LOGD("TLS handshake successful");
     return ERR_NONE;
 }
 
-// Perform Hello negotiation for protocol version agreement
-// This should be called before authentication to negotiate protocol version
-static int perform_hello_negotiation(softether_connection_t* conn) {
-    if (conn == NULL) {
-        return ERR_PROTOCOL_VERSION;
-    }
-
-    LOGD("Starting Hello negotiation for protocol version agreement");
-    
-    // Send initial Hello/CONNECT message (version 0x0001)
-    // This allows the server to respond with its version and capabilities
-    uint8_t hello_payload[4] = {0x00, 0x01, 0x00, 0x00};  // version 0x0001, no hub
-    
-    LOGD("Sending Hello/CONNECT for version negotiation...");
-    if (softether_send_packet(conn, CMD_CONNECT, hello_payload, sizeof(hello_payload)) < 0) {
-        LOGE("Failed to send Hello/CONNECT packet");
-        return ERR_PROTOCOL_VERSION;
-    }
-    
-    // Receive server's Hello response
-    uint16_t command;
-    uint8_t response[512];
-    uint32_t response_len;
-    
-    LOGD("Waiting for server Hello response...");
-    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive Hello response");
-        return ERR_PROTOCOL_VERSION;
-    }
-    
-    LOGD("Received response: command=0x%04X (%s), len=%u", command, command_to_string(command), response_len);
-    
-    if (command != CMD_CONNECT_ACK) {
-        LOGW("Expected CMD_CONNECT_ACK (0x%04X) but got 0x%04X", CMD_CONNECT_ACK, command);
-        // Some servers might not send ACK, continue anyway
-    } else {
-        LOGD("Hello negotiation successful - server acknowledged protocol version");
-    }
-    
-    return ERR_NONE;
-}
-
-// Perform protocol handshake with simple CONNECT packet format (matching native test)
-// Uses exactly the format from native_test.c: {0x00, 0x01, 0x00, 0x00}
-// This is version 0x0001 with no hub name (hub_len = 0)
-static int perform_protocol_handshake_ex(softether_connection_t* conn, const char* hub_name,
-                                         const char* username, const char* password) {
-    if (conn == NULL) {
-        return ERR_PROTOCOL_VERSION;
-    }
-    
-    LOGD("Starting protocol handshake (simple format)");
-    conn->state = STATE_PROTOCOL_HANDSHAKE;
-
-    // Use provided hub_name or fallback to "vpngate"
-    const char* effective_hub_name = hub_name ? hub_name : "vpngate";
-    size_t hub_name_len = strlen(effective_hub_name);
-    
-    // Build CONNECT packet payload
-    // Format: [version:2][hub_len:2][hub_name]
-    // Total size: 4 + hub_name_len bytes
-    uint8_t hello_payload[256];
-    size_t payload_len = 4 + hub_name_len;
-    
-    if (payload_len > sizeof(hello_payload)) {
-        LOGE("Hub name too long: %zu bytes", hub_name_len);
-        return ERR_PROTOCOL_VERSION;
-    }
-    
-    // Version 0x0001 (big-endian)
-    hello_payload[0] = 0x00;
-    hello_payload[1] = 0x01;
-    
-    // Hub name length (big-endian)
-    hello_payload[2] = (hub_name_len >> 8) & 0xFF;
-    hello_payload[3] = hub_name_len & 0xFF;
-    
-    // Hub name
-    memcpy(hello_payload + 4, effective_hub_name, hub_name_len);
-    
-    LOGD("CONNECT packet: version=0x0001, hub_name='%s' (len=%zu)", effective_hub_name, hub_name_len);
-
-    // Debug: print hex dump of payload
-    LOGD("CONNECT payload hex dump (%zu bytes):", payload_len);
-    for (size_t i = 0; i < payload_len && i < 64; i++) {
-        LOGD("  [%02zu]: 0x%02X", i, hello_payload[i]);
-    }
-
-    LOGD("Sending CONNECT packet (payload_len=%zu)...", payload_len);
-    int send_result = softether_send_packet(conn, CMD_CONNECT, hello_payload, (uint32_t)payload_len);
-    LOGD("softether_send_packet returned: %d", send_result);
-    if (send_result < 0) {
-        LOGE("Failed to send CONNECT packet");
-        return ERR_PROTOCOL_VERSION;
-    }
-
-    // Receive CONNECT_ACK
-    uint16_t command;
-    uint8_t response[256];
-    uint32_t response_len;
-
-    // Set a short timeout for receiving response
-    struct timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive CONNECT_ACK - server not responding (timeout after 10s)");
-        // Restore timeout
-        tv.tv_sec = conn->timeout_ms / 1000;
-        tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
-        setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        return ERR_TIMEOUT;
-    }
-    
-    // Restore timeout
-    tv.tv_sec = conn->timeout_ms / 1000;
-    tv.tv_usec = (conn->timeout_ms % 1000) * 1000;
-    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (command != CMD_CONNECT_ACK) {
-        LOGE("Expected CONNECT_ACK, got %s (0x%04X)", command_to_string(command), command);
-        // Don't fail - continue anyway for debugging
-        // return ERR_PROTOCOL_VERSION;
-    }
-
-    // Check protocol version in response
-    if (response_len >= 2) {
-        uint16_t server_version = ((uint16_t)response[0] << 8) | response[1];
-        LOGD("Server protocol version: 0x%04X", server_version);
-
-        if (server_version != SOFTETHER_VERSION) {
-            LOGW("Protocol version mismatch: client=0x%04X, server=0x%04X - continuing anyway",
-                 SOFTETHER_VERSION, server_version);
-        }
-    }
-
-    LOGD("Protocol handshake successful with hub '%s'", effective_hub_name);
-    return ERR_NONE;
-}
-
-// Perform protocol handshake (legacy wrapper)
-static int perform_protocol_handshake(softether_connection_t* conn) {
-    return perform_protocol_handshake_ex(conn, NULL, NULL, NULL);
-}
-
-// Perform authentication
-static int perform_authentication(softether_connection_t* conn, const char* username, const char* password) {
+// Send authentication via HTTP POST to /vpnsvc/vpn.cgi using proper PACK format.
+// This is the correct SoftEther VPN login protocol:
+//   1. Build PACK with method="login", hubname, username, authtype
+//   2. POST the PACK as application/octet-stream body to /vpnsvc/vpn.cgi
+//   3. Server responds with HTTP 200 + PACK; check error field == 0
+static int perform_authentication_http(softether_connection_t* conn,
+                                        const char* username, const char* password) {
     if (conn == NULL || username == NULL || password == NULL) {
         return ERR_AUTHENTICATION;
     }
 
-    LOGD("Starting authentication for user: %s", username);
+    LOGD("Starting PACK-based HTTP authentication for user: %s hub: %s",
+         username, conn->hub_name);
     conn->state = STATE_AUTHENTICATING;
 
-    // Store credentials
     strncpy(conn->username, username, sizeof(conn->username) - 1);
     strncpy(conn->password, password, sizeof(conn->password) - 1);
 
-    // For now, use plaintext password transmission (as per current implementation)
-    // In the future, this should use password hashing
-    // Build AUTH_REQUEST payload
-    size_t username_len = strlen(username);
-    size_t password_len = strlen(password);
-    
-    // Try hashing the password first with MD5
-    // Format: [username_len:2][username][password_hash_type:1][password_len:2][password_hash]
-    // password_hash_type: 0 = plaintext, 1 = MD5
-    uint8_t password_hash[MD5_HASH_SIZE];
-    int use_hash = 1;  // Try to use MD5 hash by default
-    
-    if (use_hash) {
-        // Hash the password with MD5
-        md5_hash((uint8_t*)password, password_len, password_hash);
-        LOGD("Password hashed with MD5");
-    }
-    
-    // Build auth payload with hashed password
-    // Format: [username_len:2][username][password_hash_type:1][hash_len:2][password_hash]
-    size_t auth_payload_len = 2 + username_len + 1 + 2 + (use_hash ? MD5_HASH_SIZE : password_len);
-    uint8_t* auth_payload = (uint8_t*)malloc(auth_payload_len);
+    // Decide auth type: password if non-empty password, else anonymous
+    int auth_type = 0;  // 0 = anonymous (CLIENT_AUTHTYPE_ANONYMOUS)
+    uint8_t secure_password[SHA1_SIZE];
+    memset(secure_password, 0, sizeof(secure_password));
 
-    if (auth_payload == NULL) {
-        LOGE("Failed to allocate auth payload");
-        return ERR_AUTHENTICATION;
-    }
-
-    // Format: [username_len:2][username][password_type:1][password_len_or_hash_len:2][password_or_hash]
-    uint32_t offset = 0;
-    auth_payload[offset++] = (username_len >> 8) & 0xFF;
-    auth_payload[offset++] = username_len & 0xFF;
-    memcpy(auth_payload + offset, username, username_len);
-    offset += username_len;
-    
-    // Password type: 0 = plaintext, 1 = MD5 hash
-    auth_payload[offset++] = use_hash ? 1 : 0;
-    
-    if (use_hash) {
-        auth_payload[offset++] = (MD5_HASH_SIZE >> 8) & 0xFF;
-        auth_payload[offset++] = MD5_HASH_SIZE & 0xFF;
-        memcpy(auth_payload + offset, password_hash, MD5_HASH_SIZE);
-        offset += MD5_HASH_SIZE;
-        LOGD("Auth payload: username='%s' (len=%zu), MD5 hash (len=%d)", 
-             username, username_len, MD5_HASH_SIZE);
-    } else {
-        auth_payload[offset++] = (password_len >> 8) & 0xFF;
-        auth_payload[offset++] = password_len & 0xFF;
-        memcpy(auth_payload + offset, password, password_len);
-        offset += password_len;
-        LOGD("Auth payload: username='%s' (len=%zu), plaintext password (len=%zu)", 
-             username, username_len, password_len);
-    }
-
-    // Send AUTH_REQUEST
-    LOGD("Sending AUTH_REQUEST with hashed password...");
-    if (softether_send_packet(conn, CMD_AUTH, auth_payload, auth_payload_len) < 0) {
-        LOGE("Failed to send AUTH packet");
-        free(auth_payload);
-        return ERR_AUTHENTICATION;
-    }
-
-    free(auth_payload);
-
-    // Receive AUTH_CHALLENGE or AUTH_SUCCESS
-    uint16_t command;
-    uint8_t response[256];
-    uint32_t response_len;
-
-    LOGD("Waiting for auth response...");
-    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive auth response");
-        return ERR_AUTHENTICATION;
-    }
-
-    LOGD("Received auth response: command=0x%04X (%s), len=%u", command, command_to_string(command), response_len);
-    
-    if (command == CMD_AUTH_CHALLENGE) {
-        // Handle challenge-response authentication
-        LOGD("Received authentication challenge (len=%u bytes)", response_len);
-        
-        if (response_len > 0) {
-            // Challenge response format:
-            // 1. Take challenge bytes from response
-            // 2. Concatenate with password hash or plaintext password
-            // 3. Hash the concatenation with MD5
-            // 4. Send back as response
-            
-            uint8_t challenge_response[MD5_HASH_SIZE];
-            
-            // Create context for MD5 hash of challenge+password
-            // For now, we'll hash the challenge with the password hash
-            uint8_t challenge_input[response_len + MD5_HASH_SIZE];
-            memcpy(challenge_input, response, response_len);
-            
-            if (use_hash) {
-                // Use the MD5 hash we already calculated
-                memcpy(challenge_input + response_len, password_hash, MD5_HASH_SIZE);
-                md5_hash(challenge_input, response_len + MD5_HASH_SIZE, challenge_response);
-                LOGD("Challenge-response: hashed challenge(%u) + password_hash(%d)", 
-                     response_len, MD5_HASH_SIZE);
-            } else {
-                // Hash challenge with plaintext password
-                memcpy(challenge_input + response_len, password, password_len);
-                md5_hash(challenge_input, response_len + password_len, challenge_response);
-                LOGD("Challenge-response: hashed challenge(%u) + password(%zu)", 
-                     response_len, password_len);
+    if (strlen(password) > 0) {
+        auth_type = 1;  // CLIENT_AUTHTYPE_PASSWORD
+        // Compute HashedPassword = SHA1(password_bytes + UPPER(username_bytes))
+        uint8_t hashed_pw[SHA1_SIZE];
+        size_t pw_len = strlen(password);
+        size_t user_len = strlen(username);
+        char* upper_user = (char*)malloc(user_len + 1);
+        if (upper_user) {
+            memcpy(upper_user, username, user_len + 1);
+            for (size_t ci = 0; ci < user_len; ci++) {
+                if (upper_user[ci] >= 'a' && upper_user[ci] <= 'z')
+                    upper_user[ci] -= 32;
             }
-            
-            // Send AUTH_RESPONSE with the challenge hash
-            LOGD("Sending AUTH_RESPONSE with challenge response hash...");
-            if (softether_send_packet(conn, CMD_AUTH_RESPONSE, challenge_response, MD5_HASH_SIZE) < 0) {
-                LOGE("Failed to send AUTH_RESPONSE");
-                return ERR_AUTHENTICATION;
+            // Concatenate: password_bytes + UPPER(username_bytes)
+            size_t concat_len = pw_len + user_len;
+            uint8_t* concat_buf = (uint8_t*)malloc(concat_len);
+            if (concat_buf) {
+                memcpy(concat_buf, password, pw_len);
+                memcpy(concat_buf + pw_len, upper_user, user_len);
+                sha1_hash(concat_buf, concat_len, hashed_pw);
+                free(concat_buf);
+                LOGD("HashedPassword (SHA1(pw+UPPER_user)) computed");
+
+                // SecurePassword = SHA1(hashed_pw + server_random)
+                if (conn->has_server_random) {
+                    uint8_t combined[SHA1_SIZE * 2];
+                    memcpy(combined, hashed_pw, SHA1_SIZE);
+                    memcpy(combined + SHA1_SIZE, conn->server_random, SHA1_SIZE);
+                    sha1_hash(combined, SHA1_SIZE * 2, secure_password);
+                    LOGD("SecurePassword (SHA1(hashed_pw+server_random)) computed");
+                } else {
+                    // No server random available — use hashed_pw directly as fallback
+                    memcpy(secure_password, hashed_pw, SHA1_SIZE);
+                    LOGW("No server random available; using raw hashed password");
+                }
             }
-        } else {
-            // Empty challenge - just send empty response
-            LOGW("Received empty challenge, sending empty response");
-            if (softether_send_packet(conn, CMD_AUTH_RESPONSE, NULL, 0) < 0) {
-                LOGE("Failed to send AUTH_RESPONSE");
-                return ERR_AUTHENTICATION;
-            }
+            free(upper_user);
         }
+    }
 
-        // Receive final auth result
-        if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-            LOGE("Failed to receive final auth response");
+    // Build the login PACK
+    uint32_t pack_len = 0;
+    uint8_t* pack_buf = build_login_pack(conn->hub_name, username,
+                                          auth_type,
+                                          (auth_type == 1) ? secure_password : NULL,
+                                          &pack_len);
+    if (pack_buf == NULL || pack_len == 0) {
+        LOGE("Failed to build login PACK");
+        if (pack_buf) free(pack_buf);
+        return ERR_AUTHENTICATION;
+    }
+
+    LOGD("Login PACK built: %u bytes, auth_type=%d", pack_len, auth_type);
+
+    // Send HTTP POST to /vpnsvc/vpn.cgi (matching reference HttpClientSend)
+    // Include Date and Keep-Alive headers like the reference
+    char date_str[64];
+    {
+        time_t now = time(NULL);
+        struct tm* gmt = gmtime(&now);
+        strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", gmt);
+    }
+
+    char http_hdr[512];
+    int hdr_len = snprintf(http_hdr, sizeof(http_hdr),
+        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+        "Date: %s\r\n"
+        "Host: %s\r\n"
+        "Keep-Alive: timeout=15; max=19\r\n"
+        "Connection: Keep-Alive\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: %u\r\n"
+        "\r\n",
+        date_str, conn->server_ip, pack_len);
+
+    // Combine header + body into single buffer and send as one SSL_write
+    // (matching reference PostHttp which does SendAll of header+body)
+    size_t combined_len = (size_t)hdr_len + pack_len;
+    uint8_t* combined = (uint8_t*)malloc(combined_len);
+    if (combined == NULL) {
+        free(pack_buf);
+        LOGE("Failed to allocate combined buffer");
+        return ERR_AUTHENTICATION;
+    }
+    memcpy(combined, http_hdr, hdr_len);
+    memcpy(combined + hdr_len, pack_buf, pack_len);
+    free(pack_buf);
+
+    int sent = ssl_write((ssl_context_t*)conn->ssl, combined, (int)combined_len);
+    free(combined);
+
+    if (sent <= 0) {
+        LOGE("Failed to send login PACK via HTTP");
+        return ERR_AUTHENTICATION;
+    }
+
+    // Receive the Welcome / error PACK response — read precisely to avoid
+    // consuming data channel bytes that follow the HTTP response
+    uint8_t resp_buf[8192];
+    int body_offset = 0, body_len_i = 0;
+    int total = read_http_response(conn, resp_buf, sizeof(resp_buf), &body_offset, &body_len_i);
+
+    if (total <= 0) {
+        LOGE("No response received for login PACK");
+        return ERR_AUTHENTICATION;
+    }
+    LOGD("Login response: %d total bytes (headers=%d, body=%d)", total, body_offset, body_len_i);
+
+    // Parse HTTP response
+    if (strstr((char*)resp_buf, "HTTP/1.1 200") == NULL &&
+        strstr((char*)resp_buf, "HTTP/1.0 200") == NULL) {
+        LOGE("Login HTTP response is not 200 OK: %.200s", (char*)resp_buf);
+        return ERR_AUTHENTICATION;
+    }
+
+    const char* body = (const char*)resp_buf + body_offset;
+    uint32_t body_len = (uint32_t)body_len_i;
+
+    if (body_len < 4) {
+        LOGE("Login response body too short: %u bytes", body_len);
+        return ERR_AUTHENTICATION;
+    }
+
+    LOGD("Login response body: %u bytes", body_len);
+
+    // Parse the response PACK — check the "error" field
+    uint32_t err_val = 0;
+    if (pack_get_int((const uint8_t*)body, body_len, "error", &err_val) == 0) {
+        if (err_val != 0) {
+            LOGE("Server returned error in login response: %u", err_val);
             return ERR_AUTHENTICATION;
         }
-        
-        LOGD("Received final auth result: command=0x%04X (%s)", command, command_to_string(command));
-    }
-
-    if (command != CMD_AUTH_SUCCESS) {
-        LOGE("Authentication failed: %s (expected CMD_AUTH_SUCCESS=0x%04X)", 
-             command_to_string(command), CMD_AUTH_SUCCESS);
-        return ERR_AUTHENTICATION;
-    }
-
-    LOGD("Authentication successful");
-    return ERR_NONE;
-}
-
-// Send authentication via HTTP POST to vpn.cgi (for VPNGate servers behind HTTP proxy)
-static int perform_authentication_http(softether_connection_t* conn, const char* username, const char* password) {
-    if (conn == NULL || username == NULL || password == NULL) {
-        return ERR_AUTHENTICATION;
-    }
-
-    LOGD("Starting HTTP authentication for user: %s", username);
-    conn->state = STATE_AUTHENTICATING;
-
-    // Store credentials
-    strncpy(conn->username, username, sizeof(conn->username) - 1);
-    strncpy(conn->password, password, sizeof(conn->password) - 1);
-
-    // Build AUTH_REQUEST payload
-    size_t username_len = strlen(username);
-    size_t password_len = strlen(password);
-    size_t auth_payload_len = 2 + username_len + 2 + password_len;
-    uint8_t* auth_payload = (uint8_t*)malloc(auth_payload_len);
-
-    if (auth_payload == NULL) {
-        LOGE("Failed to allocate auth payload");
-        return ERR_AUTHENTICATION;
-    }
-
-    // Format: [username_len:2][username][password_len:2][password]
-    uint32_t offset = 0;
-    auth_payload[offset++] = (username_len >> 8) & 0xFF;
-    auth_payload[offset++] = username_len & 0xFF;
-    memcpy(auth_payload + offset, username, username_len);
-    offset += username_len;
-    auth_payload[offset++] = (password_len >> 8) & 0xFF;
-    auth_payload[offset++] = password_len & 0xFF;
-    memcpy(auth_payload + offset, password, password_len);
-
-    // Build HTTP POST to /vpnsvc/vpn.cgi
-    char http_auth[2048];
-    int http_len = snprintf(http_auth, sizeof(http_auth),
-        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Connection: Keep-Alive\r\n"
-        "Content-Length: %zu\r\n"
-        "X-VPN: 1\r\n"
-        "\r\n",
-        conn->server_ip, auth_payload_len + 4);  // +4 for command prefix
-
-    // Send HTTP header with AUTH command prefixed
-    uint8_t cmd_prefix[4] = {0x00, 0x03, (auth_payload_len >> 8) & 0xFF, auth_payload_len & 0xFF};
-
-    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_auth, http_len);
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
-    }
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, auth_payload, auth_payload_len);
-    }
-    free(auth_payload);
-
-    if (sent <= 0) {
-        LOGE("Failed to send AUTH via HTTP");
-        return ERR_AUTHENTICATION;
-    }
-
-    // Wait for auth response via HTTP
-    uint8_t http_resp[4096];
-    int recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
-
-    if (recvd > 0) {
-        http_resp[recvd] = '\0';
-        LOGD("Auth response received: %d bytes", recvd);
-
-        // Check if we got HTTP 200 with binary content
-        if (strstr((char*)http_resp, "HTTP/1.1 200") != NULL ||
-            strstr((char*)http_resp, "HTTP/1.0 200") != NULL) {
-
-            // Check for Content-Type: application/octet-stream
-            if (strstr((char*)http_resp, "application/octet-stream") != NULL) {
-                // Extract binary response
-                char* body = strstr((char*)http_resp, "\r\n\r\n");
-                if (body) {
-                    body += 4;
-                    uint32_t body_len = recvd - (body - (char*)http_resp);
-                    if (body_len >= 4) {
-                        // Try parsing from offset 2 (CMD_AUTH is at body[2:3])
-                        uint16_t cmd = ((uint16_t)body[2] << 8) | body[3];
-                        LOGD("AUTH response command: 0x%04X", cmd);
-
-                        if (cmd == CMD_AUTH_SUCCESS || cmd == CMD_AUTH_CHALLENGE || cmd == 0x0000) {
-                            LOGD("Authentication successful via HTTP");
-                            return ERR_NONE;
-                        }
-                    }
-
-                    // Official SoftEther flow returns a PACK welcome/login response over HTTP.
-                    // In that case, there is no simplified command prefix to parse.
-                    if (body_len > 0 &&
-                        (buffer_contains_token((const uint8_t*)body, body_len, "session_key") ||
-                         buffer_contains_token((const uint8_t*)body, body_len, "session_name") ||
-                         buffer_contains_token((const uint8_t*)body, body_len, "connection_name"))) {
-                        LOGD("Detected PACK welcome fields in HTTP auth response");
-                        return ERR_NONE;
-                    }
-                }
+        LOGD("Login PACK response: error=0 (success)");
+    } else {
+        // "error" field not found — may be a Welcome PACK (no error = success)
+        // Check for session fields that indicate success
+        LOGD("No 'error' field in response; checking for session fields");
+        if (!buffer_contains_token((const uint8_t*)body, body_len, "session_key") &&
+            !buffer_contains_token((const uint8_t*)body, body_len, "session_name") &&
+            !buffer_contains_token((const uint8_t*)body, body_len, "connection_name")) {
+            LOGE("Login response PACK contains neither error nor session fields");
+            // Hex dump first 32 bytes for diagnostics
+            for (uint32_t di = 0; di < body_len && di < 32; di++) {
+                LOGD("  body[%02u] = 0x%02X", di, (unsigned char)body[di]);
             }
-        }
-
-        LOGD("Auth response: %.500s", (char*)http_resp);
-    }
-
-    LOGE("Authentication failed via HTTP");
-    return ERR_AUTHENTICATION;
-}
-
-// Forward declaration
-static int setup_session_http(softether_connection_t* conn);
-
-// Setup session
-static int setup_session(softether_connection_t* conn) {
-    if (conn == NULL) {
-        return ERR_SESSION;
-    }
-
-    LOGD("Setting up session");
-    conn->state = STATE_SESSION_SETUP;
-
-    // Binary session setup path.
-    // NOTE: Official SoftEther HTTP login flow already returns Welcome/session parameters,
-    // so this function should only be used by legacy binary command mode.
-    uint8_t session_request[4] = {0};  // Request new session
-
-    // Binary protocol
-    if (softether_send_packet(conn, CMD_SESSION_REQUEST, session_request, sizeof(session_request)) < 0) {
-        LOGE("Failed to send SESSION_REQUEST");
-        return ERR_SESSION;
-    }
-
-    // Receive SESSION_ASSIGN
-    uint16_t command;
-    uint8_t response[256];
-    uint32_t response_len;
-
-    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive SESSION_ASSIGN");
-        return ERR_SESSION;
-    }
-
-    if (command != CMD_SESSION_ASSIGN) {
-        LOGE("Expected SESSION_ASSIGN, got %s", command_to_string(command));
-        return ERR_SESSION;
-    }
-
-    // Extract session ID from response
-    if (response_len >= 4) {
-        conn->session_id = ((uint32_t)response[0] << 24) |
-                          ((uint32_t)response[1] << 16) |
-                          ((uint32_t)response[2] << 8) |
-                          (uint32_t)response[3];
-        LOGD("Session assigned: 0x%08X", conn->session_id);
-    }
-
-    // Send CONFIG_REQUEST
-    if (softether_send_packet(conn, CMD_CONFIG_REQUEST, NULL, 0) < 0) {
-        LOGE("Failed to send CONFIG_REQUEST");
-        return ERR_SESSION;
-    }
-
-    // Receive CONFIG_RESPONSE
-    if (softether_receive_packet(conn, &command, response, &response_len, sizeof(response)) < 0) {
-        LOGE("Failed to receive CONFIG_RESPONSE");
-        return ERR_SESSION;
-    }
-
-    if (command != CMD_CONFIG_RESPONSE) {
-        LOGE("Expected CONFIG_RESPONSE, got %s", command_to_string(command));
-        return ERR_SESSION;
-    }
-
-    LOGD("Session setup successful");
-    return ERR_NONE;
-}
-
-// Helper: Setup session via HTTP (for VPNGate servers)
-// SESSION_REQUEST = 0x0008, SESSION_ASSIGN = 0x0009
-// CONFIG_REQUEST = 0x000A, CONFIG_RESPONSE = 0x000B
-static int setup_session_http(softether_connection_t* conn) {
-    if (conn == NULL || conn->ssl == NULL) {
-        return ERR_SESSION;
-    }
-
-    LOGD("Setting up session via HTTP");
-    
-    // Send SESSION_REQUEST via HTTP POST to vpn.cgi
-    uint8_t session_request[4] = {0};
-    size_t session_len = 4;
-    
-    char http_post[1024];
-    int http_len = snprintf(http_post, sizeof(http_post),
-        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Connection: Keep-Alive\r\n"
-        "Content-Length: %zu\r\n"
-        "X-VPN: 1\r\n"
-        "\r\n",
-        conn->server_ip, session_len + 4);
-    
-    // SESSION_REQUEST = 0x0008
-    uint8_t cmd_prefix[4] = {0x00, 0x08, (session_len >> 8) & 0xFF, session_len & 0xFF};
-    
-    int sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, cmd_prefix, 4);
-    }
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, session_request, session_len);
-    }
-    
-    if (sent <= 0) {
-        LOGE("Failed to send SESSION_REQUEST via HTTP");
-        return ERR_SESSION;
-    }
-    
-    // Receive response
-    uint8_t http_resp[4096];
-    int recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
-    
-    if (recvd <= 0) {
-        LOGE("Failed to receive SESSION_ASSIGN via HTTP");
-        return ERR_SESSION;
-    }
-    
-    http_resp[recvd] = '\0';
-    LOGD("SESSION_REQUEST response (%d bytes): %.500s", recvd, (char*)http_resp);
-    
-    // Check for HTTP 200
-    if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
-        strstr((char*)http_resp, "HTTP/1.0 200") == NULL) {
-        LOGE("SESSION_REQUEST via HTTP failed - not HTTP 200");
-        return ERR_SESSION;
-    }
-    
-    // Extract session ID from HTTP body - verify it's SESSION_ASSIGN (0x0009)
-    char* body = strstr((char*)http_resp, "\r\n\r\n");
-    uint32_t body_len = 0;
-    if (body) {
-        body += 4;
-        body_len = recvd - (body - (char*)http_resp);
-        LOGD("SESSION response body length: %u bytes", body_len);
-        
-        // Check for SESSION_ASSIGN command (0x0009) at offset 0 or 2
-        if (body_len >= 4) {
-            uint16_t resp_cmd0 = ((uint16_t)body[0] << 8) | body[1];
-            uint16_t resp_cmd2 = ((uint16_t)body[2] << 8) | body[3];
-            LOGD("SESSION response command: offset0=0x%04X, offset2=0x%04X", resp_cmd0, resp_cmd2);
-            
-            // Accept both SESSION_ASSIGN (0x0009) and AUTH_SUCCESS (0x0006) as success
-            // Some servers return different responses
-            if (resp_cmd0 == CMD_SESSION_ASSIGN || resp_cmd2 == CMD_SESSION_ASSIGN ||
-                resp_cmd0 == CMD_AUTH_SUCCESS || resp_cmd2 == CMD_AUTH_SUCCESS ||
-                resp_cmd0 == 0x0000 || resp_cmd2 == 0x0000) {
-                // Extract session ID from offset 4 (after command + length)
-                if (body_len >= 8) {
-                    conn->session_id = ((uint32_t)body[4] << 24) |
-                                      ((uint32_t)body[5] << 16) |
-                                      ((uint32_t)body[6] << 8) |
-                                      (uint32_t)body[7];
-                    LOGD("Session assigned via HTTP: 0x%08X", conn->session_id);
-                }
-                // If no valid session ID, generate a random one
-                if (conn->session_id == 0) {
-                    conn->session_id = rand() & 0xFFFFFFFF;
-                    LOGD("Generated random session ID: 0x%08X", conn->session_id);
-                }
-            } else {
-                LOGW("Unexpected session response command, continuing anyway");
-            }
+            return ERR_AUTHENTICATION;
         }
     }
-    
-    // Small delay before next request
-    usleep(10000); // 10ms
-    
-    // Now send CONFIG_REQUEST via HTTP
-    memset(http_post, 0, sizeof(http_post));
-    http_len = snprintf(http_post, sizeof(http_post),
-        "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Connection: Keep-Alive\r\n"
-        "Content-Length: 4\r\n"
-        "X-VPN: 1\r\n"
-        "\r\n",
-        conn->server_ip);
-    
-    // CONFIG_REQUEST = 0x000A
-    uint8_t config_prefix[4] = {0x00, 0x0A, 0x00, 0x00};
-    
-    sent = ssl_write((ssl_context_t*)conn->ssl, (uint8_t*)http_post, http_len);
-    if (sent > 0) {
-        sent = ssl_write((ssl_context_t*)conn->ssl, config_prefix, 4);
+
+    LOGD("HTTP PACK authentication succeeded");
+
+    // Parse Welcome PACK session fields
+    if (pack_get_str((const uint8_t*)body, body_len, "session_name",
+                     conn->session_name, sizeof(conn->session_name)) == 0) {
+        LOGD("Session name: %s", conn->session_name);
     }
-    
-    if (sent <= 0) {
-        LOGE("Failed to send CONFIG_REQUEST via HTTP");
-        return ERR_SESSION;
+    if (pack_get_str((const uint8_t*)body, body_len, "connection_name",
+                     conn->connection_name, sizeof(conn->connection_name)) == 0) {
+        LOGD("Connection name: %s", conn->connection_name);
     }
-    
-    // Receive CONFIG response
-    recvd = ssl_read((ssl_context_t*)conn->ssl, http_resp, sizeof(http_resp) - 1);
-    
-    if (recvd <= 0) {
-        LOGE("Failed to receive CONFIG_RESPONSE via HTTP");
-        return ERR_SESSION;
+    uint32_t sk_len = 0;
+    if (pack_get_data((const uint8_t*)body, body_len, "session_key",
+                      conn->session_key, sizeof(conn->session_key), &sk_len) == 0) {
+        LOGD("Session key received (%u bytes)", sk_len);
     }
+    pack_get_int((const uint8_t*)body, body_len, "session_key_32", &conn->session_key_32);
+    pack_get_int((const uint8_t*)body, body_len, "max_connection", &conn->server_max_connection);
+    pack_get_int((const uint8_t*)body, body_len, "use_encrypt", &conn->server_use_encrypt);
+    pack_get_int((const uint8_t*)body, body_len, "use_fast_rc4", &conn->server_use_fast_rc4);
+    pack_get_int((const uint8_t*)body, body_len, "timeout", &conn->server_timeout);
     
-    http_resp[recvd] = '\0';
-    LOGD("CONFIG_RESPONSE (%d bytes): %.500s", recvd, (char*)http_resp);
-    
-    // Check for HTTP 200
-    if (strstr((char*)http_resp, "HTTP/1.1 200") == NULL && 
-        strstr((char*)http_resp, "HTTP/1.0 200") == NULL) {
-        LOGE("CONFIG_REQUEST via HTTP failed - not HTTP 200");
-        return ERR_SESSION;
+    // Determine data channel mode (same logic as reference SoftEther)
+    if (conn->server_use_encrypt && !conn->server_use_fast_rc4) {
+        conn->use_ssl_data = 1;
+        LOGD("Data channel: SSL encryption");
+    } else {
+        conn->use_ssl_data = 0;
+        LOGD("Data channel: raw TCP (use_encrypt=%u, use_fast_rc4=%u)",
+             conn->server_use_encrypt, conn->server_use_fast_rc4);
     }
-    
-    // For VPNGate servers, HTTP 200 is considered success
-    LOGD("Session setup successful via HTTP");
+    conn->session_established = 1;
+
     return ERR_NONE;
 }
 
@@ -1368,116 +1179,69 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         return result;
     }
 
-    // Perform HTTP detection - SoftEther server detection
-    int detect_result = detect_softether_server(conn, host);
-    if (detect_result < 0) {
-        LOGE("HTTP detection failed");
+    // ---- SoftEther Protocol: Step 1 ----
+    // POST /vpnsvc/connect.cgi with "VPNCONNECT" watermark.
+    // Server responds with Hello PACK containing version + server_random.
+    LOGD("Sending VPNCONNECT watermark (connect.cgi)...");
+    int watermark_result = send_vpnconnect_watermark(conn, host);
+
+    if (watermark_result < 0) {
+        LOGE("VPNCONNECT watermark failed — server may not be SoftEther");
         softether_disconnect(conn);
         return ERR_TLS_HANDSHAKE;
     }
-    LOGD("HTTP detection completed (result: %d)", detect_result);
 
-    // Send VPNCONNECT watermark BEFORE binary protocol - this is critical!
-    // The native test does this and it's required for VPNGate servers
-    LOGD("Calling send_vpnconnect_watermark...");
-    int watermark_result = send_vpnconnect_watermark(conn, host);
-    int got_hello_in_watermark = 0;
-
-    // Check if we got Hello in watermark response
-    if (watermark_result == 1) {
-        // We successfully parsed the watermark response - this means we got the Hello!
-        got_hello_in_watermark = 1;
-        LOGD("Got server Hello in watermark response - skipping binary CONNECT");
-    }
-    
-    // Wait a small amount to let server process our request
-    usleep(50000); // 50ms delay like native test does
-
-    // Only try binary protocol if we didn't get Hello from watermark
-    if (!got_hello_in_watermark) {
-        LOGD("No Hello in watermark, trying binary CONNECT...");
-        result = perform_protocol_handshake_ex(conn, conn->hub_name, username, password);
-        
-        if (result == ERR_TIMEOUT) {
-            // Binary protocol timed out - this is expected for VPNGate servers
-            LOGW("Binary protocol timed out, but watermark was sent - continuing to auth");
-            result = ERR_NONE;  // Consider this OK if watermark succeeded
-        }
-        
-        if (result != ERR_NONE) {
-            // Binary protocol failed - now we really have an error
-            LOGE("Binary protocol handshake failed - server may require HTTP-only mode");
-            LOGE("Error code: %d (%s)", result, softether_error_string(result));
-            softether_disconnect(conn);
-            return result;  // Return the actual error, not a generic one
-        }
+    if (watermark_result != 1) {
+        LOGW("Watermark sent but no Hello PACK received (result=%d)", watermark_result);
+        // Continue anyway — auth step may still work
     } else {
-        LOGD("Using Hello from watermark - handshake complete, proceeding to auth");
+        LOGD("Got server Hello in watermark response (server_random stored)");
     }
 
-    LOGD("CONNECT successful, proceeding to authentication");
-
-    // Store credentials for potential reconnection
-    strncpy(conn->username, username, sizeof(conn->username) - 1);
-    conn->username[sizeof(conn->username) - 1] = '\0';
-    strncpy(conn->password, password, sizeof(conn->password) - 1);
-    conn->password[sizeof(conn->password) - 1] = '\0';
-
-    // Try HTTP authentication first (for VPNGate servers behind HTTP proxy)
-    LOGD("Trying HTTP authentication first...");
-    int used_http_auth = 0;
+    // ---- SoftEther Protocol: Step 2 ----
+    // POST /vpnsvc/vpn.cgi with login PACK.
+    // Server responds with Welcome PACK (error=0 on success).
+    LOGD("Performing PACK-based authentication...");
     result = perform_authentication_http(conn, username, password);
-    if (result == ERR_NONE) {
-        used_http_auth = 1;
-        LOGD("HTTP authentication succeeded");
-    }
-    
-    // If HTTP auth fails, try binary authentication
+
     if (result != ERR_NONE) {
-        LOGD("HTTP auth failed (error: %d, %s), trying binary authentication...", 
-             result, softether_error_string(result));
-        result = perform_authentication(conn, username, password);
-    }
-    if (result != ERR_NONE) {
-        LOGE("Authentication failed with result: %d (%s)", result, softether_error_string(result));
+        LOGE("Authentication failed: %d (%s)", result, softether_error_string(result));
         softether_disconnect(conn);
-        return result;  // Return the actual error code
+        return result;
     }
 
     LOGD("Authentication successful");
 
-    // Enter explicit session establishment phase so upper layers can reflect
-    // correct state in UI/notifications.
+    // Session is established via the PACK login flow.
     conn->state = STATE_SESSION_SETUP;
 
-    // Official SoftEther HTTP login flow already returns Welcome/session parameters.
-    // Running legacy SESSION_REQUEST/CONFIG_REQUEST after successful HTTP login can
-    // cause protocol mismatch and ERR_SESSION.
-    if (!used_http_auth) {
-        LOGD("Using legacy binary session setup");
-        result = setup_session(conn);
-        if (result != ERR_NONE) {
-            LOGE("Session setup failed");
-            softether_disconnect(conn);
-            return result;
+    if (conn->session_established) {
+        // Use session_key_32 from server as session_id
+        if (conn->session_key_32 != 0) {
+            conn->session_id = conn->session_key_32;
+            LOGD("Using server session_key_32: 0x%08X", conn->session_id);
         }
-    } else {
-        LOGD("Skipping legacy session setup for HTTP/PACK login flow");
-
-        if (conn->session_id == 0) {
-            conn->session_id = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
-            LOGD("Generated session id for local state tracking: 0x%08X", conn->session_id);
-        }
+        LOGD("Session: name=%s, connection=%s",
+             conn->session_name, conn->connection_name);
     }
 
-    // Connection established - only after ALL steps complete
+    if (conn->session_id == 0) {
+        conn->session_id = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+        LOGD("Generated local session id: 0x%08X", conn->session_id);
+    }
+
+    // Connection established
     conn->state = STATE_CONNECTED;
     LOGD("Connection established successfully");
     
+    // Check for any leftover SSL data from the HTTP exchange
+    {
+        int pending = ssl_has_pending((ssl_context_t*)conn->ssl);
+        LOGD("SSL pending bytes after auth: %d", pending);
+    }
+    
     // Set appropriate timeout for data operations
-    // For data transmission, use a moderate timeout (5 seconds by default)
-    // This is different from handshake timeout (10 seconds)
-    int data_timeout_ms = 5000;  // 5 seconds for data operations
+    int data_timeout_ms = 5000;
     struct timeval tv;
     tv.tv_sec = data_timeout_ms / 1000;
     tv.tv_usec = (data_timeout_ms % 1000) * 1000;
@@ -1489,26 +1253,6 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         conn->on_connect(conn);
     }
 
-    return ERR_NONE;
-}
-
-// Simple keepalive mechanism - sends periodic keep-alive packets to maintain connection
-// Should be called periodically (e.g., every 25 seconds) while connected
-int softether_send_keepalive(softether_connection_t* conn) {
-    if (conn == NULL || conn->state != STATE_CONNECTED) {
-        return ERR_UNKNOWN;
-    }
-
-    LOGD("Sending KEEPALIVE packet to maintain connection");
-    
-    // Send a keep-alive packet (empty payload with specific command)
-    // Using a simple approach: send empty packet with marker
-    // This is compatible with SoftEther's keepalive mechanism
-    if (softether_send_packet(conn, 0x0010, NULL, 0) < 0) {  // 0x0010 is a keep-alive marker
-        LOGW("Failed to send keepalive packet");
-        return ERR_DATA_TRANSMISSION;
-    }
-    
     return ERR_NONE;
 }
 
@@ -1557,17 +1301,8 @@ void softether_disconnect(softether_connection_t* conn) {
     LOGD("Disconnecting (previous state: %s)", softether_state_string(prev_state));
     conn->state = STATE_DISCONNECTING;
 
-    // Send disconnect packet only if we were fully connected
-    if (prev_state == STATE_CONNECTED && conn->socket_fd >= 0) {
-        LOGD("Sending disconnect packet");
-        softether_send_packet(conn, CMD_DISCONNECT, NULL, 0);
-
-        // Wait for disconnect ACK with short timeout
-        uint16_t command;
-        uint8_t response[256];
-        uint32_t response_len;
-        softether_receive_packet(conn, &command, response, &response_len, sizeof(response));
-    }
+    // In real SoftEther, disconnect is simply closing the connection.
+    // No special disconnect packet exists in the block protocol.
 
     // Shutdown SSL only if it was initialized
     if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
@@ -1597,7 +1332,33 @@ void softether_disconnect(softether_connection_t* conn) {
     }
 }
 
-// Send data
+// Ethernet header constants
+#define ETH_HEADER_SIZE     14
+#define ETH_TYPE_IPV4       0x0800
+#define ETH_TYPE_IPV6       0x86DD
+#define ETH_TYPE_ARP        0x0806
+
+// Build an Ethernet frame around an IP packet
+static int build_ethernet_frame(uint8_t* frame, size_t max_frame_len,
+                                const uint8_t* ip_packet, size_t ip_len,
+                                const uint8_t* src_mac) {
+    if (ip_len + ETH_HEADER_SIZE > max_frame_len) return -1;
+    // Destination: broadcast (for DHCP/ARP) or gateway MAC
+    // Using broadcast works universally with SecureNAT
+    memset(frame, 0xFF, 6);  // dst MAC = FF:FF:FF:FF:FF:FF
+    memcpy(frame + 6, src_mac, 6);  // src MAC
+    // Determine EtherType from IP version
+    uint16_t ethertype = ETH_TYPE_IPV4;
+    if (ip_len > 0 && ((ip_packet[0] >> 4) & 0x0F) == 6) {
+        ethertype = ETH_TYPE_IPV6;
+    }
+    frame[12] = (ethertype >> 8) & 0xFF;
+    frame[13] = ethertype & 0xFF;
+    memcpy(frame + ETH_HEADER_SIZE, ip_packet, ip_len);
+    return (int)(ETH_HEADER_SIZE + ip_len);
+}
+
+// Send data — wraps IP packet in Ethernet frame for SoftEther L2 tunnel
 int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len) {
     if (conn == NULL || data == NULL || len == 0) {
         return -1;
@@ -1608,29 +1369,25 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
         return -1;
     }
 
-    // Send as DATA packet
-    // Split into chunks if necessary (max payload size)
-    size_t max_chunk = SOFTETHER_MAX_PAYLOAD;
-    size_t offset = 0;
-    int total_sent = 0;
-
-    while (offset < len) {
-        size_t chunk_size = (len - offset) > max_chunk ? max_chunk : (len - offset);
-
-        int sent = softether_send_packet(conn, CMD_DATA, data + offset, (uint32_t)chunk_size);
-        if (sent < 0) {
-            LOGE("Failed to send data chunk");
-            return -1;
-        }
-
-        total_sent += (int)chunk_size;
-        offset += chunk_size;
+    // Wrap IP packet in Ethernet frame
+    uint8_t frame[ETH_HEADER_SIZE + 65535];
+    int frame_len = build_ethernet_frame(frame, sizeof(frame), data, len, conn->client_mac);
+    if (frame_len < 0) {
+        LOGE("Failed to build Ethernet frame");
+        return -1;
     }
 
-    return total_sent;
+    // Send as a single data block using real SoftEther format
+    int sent = softether_send_packet(conn, CMD_DATA, frame, (uint32_t)frame_len);
+    if (sent < 0) {
+        LOGE("Failed to send data block");
+        return -1;
+    }
+
+    return (int)len;
 }
 
-// Receive data
+// Receive data — uses queue to handle multi-block messages; strips Ethernet header
 int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len) {
     if (conn == NULL || buffer == NULL || max_len == 0) {
         return -1;
@@ -1641,28 +1398,85 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
         return -1;
     }
 
-    uint16_t command;
-    uint32_t payload_len = 0;
-    uint32_t buffer_uint32 = (uint32_t)max_len;
+    // If queue is empty, read one protocol message and fill queue
+    if (conn->recv_queue_count <= 0) {
+        int rc = softether_fill_recv_queue(conn);
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;  // keepalive or empty — no user data
+    }
 
-    int result = softether_receive_packet(conn, &command, buffer, &payload_len, buffer_uint32);
-    if (result < 0) {
+    // Dequeue one frame
+    if (conn->recv_queue_count <= 0) return 0;
+
+    queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
+    uint32_t frame_len = entry->len;
+
+    if (frame_len <= ETH_HEADER_SIZE) {
+        // Too small for Ethernet — skip
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
+        return 0;
+    }
+
+    // Strip Ethernet header — return IP packet only
+    uint32_t ip_len = frame_len - ETH_HEADER_SIZE;
+    if (ip_len > max_len) {
+        LOGE("IP packet too large for buffer: %u > %zu", ip_len, max_len);
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
         return -1;
     }
 
-    if (command == CMD_DATA) {
-        return (int)payload_len;
-    } else if (command == CMD_KEEPALIVE) {
-        // Send keepalive ACK
-        softether_send_packet(conn, CMD_KEEPALIVE_ACK, NULL, 0);
-        return 0;  // No data received
-    } else {
-        LOGD("Received non-data packet: %s", command_to_string(command));
-        return 0;
-    }
+    memcpy(buffer, entry->data + ETH_HEADER_SIZE, ip_len);
+    conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+    conn->recv_queue_count--;
+    return (int)ip_len;
 }
 
-// Data tunnel operations - Send data packet with proper encapsulation
+// Raw L2 send — sends a raw Ethernet frame as a data block (for DHCP)
+int softether_send_raw(softether_connection_t* conn, const uint8_t* frame, size_t len) {
+    if (conn == NULL || frame == NULL || len == 0) return -1;
+    if (conn->state != STATE_CONNECTED) return -1;
+    return softether_send_packet(conn, CMD_DATA, frame, (uint32_t)len);
+}
+
+// Raw L2 receive — uses queue; returns raw Ethernet frame (for DHCP)
+int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t max_len, uint32_t* frame_len) {
+    if (conn == NULL || frame == NULL) return -1;
+    if (conn->state != STATE_CONNECTED) return -1;
+
+    // If queue is empty, read one protocol message
+    if (conn->recv_queue_count <= 0) {
+        int rc = softether_fill_recv_queue(conn);
+        if (rc < 0) return -1;
+        if (rc == 0) {
+            if (frame_len) *frame_len = 0;
+            return 0;
+        }
+    }
+
+    if (conn->recv_queue_count <= 0) {
+        if (frame_len) *frame_len = 0;
+        return 0;
+    }
+
+    // Dequeue one raw frame
+    queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
+    if (entry->len > (uint32_t)max_len) {
+        if (frame_len) *frame_len = 0;
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
+        return 0;
+    }
+
+    memcpy(frame, entry->data, entry->len);
+    if (frame_len) *frame_len = entry->len;
+    conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+    conn->recv_queue_count--;
+    return (int)entry->len;
+}
+
+// Data tunnel operations - Send data block
 int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint32_t data_len) {
     if (conn == NULL || data == NULL) {
         LOGE("Invalid parameters for send_data");
@@ -1674,18 +1488,17 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
-    // For data tunnel, we send raw data as payload
     int result = softether_send_packet(conn, CMD_DATA, data, data_len);
     if (result < 0) {
-        LOGE("Failed to send data packet");
+        LOGE("Failed to send data block");
         return -1;
     }
 
-    LOGD("Sent data packet: %u bytes", data_len);
+    LOGD("Sent data block: %u bytes", data_len);
     return result;
 }
 
-// Data tunnel operations - Receive data packet with command type returned
+// Data tunnel operations - Receive data block
 int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32_t max_len,
                            uint32_t* received_len, uint16_t* command) {
     if (conn == NULL || buffer == NULL || received_len == NULL || command == NULL) {
@@ -1702,9 +1515,7 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
     int result = softether_receive_packet(conn, command, buffer, &payload_len, max_len);
 
     if (result < 0) {
-        // Timeout or error - return 0 to indicate no data available
-        // In normal VPN operation, timeouts are expected when no packets arrive
-        // from the server
+        // Timeout or error
         LOGD("No data available from server (timeout or error)");
         *received_len = 0;
         *command = 0;
@@ -1713,34 +1524,10 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 
     *received_len = payload_len;
 
-    // Handle different command types
-    switch (*command) {
-        case CMD_DATA:
-            LOGD("Received data packet: %u bytes", payload_len);
-            break;
-
-        case CMD_KEEPALIVE:
-            // Send keepalive ACK
-            softether_send_packet(conn, CMD_KEEPALIVE_ACK, NULL, 0);
-            LOGD("Received keepalive, sent ACK");
-            *received_len = 0;  // No actual data
-            break;
-
-        case CMD_KEEPALIVE_ACK:
-            LOGD("Received keepalive ACK");
-            *received_len = 0;
-            break;
-
-        case CMD_DISCONNECT:
-        case CMD_DISCONNECT_ACK:
-            LOGD("Received disconnect command");
-            conn->state = STATE_DISCONNECTING;
-            return -1;
-
-        default:
-            LOGD("Received command: %s (0x%04X)", command_to_string(*command), *command);
-            *received_len = 0;
-            break;
+    if (*command == CMD_KEEPALIVE) {
+        softether_send_keepalive(conn);
+        LOGD("Received keepalive, sent response");
+        *received_len = 0;
     }
 
     return 0;

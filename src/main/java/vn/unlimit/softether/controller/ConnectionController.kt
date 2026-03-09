@@ -64,6 +64,10 @@ class ConnectionController(
     private var nativeHandle: Long = 0
     private var vpnInterface: ParcelFileDescriptor? = null
 
+    /** DHCP-assigned local IP address (available after successful connect) */
+    var assignedLocalIp: String? = null
+        private set
+
     /**
      * Initiates VPN connection with automatic retry logic
      */
@@ -165,15 +169,14 @@ class ConnectionController(
             throw Exception("Connection failed with error code: $result")
         }
 
-        // Make session-establishment phase explicit in app state/notification flow
-        // even if native transitions happen very quickly.
-        if (currentState != ConnectionState.SESSION_SETUP) {
-            currentState = ConnectionState.SESSION_SETUP
+        // Connection established — set CONNECTED state
+        // (State monitor may have already set CONNECTED; avoid downgrading to SESSION_SETUP)
+        if (currentState != ConnectionState.CONNECTED) {
+            currentState = ConnectionState.CONNECTED
         }
-        delay(120)
-
-        currentState = ConnectionState.CONNECTED
         reconnectAttempts.set(0) // Reset on successful connection
+        // Set external handle so send/receive work through ConnectionController
+        client.externalHandle = nativeHandle
         Log.d(TAG, "VPN connection established successfully")
 
         // Check if cancelled before establishing VPN interface
@@ -186,9 +189,39 @@ class ConnectionController(
             throw CancellationException("Connection cancelled by user")
         }
 
-        // Establish VPN interface
-        vpnInterface = service.establishVpnInterface(config)
-            ?: throw Exception("Failed to establish VPN interface")
+        // Protect VPN socket from routing through TUN (prevents routing loop)
+        val socketFd = client.nativeGetSocketFd(nativeHandle)
+        if (socketFd >= 0) {
+            if (!service.protect(socketFd)) {
+                Log.e(TAG, "Failed to protect VPN socket fd=$socketFd")
+            } else {
+                Log.d(TAG, "VPN socket fd=$socketFd protected from TUN routing")
+            }
+        } else {
+            Log.e(TAG, "Invalid socket fd, cannot protect")
+        }
+
+        // Perform DHCP over the SoftEther tunnel to get IP configuration
+        Log.d(TAG, "Starting DHCP over SoftEther tunnel...")
+        val dhcpResult = client.doDhcp(nativeHandle)
+        if (dhcpResult != null) {
+            Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
+                    "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer}")
+            assignedLocalIp = dhcpResult.assignedIp
+            // Update config with DHCP-assigned values
+            val dhcpConfig = config.copy(
+                localAddress = dhcpResult.assignedIp,
+                prefixLength = dhcpResult.prefixLength,
+                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer
+            )
+            vpnInterface = service.establishVpnInterface(dhcpConfig)
+                ?: throw Exception("Failed to establish VPN interface")
+        } else {
+            Log.w(TAG, "DHCP failed, falling back to hardcoded IP config")
+            assignedLocalIp = config.localAddress
+            vpnInterface = service.establishVpnInterface(config)
+                ?: throw Exception("Failed to establish VPN interface")
+        }
 
         // Start data forwarding loops
         startDataForwarding()
@@ -226,6 +259,7 @@ class ConnectionController(
     fun disconnect() {
         Log.d(TAG, "Disconnecting VPN")
         isCancelled.set(true)
+        client.externalHandle = 0
 
         // Use mutex to prevent race with connect()
         connectionMutex.tryLock()
@@ -469,12 +503,16 @@ class ConnectionController(
                 throw Exception("Reconnection failed with error code: $result")
             }
 
-            if (currentState != ConnectionState.SESSION_SETUP) {
-                currentState = ConnectionState.SESSION_SETUP
+            // Protect socket during reconnect too
+            val socketFd = client.nativeGetSocketFd(nativeHandle)
+            if (socketFd >= 0) {
+                service.protect(socketFd)
             }
-            delay(120)
+            client.externalHandle = nativeHandle
 
-            currentState = ConnectionState.CONNECTED
+            if (currentState != ConnectionState.CONNECTED) {
+                currentState = ConnectionState.CONNECTED
+            }
             reconnectAttempts.set(0) // Reset on successful reconnection
             Log.d(TAG, "Reconnection successful")
 

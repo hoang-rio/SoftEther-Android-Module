@@ -36,6 +36,14 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeRe
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetOption(
     JNIEnv *env, jobject thiz, jlong handle, jint option, jlong value);
 
+// Socket access (for VpnService.protect())
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetSocketFd(
+    JNIEnv *env, jobject thiz, jlong handle);
+
+// DHCP over SoftEther tunnel
+JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDoDhcp(
+    JNIEnv *env, jobject thiz, jlong handle);
+
 // Test functions for instrumentation tests
 JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestTcpConnection(
     JNIEnv *env, jobject thiz, jstring host, jint port, jint timeoutMs);

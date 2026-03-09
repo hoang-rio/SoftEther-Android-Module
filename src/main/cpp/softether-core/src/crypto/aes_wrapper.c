@@ -4,6 +4,7 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -249,11 +250,16 @@ ssl_context_t* ssl_create_client(void) {
         return NULL;
     }
     
-    // Set minimum TLS version to 1.2
-    SSL_CTX_set_min_proto_version(ctx->ctx, TLS1_2_VERSION);
+    // Set TLS version — force TLS 1.2 for SoftEther compatibility
+    // Many VPNGate servers don't properly support TLS 1.3 data exchange
+    SSL_CTX_set_min_proto_version(ctx->ctx, TLS1_VERSION);
+    SSL_CTX_set_max_proto_version(ctx->ctx, TLS1_2_VERSION);
     
-    // Set default verify paths
-    SSL_CTX_set_default_verify_paths(ctx->ctx);
+    // Auto-retry for renegotiation transparency
+    SSL_CTX_set_mode(ctx->ctx, SSL_MODE_AUTO_RETRY);
+    
+    // Disable verification for VPN connections (self-signed certs are common)
+    SSL_CTX_set_verify(ctx->ctx, SSL_VERIFY_NONE, NULL);
     
     LOGD("SSL client context created");
     return ctx;
@@ -341,7 +347,18 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     }
     
     ctx->connected = 1;
-    LOGD("SSL handshake successful after %d attempts", attempt + 1);
+    // Log negotiated TLS version and cipher
+    int tls_ver = SSL_version(ctx->ssl);
+    const char* ver_str = SSL_get_version(ctx->ssl);
+    const char* cipher = SSL_get_cipher(ctx->ssl);
+    LOGD("SSL handshake successful after %d attempts (version: %s / 0x%04X, cipher: %s)", 
+         attempt + 1, ver_str ? ver_str : "unknown", tls_ver,
+         cipher ? cipher : "unknown");
+    
+    // Set SSL modes matching reference SoftEther implementation
+    SSL_set_mode(ctx->ssl, SSL_MODE_AUTO_RETRY);
+    SSL_set_mode(ctx->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    
     return 0;
 }
 
@@ -352,7 +369,7 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     
     // Check if there's pending data in the SSL buffer first
     int pending = SSL_pending(ctx->ssl);
-    if (pending > 0) {
+    if (pending > 0 && pending % 500 == 0) {
         LOGD("SSL has %d bytes pending in buffer", pending);
     }
     
@@ -360,17 +377,20 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     if (result < 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
         if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
-            LOGE("SSL read error: %d", ssl_error);
+            unsigned long err_detail = ERR_get_error();
+            LOGE("SSL read error: %d, detail: %lu (%s)", ssl_error, err_detail,
+                 err_detail ? ERR_error_string(err_detail, NULL) : "none");
         }
     } else if (result == 0) {
-        // Check if connection was closed or just no data available
         int ssl_error = SSL_get_error(ctx->ssl, result);
+        unsigned long err_detail = ERR_get_error();
         if (ssl_error == SSL_ERROR_ZERO_RETURN) {
-            LOGD("SSL connection closed by peer");
+            LOGD("SSL connection closed by peer (clean shutdown)");
         } else if (ssl_error == SSL_ERROR_SYSCALL) {
-            LOGE("SSL read syscall error");
+            LOGE("SSL read syscall error: errno=%d", errno);
         } else {
-            LOGD("SSL read returned 0, error: %d", ssl_error);
+            LOGE("SSL read returned 0, ssl_error=%d, detail=%lu (%s)", ssl_error,
+                 err_detail, err_detail ? ERR_error_string(err_detail, NULL) : "none");
         }
     }
     return result;
@@ -398,6 +418,11 @@ void ssl_shutdown(ssl_context_t* ctx) {
     
     SSL_shutdown(ctx->ssl);
     ctx->connected = 0;
+}
+
+int ssl_has_pending(ssl_context_t* ctx) {
+    if (ctx == NULL || ctx->ssl == NULL) return 0;
+    return SSL_pending(ctx->ssl) > 0 ? 1 : 0;
 }
 
 // MD5 hashing

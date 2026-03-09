@@ -14,6 +14,10 @@ class SoftEtherClient {
     private val tag = "SoftEtherClient"
     private var nativeHandle: Long = 0
     private val isConnected = AtomicBoolean(false)
+    
+    // External handle set by ConnectionController when it manages the native connection directly
+    @Volatile
+    var externalHandle: Long = 0
 
     init {
         System.loadLibrary("softether")
@@ -91,10 +95,9 @@ class SoftEtherClient {
      * @return Number of bytes sent, or -1 on error
      */
     fun send(data: ByteArray): Int {
-        if (!isConnected.get() || nativeHandle == 0L) {
-            return -1
-        }
-        return nativeSend(nativeHandle, data, data.size)
+        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+        if (handle == 0L) return -1
+        return nativeSend(handle, data, data.size)
     }
 
     /**
@@ -104,10 +107,9 @@ class SoftEtherClient {
      * @return Number of bytes received, 0 for keepalive, or -1 on error
      */
     fun receive(buffer: ByteArray): Int {
-        if (!isConnected.get() || nativeHandle == 0L) {
-            return -1
-        }
-        return nativeReceive(nativeHandle, buffer, buffer.size)
+        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+        if (handle == 0L) return -1
+        return nativeReceive(handle, buffer, buffer.size)
     }
 
     /**
@@ -178,6 +180,28 @@ class SoftEtherClient {
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
+    external fun nativeGetSocketFd(handle: Long): Int
+    external fun nativeDoDhcp(handle: Long): IntArray?
+
+    /**
+     * Perform DHCP over SoftEther tunnel to get IP configuration
+     * @param handle Native connection handle (from ConnectionController)
+     * @return DhcpResult or null on failure
+     */
+    fun doDhcp(handle: Long = nativeHandle): DhcpResult? {
+        if (handle == 0L) return null
+        val arr = nativeDoDhcp(handle) ?: return null
+        if (arr.size < 7 || arr[0] == 0) return null
+        return DhcpResult(
+            assignedIp = intToIpString(arr[1]),
+            subnetMask = intToIpString(arr[2]),
+            gateway = intToIpString(arr[3]),
+            dnsServer = intToIpString(arr[4]),
+            dnsServer2 = intToIpString(arr[5]),
+            leaseTime = arr[6],
+            prefixLength = subnetMaskToPrefix(arr[2])
+        )
+    }
 
     companion object {
         // Option types for nativeSetOption
@@ -187,8 +211,34 @@ class SoftEtherClient {
         
         // Default hub name for VPNGate servers
         const val DEFAULT_HUB_NAME = "VPN"
+
+        private fun intToIpString(ip: Int): String {
+            return "${(ip ushr 24) and 0xFF}.${(ip ushr 16) and 0xFF}.${(ip ushr 8) and 0xFF}.${ip and 0xFF}"
+        }
+
+        private fun subnetMaskToPrefix(mask: Int): Int {
+            var m = mask
+            var prefix = 0
+            for (i in 31 downTo 0) {
+                if ((m and (1 shl i)) != 0) prefix++ else break
+            }
+            return prefix
+        }
     }
 }
+
+/**
+ * DHCP result from SoftEther tunnel
+ */
+data class DhcpResult(
+    val assignedIp: String,
+    val subnetMask: String,
+    val gateway: String,
+    val dnsServer: String,
+    val dnsServer2: String,
+    val leaseTime: Int,
+    val prefixLength: Int
+)
 
 /**
  * Custom exception for connection errors

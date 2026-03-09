@@ -1,313 +1,471 @@
+/*
+ * SoftEther VPN Data Channel - Block Format
+ *
+ * Real SoftEther uses a simple block-count + length-prefixed format for data
+ * after the HTTP-based authentication phase:
+ *
+ *   [uint32 block_count]              -- number of blocks, big-endian
+ *   [uint32 block_size_1][block_data_1]
+ *   [uint32 block_size_2][block_data_2]
+ *   ...
+ *
+ * Keepalive uses a special magic value:
+ *   [0xFFFFFFFF]                      -- KEEP_ALIVE_MAGIC
+ *   [uint32 keepalive_size][keepalive_data]
+ */
 #include "softether_protocol.h"
 #include "softether_socket.h"
 #include "softether_crypto.h"
-#include <openssl/ssl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <android/log.h>
 
 #define TAG "SoftEtherPacket"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// Forward declarations from serializer.c
-extern int serialize_header(const softether_header_t* header, uint8_t* buffer, size_t buffer_size);
-extern int deserialize_header(const uint8_t* buffer, size_t buffer_size, softether_header_t* header);
-extern int serialize_packet(const softether_header_t* header, const uint8_t* payload,
-                            uint8_t* buffer, size_t buffer_size);
-extern void create_packet_header(softether_header_t* header, uint16_t command,
-                                 uint32_t payload_length, uint32_t session_id,
-                                 uint32_t sequence_num);
-extern const char* command_to_string(uint16_t command);
+#define KEEP_ALIVE_MAGIC 0xFFFFFFFF
+#define MAX_BLOCK_SIZE   (1600 * 1600)  // same as SoftEther MAX_PACKET_SIZE safety
 
-// Send a packet through the connection
-int softether_send_packet(softether_connection_t* conn, uint16_t command,
-                          const uint8_t* payload, uint32_t payload_len) {
-    if (conn == NULL) {
-        LOGE("Connection is NULL");
-        return -1;
-    }
-    
-    if (conn->socket_fd < 0) {
-        LOGE("Socket not connected");
-        return -1;
-    }
-    
-    // Create packet header
-    softether_header_t header;
-    uint32_t seq_before = conn->sequence_num;
-    create_packet_header(&header, command, payload_len, conn->session_id, conn->sequence_num);
-    conn->sequence_num++;  // Increment after creating header
-    
-    LOGD("Sequence number: before=%u, header=%u, after=%u", 
-         seq_before, header.sequence_num, conn->sequence_num);
-    
-    // Calculate total packet size
-    size_t packet_size = SOFTETHER_HEADER_SIZE + payload_len;
-    uint8_t* packet = (uint8_t*)malloc(packet_size);
-    if (packet == NULL) {
-        LOGE("Failed to allocate packet buffer");
-        return -1;
-    }
-    
-    // Serialize the packet
-    int serialized_size = serialize_packet(&header, payload, packet, packet_size);
-    if (serialized_size < 0) {
-        LOGE("Failed to serialize packet");
-        free(packet);
-        return -1;
-    }
-    
-    LOGD("Sending packet: cmd=%s(0x%04X), total_size=%d, session_id=0x%08X, seq=%u",
-         command_to_string(command), command, serialized_size, header.session_id, header.sequence_num);
-    
-    // Log first few bytes for debugging
-    LOGD("Packet header hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-         packet[0], packet[1], packet[2], packet[3], packet[4], packet[5], packet[6], packet[7],
-         packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14], packet[15]);
-    
-    // Send through SSL if available, otherwise through plain socket
-    int bytes_sent = 0;
-    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
-        // Check state before SSL operation
+// Read exactly `len` bytes from the SSL connection. Returns 0 on success, -1 on error.
+static int ssl_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
+    int total = 0;
+    while (total < len) {
         if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
-            LOGE("Connection is disconnected, cannot send");
-            free(packet);
             return -1;
         }
-        bytes_sent = ssl_write((ssl_context_t*)conn->ssl, packet, serialized_size);
-        LOGD("SSL write result: %d", bytes_sent);
-    } else {
-        // Create a temporary socket wrapper for plain socket send
-        softether_socket_t temp_sock;
-        temp_sock.fd = conn->socket_fd;
-        temp_sock.connected = 1;
-        temp_sock.timeout_ms = conn->timeout_ms;
-        bytes_sent = socket_send_all(&temp_sock, packet, serialized_size, conn->timeout_ms);
+        int ret = ssl_read((ssl_context_t*)conn->ssl, buf + total, len - total);
+        if (ret <= 0) {
+            return -1;
+        }
+        total += ret;
     }
-    
-    free(packet);
-    
-    if (bytes_sent < 0) {
-        LOGE("Failed to send packet");
-        return -1;
-    }
-    
-    LOGD("Sent packet: cmd=%s(0x%04X), payload=%u bytes, sent=%d", 
-         command_to_string(command), command, payload_len, bytes_sent);
-    
-    return bytes_sent;
+    return 0;
 }
 
-// Receive a packet from the connection
+// Write exactly `len` bytes to the SSL connection. Returns 0 on success, -1 on error.
+static int ssl_write_all(softether_connection_t* conn, const uint8_t* buf, int len) {
+    int total = 0;
+    LOGD("ssl_write_all: writing %d bytes (first 8: %02X %02X %02X %02X %02X %02X %02X %02X)",
+         len,
+         len > 0 ? buf[0] : 0, len > 1 ? buf[1] : 0,
+         len > 2 ? buf[2] : 0, len > 3 ? buf[3] : 0,
+         len > 4 ? buf[4] : 0, len > 5 ? buf[5] : 0,
+         len > 6 ? buf[6] : 0, len > 7 ? buf[7] : 0);
+    while (total < len) {
+        if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+            LOGE("ssl_write_all: connection state %d", conn->state);
+            return -1;
+        }
+        int ret = ssl_write((ssl_context_t*)conn->ssl, buf + total, len - total);
+        if (ret <= 0) {
+            LOGE("ssl_write_all: ssl_write returned %d (wrote %d/%d)", ret, total, len);
+            return -1;
+        }
+        LOGD("ssl_write_all: ssl_write returned %d (progress %d/%d)", ret, total + ret, len);
+        total += ret;
+    }
+    return 0;
+}
+
+// Read exactly `len` bytes from raw TCP socket. Returns 0 on success, -1 on error.
+static int raw_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
+    int total = 0;
+    while (total < len) {
+        if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+            return -1;
+        }
+        int ret = (int)recv(conn->socket_fd, buf + total, len - total, 0);
+        if (ret <= 0) {
+            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            LOGE("raw_read_all: recv returned %d (errno=%d)", ret, errno);
+            return -1;
+        }
+        total += ret;
+    }
+    return 0;
+}
+
+// Write exactly `len` bytes to raw TCP socket. Returns 0 on success, -1 on error.
+static int raw_write_all(softether_connection_t* conn, const uint8_t* buf, int len) {
+    int total = 0;
+    while (total < len) {
+        if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+            return -1;
+        }
+        int ret = (int)send(conn->socket_fd, buf + total, len - total, 0);
+        if (ret <= 0) {
+            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            LOGE("raw_write_all: send returned %d (errno=%d)", ret, errno);
+            return -1;
+        }
+        total += ret;
+    }
+    return 0;
+}
+
+// Read `len` bytes using the appropriate channel (SSL or raw TCP)
+static int data_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
+    if (conn->use_ssl_data) {
+        return ssl_read_all(conn, buf, len);
+    } else {
+        return raw_read_all(conn, buf, len);
+    }
+}
+
+// Write `len` bytes using the appropriate channel (SSL or raw TCP)
+static int data_write_all(softether_connection_t* conn, const uint8_t* buf, int len) {
+    if (conn->use_ssl_data) {
+        return ssl_write_all(conn, buf, len);
+    } else {
+        return raw_write_all(conn, buf, len);
+    }
+}
+
+// Read a big-endian uint32 from the data channel.
+static int read_uint32(softether_connection_t* conn, uint32_t* out) {
+    uint8_t buf[4];
+    if (data_read_all(conn, buf, 4) != 0) return -1;
+    *out = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+    return 0;
+}
+
+
+// Send one data block (Ethernet frame) using the real SoftEther block format.
+// Format: [block_count=1][block_size][block_data]
+// Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
+int softether_send_packet(softether_connection_t* conn, uint16_t command,
+                          const uint8_t* payload, uint32_t payload_len) {
+    if (conn == NULL || conn->ssl == NULL) {
+        LOGE("Connection or SSL is NULL");
+        return -1;
+    }
+    if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
+        LOGE("Cannot send: connection state %d", conn->state);
+        return -1;
+    }
+
+    // For keepalive, use the magic format (has its own mutex lock)
+    if (command == CMD_KEEPALIVE || command == CMD_KEEPALIVE_ACK) {
+        return softether_send_keepalive(conn);
+    }
+
+    pthread_mutex_lock(&conn->write_mutex);
+
+    // Build entire data block as single buffer (matching reference ConnectionSend)
+    // Format: [block_count=1(4)][block_size(4)][block_data(payload_len)]
+    uint32_t total_size = 4 + 4 + payload_len;
+    uint8_t* buf = (uint8_t*)malloc(total_size);
+    if (buf == NULL) {
+        LOGE("Failed to allocate send buffer");
+        pthread_mutex_unlock(&conn->write_mutex);
+        return -1;
+    }
+
+    // block_count = 1 in big-endian
+    buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
+    // block_size in big-endian
+    buf[4] = (payload_len >> 24) & 0xFF;
+    buf[5] = (payload_len >> 16) & 0xFF;
+    buf[6] = (payload_len >> 8) & 0xFF;
+    buf[7] = payload_len & 0xFF;
+    // block data
+    if (payload_len > 0 && payload != NULL) {
+        memcpy(buf + 8, payload, payload_len);
+    }
+
+    int ret = data_write_all(conn, buf, (int)total_size);
+    free(buf);
+
+    if (ret != 0) {
+        LOGE("Failed to send data block");
+        pthread_mutex_unlock(&conn->write_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&conn->write_mutex);
+    LOGD("Sent 1 data block (%u bytes)", payload_len);
+    return (int)total_size;
+}
+
+// Receive data blocks from the connection.
+// Returns the first data block in `payload`, sets `payload_len`.
+// Sets `command` to CMD_DATA for data blocks, CMD_KEEPALIVE for keepalive.
+// Returns total bytes read on success, -1 on error.
 int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                              uint8_t* payload, uint32_t* payload_len, uint32_t max_payload) {
     if (conn == NULL || command == NULL) {
         LOGE("Invalid parameters");
         return -1;
     }
-    
-    if (conn->socket_fd < 0) {
-        LOGE("Socket not connected");
+    if (conn->ssl == NULL || conn->socket_fd < 0) {
+        LOGE("Socket/SSL not connected");
         return -1;
     }
-    
-    // Check if connection is in a valid state for receiving
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
-        LOGE("Connection is disconnected or disconnecting, state=%s", 
-             softether_state_string(conn->state));
         return -1;
     }
-    
-    LOGD("softether_receive_packet: Starting receive...");
-    LOGD("conn->state=%s, conn->socket_fd=%d, conn->ssl=%p", 
-         softether_state_string(conn->state), conn->socket_fd, (void*)conn->ssl);
 
-    // First, receive the header
-    uint8_t header_buffer[SOFTETHER_HEADER_SIZE];
-    int header_received = 0;
-    
-    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
-        // Receive through SSL
-        while (header_received < SOFTETHER_HEADER_SIZE) {
-            // Check state again before each SSL operation
-            if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
-                LOGE("Connection state changed during receive");
-                return -1;
-            }
-            
-            int ret = ssl_read((ssl_context_t*)conn->ssl, 
-                              header_buffer + header_received, 
-                              SOFTETHER_HEADER_SIZE - header_received);
-            if (ret <= 0) {
-                // Simplified error logging - ret value tells us what happened
-                LOGE("SSL read failed during header receive, ret=%d (0 means closed, negative means error)", ret);
-                return -1;
-            }
-            header_received += ret;
-            LOGD("Header receive progress: %d/%d bytes", header_received, SOFTETHER_HEADER_SIZE);
-        }
-    } else {
-        // Receive through plain socket
-        softether_socket_t temp_sock;
-        temp_sock.fd = conn->socket_fd;
-        temp_sock.connected = 1;
-        temp_sock.timeout_ms = conn->timeout_ms;
-        header_received = socket_recv_all(&temp_sock, header_buffer, SOFTETHER_HEADER_SIZE, conn->timeout_ms);
-        if (header_received < 0) {
-            LOGE("Socket receive failed during header receive");
+    // Read block count (or keepalive magic)
+    uint32_t block_count = 0;
+    if (read_uint32(conn, &block_count) != 0) {
+        LOGE("Failed to read block count");
+        return -1;
+    }
+
+    if (block_count == KEEP_ALIVE_MAGIC) {
+        // Keepalive: read size + data
+        uint32_t ka_size = 0;
+        if (read_uint32(conn, &ka_size) != 0) {
+            LOGE("Failed to read keepalive size");
             return -1;
         }
-    }
-    
-    LOGD("Received header bytes: %d", header_received);
-    
-    // Log raw header bytes
-    LOGD("Received header hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-         header_buffer[0], header_buffer[1], header_buffer[2], header_buffer[3], 
-         header_buffer[4], header_buffer[5], header_buffer[6], header_buffer[7],
-         header_buffer[8], header_buffer[9], header_buffer[10], header_buffer[11], 
-         header_buffer[12], header_buffer[13], header_buffer[14], header_buffer[15]);
-    
-    // Deserialize header
-    softether_header_t header;
-    if (deserialize_header(header_buffer, SOFTETHER_HEADER_SIZE, &header) < 0) {
-        LOGE("Failed to deserialize header");
-        return -1;
-    }
-    
-    LOGD("Parsed header: sig=0x%08X, ver=0x%04X, cmd=0x%04X, payload_len=%u, session_id=0x%08X, seq=%u",
-         header.signature, header.version, header.command, header.payload_length, 
-         header.session_id, header.sequence_num);
-    
-    // Validate signature
-    if (header.signature != SOFTETHER_SIGNATURE) {
-        // Check if we got an HTTP response instead of binary protocol
-        if (header_buffer[0] == 'H' && header_buffer[1] == 'T' && 
-            header_buffer[2] == 'T' && header_buffer[3] == 'P') {
-            // Read the rest of the HTTP response
-            uint8_t http_response[1024];
-            int http_len = 0;
-            if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
-                http_len = ssl_read((ssl_context_t*)conn->ssl, http_response, sizeof(http_response) - 1);
-            }
-            if (http_len > 0) {
-                http_response[http_len] = '\0';
-                LOGE("Received HTTP response (%d bytes): %.500s", http_len, (char*)http_response);
-            }
-            LOGE("Received HTTP response instead of binary protocol - server may require HTTP mode");
-        } else {
-            LOGE("Invalid packet signature: 0x%08X", header.signature);
-        }
-        return -1;
-    }
-    
-    // Validate version
-    if (header.version != SOFTETHER_VERSION) {
-        LOGE("Version mismatch: client=0x%04X, server=0x%04X", SOFTETHER_VERSION, header.version);
-        // Don't fail - continue anyway for debugging
-        // return -1;
-    }
-    
-    // Check payload size
-    if (header.payload_length > max_payload) {
-        LOGE("Payload too large: %u > %u", header.payload_length, max_payload);
-        return -1;
-    }
-    
-    *command = header.command;
-    
-    // Receive payload if present
-    if (header.payload_length > 0) {
-        if (payload == NULL || payload_len == NULL) {
-            LOGE("Payload expected but buffer is NULL");
-            return -1;
-        }
-        
-        int payload_received = 0;
-        
-        if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
-            // Receive payload through SSL
-            while (payload_received < (int)header.payload_length) {
-                // Check state again before each SSL operation
-                if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
-                    LOGE("Connection state changed during payload receive");
-                    return -1;
-                }
-                
-                int ret = ssl_read((ssl_context_t*)conn->ssl,
-                                  payload + payload_received,
-                                  header.payload_length - payload_received);
-                if (ret <= 0) {
-                    LOGE("SSL read failed during payload receive, ret=%d", ret);
-                    return -1;
-                }
-                payload_received += ret;
-                LOGD("Payload receive progress: %d/%d bytes", payload_received, header.payload_length);
-            }
-        } else {
-            // Receive payload through plain socket
-            softether_socket_t temp_sock;
-            temp_sock.fd = conn->socket_fd;
-            temp_sock.connected = 1;
-            temp_sock.timeout_ms = conn->timeout_ms;
-            payload_received = socket_recv_all(&temp_sock, payload, header.payload_length, conn->timeout_ms);
-            if (payload_received < 0) {
-                LOGE("Socket receive failed during payload receive");
+        if (ka_size > 512) ka_size = 512;  // safety cap
+        if (ka_size > 0) {
+            uint8_t ka_buf[512];
+            if (data_read_all(conn, ka_buf, (int)ka_size) != 0) {
+                LOGE("Failed to read keepalive data");
                 return -1;
             }
         }
-        
-        *payload_len = header.payload_length;
-    } else {
-        if (payload_len != NULL) {
-            *payload_len = 0;
+        *command = CMD_KEEPALIVE;
+        if (payload_len) *payload_len = 0;
+        LOGD("Received keepalive (%u bytes)", ka_size);
+        return (int)(8 + ka_size);
+    }
+
+    // Regular data blocks
+    if (block_count == 0) {
+        *command = CMD_DATA;
+        if (payload_len) *payload_len = 0;
+        return 4;
+    }
+
+    LOGD("Receiving %u data block(s)", block_count);
+
+    int total_read = 4;
+    int first_block_stored = 0;
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        uint32_t block_size = 0;
+        if (read_uint32(conn, &block_size) != 0) {
+            LOGE("Failed to read block %u size", i);
+            return -1;
         }
+        total_read += 4;
+
+        if (block_size > MAX_BLOCK_SIZE) {
+            LOGE("Block %u size too large: %u", i, block_size);
+            return -1;
+        }
+
+        if (!first_block_stored && payload != NULL && payload_len != NULL && block_size <= max_payload) {
+            // Store first block in caller's buffer
+            if (block_size > 0) {
+                if (data_read_all(conn, payload, (int)block_size) != 0) {
+                    LOGE("Failed to read block %u data", i);
+                    return -1;
+                }
+            }
+            *payload_len = block_size;
+            first_block_stored = 1;
+        } else {
+            // Skip subsequent blocks (or if buffer too small)
+            uint8_t skip_buf[2048];
+            uint32_t remaining = block_size;
+            while (remaining > 0) {
+                uint32_t chunk = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
+                if (data_read_all(conn, skip_buf, (int)chunk) != 0) {
+                    LOGE("Failed to skip block %u data", i);
+                    return -1;
+                }
+                remaining -= chunk;
+            }
+        }
+        total_read += (int)block_size;
     }
-    
-    // Update session ID if provided by server
-    if (header.session_id != 0 && header.session_id != conn->session_id) {
-        conn->session_id = header.session_id;
-        LOGD("Session ID updated to: 0x%08X", conn->session_id);
-    }
-    
-    LOGD("Received packet: cmd=%s(0x%04X), payload=%u bytes",
-         command_to_string(*command), *command, header.payload_length);
-    
-    return SOFTETHER_HEADER_SIZE + header.payload_length;
+
+    *command = CMD_DATA;
+    LOGD("Received %u block(s), first block %u bytes, total %d bytes",
+         block_count, payload_len ? *payload_len : 0, total_read);
+    return total_read;
 }
 
-// Send keepalive packet
+// Send keepalive using the real SoftEther format: [0xFFFFFFFF][size][random_data]
+// Thread-safe: locks write_mutex since this may be called from the receive thread
 int softether_send_keepalive(softether_connection_t* conn) {
-    if (conn == NULL) {
+    if (conn == NULL || conn->ssl == NULL) {
         return -1;
     }
-    
-    LOGD("Sending keepalive");
-    return softether_send_packet(conn, CMD_KEEPALIVE, NULL, 0);
+    if (conn->state != STATE_CONNECTED) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&conn->write_mutex);
+
+    // Build keepalive as a single buffer (matching reference ConnectionSend behavior)
+    // Format: [KEEP_ALIVE_MAGIC(4)][ka_size(4)][random_data(ka_size)]
+    uint32_t ka_size = (uint32_t)(rand() % 64);
+    uint32_t total_size = 4 + 4 + ka_size;
+    uint8_t ka_buf[136]; // 4+4+64 max
+
+    // KEEP_ALIVE_MAGIC in big-endian
+    uint32_t magic = KEEP_ALIVE_MAGIC;
+    ka_buf[0] = (magic >> 24) & 0xFF;
+    ka_buf[1] = (magic >> 16) & 0xFF;
+    ka_buf[2] = (magic >> 8) & 0xFF;
+    ka_buf[3] = magic & 0xFF;
+
+    // ka_size in big-endian
+    ka_buf[4] = (ka_size >> 24) & 0xFF;
+    ka_buf[5] = (ka_size >> 16) & 0xFF;
+    ka_buf[6] = (ka_size >> 8) & 0xFF;
+    ka_buf[7] = ka_size & 0xFF;
+
+    // Random payload
+    for (uint32_t i = 0; i < ka_size; i++) {
+        ka_buf[8 + i] = (uint8_t)(rand() & 0xFF);
+    }
+
+    // Send entire keepalive as one SSL_write (single TLS record)
+    int ret = data_write_all(conn, ka_buf, (int)total_size);
+    pthread_mutex_unlock(&conn->write_mutex);
+
+    if (ret != 0) {
+        LOGE("Failed to send keepalive");
+        return -1;
+    }
+    LOGD("Sent keepalive (%u bytes payload)", ka_size);
+    return (int)total_size;
 }
 
-// Process keepalive response
+// Process keepalive — receive and handle if the next message is a keepalive.
 int softether_process_keepalive(softether_connection_t* conn) {
-    if (conn == NULL) {
-        return -1;
-    }
-    
+    if (conn == NULL) return -1;
+
     uint16_t command;
     uint8_t buffer[256];
-    uint32_t payload_len;
-    
+    uint32_t payload_len = 0;
+
     int result = softether_receive_packet(conn, &command, buffer, &payload_len, sizeof(buffer));
-    if (result < 0) {
-        return -1;
+    if (result < 0) return -1;
+
+    if (command == CMD_KEEPALIVE) {
+        // Respond with our own keepalive
+        softether_send_keepalive(conn);
+        LOGD("Keepalive exchanged");
+        return 0;
     }
-    
-    if (command != CMD_KEEPALIVE_ACK) {
-        LOGE("Expected KEEPALIVE_ACK, got %s", command_to_string(command));
-        return -1;
-    }
-    
-    LOGD("Keepalive acknowledged");
+
+    LOGD("Expected keepalive, got command 0x%04X", command);
     return 0;
+}
+
+// ---- Receive queue helpers ----
+
+// Read one protocol message and queue ALL blocks into the receive queue.
+// Returns: 1 = data queued, 0 = keepalive/no data/timeout, -1 = error
+int softether_fill_recv_queue(softether_connection_t* conn) {
+    if (conn == NULL || conn->ssl == NULL) return -1;
+    if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) return -1;
+
+    // Check if SSL has buffered data first (may not show up in poll)
+    int ssl_pending = conn->use_ssl_data ? ssl_has_pending((ssl_context_t*)conn->ssl) : 0;
+
+    if (ssl_pending <= 0) {
+        // No SSL-buffered data — poll the underlying socket with short timeout
+        struct pollfd pfd;
+        pfd.fd = conn->socket_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int poll_ret = poll(&pfd, 1, 50);  // 50ms poll timeout
+        if (poll_ret == 0) {
+            return 0;  // No data available — normal timeout
+        }
+        if (poll_ret < 0) {
+            LOGE("fill_recv_queue: poll error: %d", poll_ret);
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            LOGE("fill_recv_queue: socket error (revents=0x%x)", pfd.revents);
+            return -1;
+        }
+    }
+
+    // Read block count (or keepalive magic)
+    uint32_t block_count = 0;
+    if (read_uint32(conn, &block_count) != 0) {
+        LOGE("fill_recv_queue: failed to read block count");
+        return -1;
+    }
+
+    if (block_count == KEEP_ALIVE_MAGIC) {
+        // Keepalive: read size + data, respond
+        uint32_t ka_size = 0;
+        if (read_uint32(conn, &ka_size) != 0) return -1;
+        if (ka_size > 512) ka_size = 512;
+        if (ka_size > 0) {
+            uint8_t ka_buf[512];
+            if (data_read_all(conn, ka_buf, (int)ka_size) != 0) return -1;
+        }
+        LOGD("fill_recv_queue: keepalive (%u bytes)", ka_size);
+        softether_send_keepalive(conn);
+        return 0;
+    }
+
+    if (block_count == 0) {
+        return 0; // Empty message
+    }
+
+    LOGD("fill_recv_queue: reading %u block(s)", block_count);
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        uint32_t block_size = 0;
+        if (read_uint32(conn, &block_size) != 0) {
+            LOGE("fill_recv_queue: failed to read block %u size", i);
+            return -1;
+        }
+
+        if (block_size > MAX_BLOCK_SIZE) {
+            LOGE("fill_recv_queue: block %u too large: %u", i, block_size);
+            return -1;
+        }
+
+        if (block_size == 0) continue;
+
+        if (block_size <= MAX_QUEUED_FRAME && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+            // Read directly into queue slot
+            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+            if (data_read_all(conn, entry->data, (int)block_size) != 0) {
+                LOGE("fill_recv_queue: failed to read block %u", i);
+                return -1;
+            }
+            entry->len = block_size;
+            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+            conn->recv_queue_count++;
+        } else {
+            // Queue full or frame too large — skip this block
+            uint8_t skip_buf[2048];
+            uint32_t remaining = block_size;
+            while (remaining > 0) {
+                uint32_t chunk = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
+                if (data_read_all(conn, skip_buf, (int)chunk) != 0) return -1;
+                remaining -= chunk;
+            }
+            LOGD("fill_recv_queue: skipped block %u (%u bytes, queue_count=%d)", i, block_size, conn->recv_queue_count);
+        }
+    }
+
+    LOGD("fill_recv_queue: queued %d frames total", conn->recv_queue_count);
+    return (conn->recv_queue_count > 0) ? 1 : 0;
 }

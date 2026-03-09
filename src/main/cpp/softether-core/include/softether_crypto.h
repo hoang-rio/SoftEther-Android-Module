@@ -58,6 +58,7 @@ void ssl_destroy(ssl_context_t* ctx);
 int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname);
 int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len);
 int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len);
+int ssl_has_pending(ssl_context_t* ctx);
 void ssl_shutdown(ssl_context_t* ctx);
 
 #ifdef __cplusplus

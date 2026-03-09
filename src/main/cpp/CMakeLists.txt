@@ -47,7 +47,7 @@ set(SOFTETHER_SOURCES
     softether-core/src/crypto/aes_wrapper.c
     softether-core/src/socket/tcp_socket.c
     softether-core/src/packet/packet_handler.c
-    softether-core/src/packet/serializer.c
+    softether-core/src/net/dhcp_client.c
 )
 
 # Create main shared library

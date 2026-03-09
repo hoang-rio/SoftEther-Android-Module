@@ -29,7 +29,7 @@ object TestConfig {
 
     // VPNGate default credentials
     const val DEFAULT_USERNAME = "vpn"
-    const val DEFAULT_PASSWORD = "vpn"
+    const val DEFAULT_PASSWORD = ""
 
     // Default SoftEther ports
     val SOFTETHER_PORTS = listOf(443, 992, 5555, 5556)
