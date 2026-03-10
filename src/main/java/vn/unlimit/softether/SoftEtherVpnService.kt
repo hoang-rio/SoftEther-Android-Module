@@ -311,6 +311,11 @@ class SoftEtherVpnService : VpnService() {
             .addAddress(config.localAddress, config.prefixLength)
             .addDnsServer(config.dnsServer)
 
+        // Add secondary DNS if it differs from primary and is valid
+        if (config.secondaryDnsServer.isNotEmpty() && config.secondaryDnsServer != config.dnsServer) {
+            builder.addDnsServer(config.secondaryDnsServer)
+        }
+
         // Add routes
         config.routes.forEach { route ->
             builder.addRoute(route.address, route.prefixLength)

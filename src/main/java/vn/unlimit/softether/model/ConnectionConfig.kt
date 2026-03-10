@@ -26,6 +26,7 @@ data class ConnectionConfig(
     val localAddress: String = "10.0.0.2",
     val prefixLength: Int = 24,
     val dnsServer: String = "8.8.8.8",
+    val secondaryDnsServer: String = "8.8.4.4",
     val mtu: Int = 1500,
     val routes: List<Route> = listOf(Route("0.0.0.0", 0)), // Default route all traffic
     val excludedApps: List<String> = emptyList(), // Apps excluded from VPN (bypass VPN tunnel)
@@ -50,6 +51,7 @@ data class ConnectionConfig(
         localAddress = parcel.readString() ?: "10.0.0.2",
         prefixLength = parcel.readInt(),
         dnsServer = parcel.readString() ?: "8.8.8.8",
+        secondaryDnsServer = parcel.readString() ?: "8.8.4.4",
         mtu = parcel.readInt(),
         routes = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("0.0.0.0", 0)),
         excludedApps = parcel.createStringArrayList() ?: emptyList(),
@@ -74,6 +76,7 @@ data class ConnectionConfig(
         parcel.writeString(localAddress)
         parcel.writeInt(prefixLength)
         parcel.writeString(dnsServer)
+        parcel.writeString(secondaryDnsServer)
         parcel.writeInt(mtu)
         parcel.writeTypedList(routes)
         parcel.writeStringList(excludedApps)

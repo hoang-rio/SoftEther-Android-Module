@@ -215,13 +215,14 @@ class ConnectionController(
         val dhcpResult = client.doDhcp(nativeHandle)
         if (dhcpResult != null) {
             Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
-                    "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer}")
+                    "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer} DNS2=${dhcpResult.dnsServer2}")
             assignedLocalIp = dhcpResult.assignedIp
             // Update config with DHCP-assigned values
             val dhcpConfig = config.copy(
                 localAddress = dhcpResult.assignedIp,
                 prefixLength = dhcpResult.prefixLength,
-                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer
+                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
+                secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
             )
             vpnInterface = service.establishVpnInterface(dhcpConfig)
                 ?: throw Exception("Failed to establish VPN interface")
