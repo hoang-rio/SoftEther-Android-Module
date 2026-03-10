@@ -13,6 +13,29 @@ SoftEther-Android-Module for [vpngate-connector](https://github.com/hoang-rio/vp
 
 **UDP (RUDP)** support is planned for a future release. The SoftEther RUDP transport requires a full reliable-UDP layer including NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures (~5000+ lines in the reference implementation).
 
+# Authentication Methods
+
+| Method | `AuthMethod` enum | Status | Notes |
+|--------|-------------------|--------|-------|
+| Anonymous | `AuthMethod.ANONYMOUS` | ✅ Supported | No credentials required; server hub must allow anonymous login |
+| Hashed Password | `AuthMethod.PASSWORD` | ✅ Supported | `CLIENT_AUTHTYPE_PASSWORD` — password hashed as `SHA1(SHA1(pw + UPPER(user)) + server_random)` |
+| Plain Password (RADIUS) | `AuthMethod.PLAIN_PASSWORD` | ✅ Supported | `CLIENT_AUTHTYPE_PLAIN_PASSWORD` — plaintext password forwarded by server to a RADIUS backend |
+| Auto-detect | `AuthMethod.AUTO` | ✅ Supported | Selects `PASSWORD` when password is non-empty, `ANONYMOUS` otherwise |
+| Certificate | — | 🚧 Not supported | `CLIENT_AUTHTYPE_CERT` — requires client certificate and private key handling |
+| Windows NT / AD | — | 🚧 Not supported | `CLIENT_AUTHTYPE_SECURE` — Windows-specific secure device auth |
+
+**Usage in `ConnectionConfig`:**
+```kotlin
+// Free VPNGate server (auto-detect)
+ConnectionConfig(username = "vpn", password = "vpn", authMethod = AuthMethod.AUTO, ...)
+
+// Paid server with RADIUS
+ConnectionConfig(username = "user", password = "secret", authMethod = AuthMethod.PLAIN_PASSWORD, ...)
+
+// Anonymous hub
+ConnectionConfig(username = "", password = "", authMethod = AuthMethod.ANONYMOUS, ...)
+```
+
 # Source Version
 
 This module implements the SoftEther VPN protocol based on the reference source:

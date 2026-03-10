@@ -49,7 +49,23 @@ class SoftEtherClient {
      */
     @Throws(ConnectionException::class)
     fun connect(host: String, port: Int, username: String, password: String, hubName: String) {
-        Log.d(tag, "Connecting to $host:$port as $username (hub: $hubName)")
+        connect(host, port, username, password, hubName, vn.unlimit.softether.model.AuthMethod.AUTO)
+    }
+
+    /**
+     * Connect to SoftEther VPN server with hub name and explicit auth method
+     *
+     * @param host Server hostname or IP address
+     * @param port Server port (typically 443, 992, or 5555)
+     * @param username Authentication username
+     * @param password Authentication password
+     * @param hubName Virtual hub name (default: "VPN" for VPNGate)
+     * @param authMethod Authentication method to use
+     * @throws ConnectionException if connection fails
+     */
+    @Throws(ConnectionException::class)
+    fun connect(host: String, port: Int, username: String, password: String, hubName: String, authMethod: vn.unlimit.softether.model.AuthMethod = vn.unlimit.softether.model.AuthMethod.AUTO) {
+        Log.d(tag, "Connecting to $host:$port as $username (hub: $hubName, auth: $authMethod)")
 
         // Create native connection
         nativeHandle = nativeCreate()
@@ -59,6 +75,17 @@ class SoftEtherClient {
 
         // Set default timeout
         nativeSetOption(nativeHandle, OPTION_TIMEOUT, 30000L)
+
+        // Set auth type if not AUTO
+        if (authMethod != vn.unlimit.softether.model.AuthMethod.AUTO) {
+            val authTypeInt = when (authMethod) {
+                vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
+                vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
+                vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
+                else -> 0
+            }
+            nativeSetAuthType(nativeHandle, authTypeInt)
+        }
 
         // Connect to server with hub name
         val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName)
@@ -71,6 +98,21 @@ class SoftEtherClient {
 
         isConnected.set(true)
         Log.d(tag, "Connected successfully")
+    }
+
+    /**
+     * Set authentication type explicitly before connecting.
+     * @param authMethod The authentication method to use
+     */
+    fun setAuthType(authMethod: vn.unlimit.softether.model.AuthMethod) {
+        if (nativeHandle == 0L) return
+        val authTypeInt = when (authMethod) {
+            vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
+            vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
+            vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
+            vn.unlimit.softether.model.AuthMethod.AUTO -> 0
+        }
+        nativeSetAuthType(nativeHandle, authTypeInt)
     }
 
     /**
@@ -182,6 +224,7 @@ class SoftEtherClient {
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
     external fun nativeGetSocketFd(handle: Long): Int
     external fun nativeDoDhcp(handle: Long): IntArray?
+    external fun nativeSetAuthType(handle: Long, authType: Int)
 
     /**
      * Perform DHCP over SoftEther tunnel to get IP configuration

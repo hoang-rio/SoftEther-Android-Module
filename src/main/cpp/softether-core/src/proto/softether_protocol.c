@@ -481,11 +481,13 @@ static int pack_get_data(const uint8_t* body, uint32_t body_len,
     }
     return -1;
 }
-// auth_type: 0 = anonymous, 1 = password
+// auth_type: 0 = anonymous, 1 = hashed password, 2 = plain password (RADIUS)
 // For password auth, secure_password must be 20 bytes:
 //   secure_password = SHA1( SHA1(password + UPPER(username)) + server_random )
+// For plain password auth, plain_password is the plaintext password string.
 static uint8_t* build_login_pack(const char* hub_name, const char* username,
                                   int auth_type, const uint8_t* secure_password,
+                                  const char* plain_password,
                                   uint32_t* out_len) {
     if (!hub_name || !username || !out_len) return NULL;
 
@@ -550,6 +552,10 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         num_elems++;
         size += PACK_DATA_SZ("secure_password", SHA1_SIZE);
     }
+    if (auth_type == 2 && plain_password) {
+        num_elems++;
+        size += PACK_STR_SZ("plain_password", plain_password);
+    }
 
     uint8_t* buf = (uint8_t*)calloc(1, size + 64);  // +64 safety margin
     if (!buf) { free(pencore_data); return NULL; }
@@ -585,6 +591,9 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
 
     if (auth_type == 1 && secure_password) {
         pack_add_data(&p, "secure_password", secure_password, SHA1_SIZE);
+    }
+    if (auth_type == 2 && plain_password) {
+        pack_add_str(&p, "plain_password", plain_password);
     }
 
     free(pencore_data);
@@ -931,13 +940,24 @@ static int perform_authentication_http(softether_connection_t* conn,
     strncpy(conn->username, username, sizeof(conn->username) - 1);
     strncpy(conn->password, password, sizeof(conn->password) - 1);
 
-    // Decide auth type: password if non-empty password, else anonymous
-    int auth_type = 0;  // 0 = anonymous (CLIENT_AUTHTYPE_ANONYMOUS)
+    // Decide auth type: use forced_auth_type if set, otherwise auto-detect
+    int auth_type;
     uint8_t secure_password[SHA1_SIZE];
     memset(secure_password, 0, sizeof(secure_password));
 
-    if (strlen(password) > 0) {
-        auth_type = 1;  // CLIENT_AUTHTYPE_PASSWORD
+    if (conn->forced_auth_type == CLIENT_AUTHTYPE_PLAIN_PASSWORD) {
+        // Plain password auth (used for RADIUS): send password in plaintext
+        auth_type = CLIENT_AUTHTYPE_PLAIN_PASSWORD;
+        LOGD("Using PLAIN_PASSWORD auth (RADIUS mode)");
+    } else if (conn->forced_auth_type == CLIENT_AUTHTYPE_ANONYMOUS) {
+        auth_type = CLIENT_AUTHTYPE_ANONYMOUS;
+        LOGD("Using ANONYMOUS auth (forced)");
+    } else {
+        // Auto-detect: password if non-empty, else anonymous
+        auth_type = (strlen(password) > 0) ? CLIENT_AUTHTYPE_PASSWORD : CLIENT_AUTHTYPE_ANONYMOUS;
+    }
+
+    if (auth_type == CLIENT_AUTHTYPE_PASSWORD) {
         // Compute HashedPassword = SHA1(password_bytes + UPPER(username_bytes))
         uint8_t hashed_pw[SHA1_SIZE];
         size_t pw_len = strlen(password);
@@ -949,7 +969,6 @@ static int perform_authentication_http(softether_connection_t* conn,
                 if (upper_user[ci] >= 'a' && upper_user[ci] <= 'z')
                     upper_user[ci] -= 32;
             }
-            // Concatenate: password_bytes + UPPER(username_bytes)
             size_t concat_len = pw_len + user_len;
             uint8_t* concat_buf = (uint8_t*)malloc(concat_len);
             if (concat_buf) {
@@ -958,8 +977,6 @@ static int perform_authentication_http(softether_connection_t* conn,
                 sha1_hash(concat_buf, concat_len, hashed_pw);
                 free(concat_buf);
                 LOGD("HashedPassword (SHA1(pw+UPPER_user)) computed");
-
-                // SecurePassword = SHA1(hashed_pw + server_random)
                 if (conn->has_server_random) {
                     uint8_t combined[SHA1_SIZE * 2];
                     memcpy(combined, hashed_pw, SHA1_SIZE);
@@ -967,7 +984,6 @@ static int perform_authentication_http(softether_connection_t* conn,
                     sha1_hash(combined, SHA1_SIZE * 2, secure_password);
                     LOGD("SecurePassword (SHA1(hashed_pw+server_random)) computed");
                 } else {
-                    // No server random available — use hashed_pw directly as fallback
                     memcpy(secure_password, hashed_pw, SHA1_SIZE);
                     LOGW("No server random available; using raw hashed password");
                 }
@@ -980,7 +996,8 @@ static int perform_authentication_http(softether_connection_t* conn,
     uint32_t pack_len = 0;
     uint8_t* pack_buf = build_login_pack(conn->hub_name, username,
                                           auth_type,
-                                          (auth_type == 1) ? secure_password : NULL,
+                                          (auth_type == CLIENT_AUTHTYPE_PASSWORD) ? secure_password : NULL,
+                                          (auth_type == CLIENT_AUTHTYPE_PLAIN_PASSWORD) ? password : NULL,
                                           &pack_len);
     if (pack_buf == NULL || pack_len == 0) {
         LOGE("Failed to build login PACK");
@@ -1660,6 +1677,7 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 }
 
 // Reconnection support - Enable/disable automatic reconnection
+// Reconnection support - Enable/disable automatic reconnection
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled) {
     if (conn == NULL) {
         return;
@@ -1667,6 +1685,13 @@ void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled) 
 
     // Store reconnection preference (implementation can be extended)
     LOGD("Reconnection %s", enabled ? "enabled" : "disabled");
+}
+
+void softether_set_auth_type(softether_connection_t* conn, int auth_type) {
+    if (conn) {
+        conn->forced_auth_type = auth_type;
+        LOGD("Auth type set to %d", auth_type);
+    }
 }
 
 // Reconnection support - Attempt to reconnect using stored credentials

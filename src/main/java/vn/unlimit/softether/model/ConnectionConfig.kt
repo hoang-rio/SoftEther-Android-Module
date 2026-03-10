@@ -4,6 +4,16 @@ import android.os.Parcel
 import android.os.Parcelable
 
 /**
+ * Authentication method for SoftEther VPN connection
+ */
+enum class AuthMethod {
+    AUTO,           // Auto-detect: password if non-empty, else anonymous
+    ANONYMOUS,      // Anonymous authentication (no password)
+    PASSWORD,       // Hashed password authentication (CLIENT_AUTHTYPE_PASSWORD)
+    PLAIN_PASSWORD  // Plain text password for RADIUS authentication (CLIENT_AUTHTYPE_PLAIN_PASSWORD)
+}
+
+/**
  * Configuration for SoftEther VPN connection
  */
 data class ConnectionConfig(
@@ -26,7 +36,8 @@ data class ConnectionConfig(
     val keepAliveIntervalMs: Int = 60000,
     val country: String = "",
     val isL2TPSupport: Boolean = false,
-    val isSSTPSupport: Boolean = false
+    val isSSTPSupport: Boolean = false,
+    val authMethod: AuthMethod = AuthMethod.AUTO
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -49,7 +60,8 @@ data class ConnectionConfig(
         keepAliveIntervalMs = parcel.readInt(),
         country = parcel.readString() ?: "",
         isL2TPSupport = parcel.readByte() != 0.toByte(),
-        isSSTPSupport = parcel.readByte() != 0.toByte()
+        isSSTPSupport = parcel.readByte() != 0.toByte(),
+        authMethod = AuthMethod.valueOf(parcel.readString() ?: AuthMethod.AUTO.name)
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -73,6 +85,7 @@ data class ConnectionConfig(
         parcel.writeString(country)
         parcel.writeByte(if (isL2TPSupport) 1 else 0)
         parcel.writeByte(if (isSSTPSupport) 1 else 0)
+        parcel.writeString(authMethod.name)
     }
 
     override fun describeContents(): Int = 0

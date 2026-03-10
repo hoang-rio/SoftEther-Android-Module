@@ -137,6 +137,15 @@ class ConnectionController(
         // Use virtualHub from config, default to "VPN" if not set
         val hubName = config.virtualHub.ifEmpty { "VPN" }
         Log.d(TAG, "Connecting with hub: $hubName")
+        if (config.authMethod != vn.unlimit.softether.model.AuthMethod.AUTO) {
+            val authTypeInt = when (config.authMethod) {
+                vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
+                vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
+                vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
+                else -> 0
+            }
+            client.nativeSetAuthType(nativeHandle, authTypeInt)
+        }
         startNativeStateMonitor()
         val result = try {
             client.nativeConnectWithHub(
@@ -493,6 +502,15 @@ class ConnectionController(
 
             // Use hub name for reconnection
             val hubName = config.virtualHub.ifEmpty { "VPN" }
+            if (config.authMethod != vn.unlimit.softether.model.AuthMethod.AUTO) {
+                val authTypeInt = when (config.authMethod) {
+                    vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
+                    vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
+                    vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
+                    else -> 0
+                }
+                client.nativeSetAuthType(nativeHandle, authTypeInt)
+            }
             val result = client.nativeConnectWithHub(
                 nativeHandle,
                 config.serverHost,

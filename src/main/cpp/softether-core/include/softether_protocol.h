@@ -9,6 +9,11 @@
 extern "C" {
 #endif
 
+// Client authentication types (matching SoftEther Cedar.h)
+#define CLIENT_AUTHTYPE_ANONYMOUS       0
+#define CLIENT_AUTHTYPE_PASSWORD        1
+#define CLIENT_AUTHTYPE_PLAIN_PASSWORD  2
+
 // Real SoftEther data channel constants
 #define KEEP_ALIVE_MAGIC        0xFFFFFFFF
 #define SOFTETHER_MAX_BLOCK     (1600 * 1600)
@@ -79,6 +84,7 @@ typedef struct softether_connection {
     uint32_t server_timeout;
     int use_ssl_data;  // 1 = SSL for data, 0 = raw TCP
     int session_established;    // 1 if Welcome PACK was parsed successfully
+    int forced_auth_type;  // 0=auto-detect, 1=hashed password, 2=plain password (RADIUS)
     // Client MAC address (for Ethernet L2 encapsulation)
     uint8_t client_mac[6];     // Locally-administered random MAC
     // Gateway MAC address (resolved via ARP after DHCP)
@@ -148,6 +154,9 @@ int softether_fill_recv_queue(softether_connection_t* conn);
 // Reconnection support
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);
 int softether_reconnect(softether_connection_t* conn);
+
+// Set authentication type explicitly (use CLIENT_AUTHTYPE_* constants; 0=auto)
+void softether_set_auth_type(softether_connection_t* conn, int auth_type);
 
 // DHCP result
 typedef struct {

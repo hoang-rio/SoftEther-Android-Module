@@ -78,8 +78,7 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeConnectWithHub(
     JNIEnv *env, jobject thiz, jlong handle, jstring host, jint port, 
     jstring username, jstring password, jstring hubName) {
-    LOGD("nativeConnectWithHub called");
-    
+    LOGD("nativeConnectWithHub called");    
     if (handle == 0) {
         LOGE("Invalid handle");
         return ERR_UNKNOWN;
@@ -108,6 +107,17 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
     (*env)->ReleaseStringUTFChars(env, hubName, hub_name_str);
     
     return result;
+}
+
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetAuthType(
+    JNIEnv *env, jobject thiz, jlong handle, jint authType) {
+    if (handle == 0) {
+        LOGE("Invalid handle");
+        return;
+    }
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    softether_set_auth_type(conn, (int)authType);
+    LOGD("Auth type set to %d via JNI", (int)authType);
 }
 
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDisconnect(
