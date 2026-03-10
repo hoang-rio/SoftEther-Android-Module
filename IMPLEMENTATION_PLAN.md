@@ -70,7 +70,7 @@ All core implementation phases are complete and stable:
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | 🚧 Planned |
+| UDP (SoftEther RUDP) | 🚧 Planned (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
 
 **TCP** is the only currently supported transport. UDP (RUDP) support is planned and requires implementing ~5000+ lines of reliable-UDP layer with NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures.
 
