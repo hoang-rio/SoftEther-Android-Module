@@ -63,6 +63,7 @@ class ConnectionController(
 
     private var nativeHandle: Long = 0
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var tunTerminal: TunTerminal? = null
 
     /** DHCP-assigned local IP address (available after successful connect) */
     var assignedLocalIp: String? = null
@@ -303,6 +304,14 @@ class ConnectionController(
             }
         }
 
+        // Stop TunTerminal first to avoid reading from closed interface
+        try {
+            tunTerminal?.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping TunTerminal", e)
+        }
+        tunTerminal = null
+        
         // Close VPN interface
         try {
             vpnInterface?.close()
@@ -350,12 +359,15 @@ class ConnectionController(
         val tunInterface = vpnInterface
             ?: throw IllegalStateException("VPN interface not established")
 
-        val tunTerminal = TunTerminal(tunInterface, scope)
+        // Store reference to tunTerminal so we can stop it cleanly
+        this.tunTerminal = TunTerminal(tunInterface, scope)
+        val terminal = this.tunTerminal!!
+        
         val packetHandler = PacketHandler(client)
         val keepAliveManager = KeepAliveManager(client)
 
         // Start TUN interface reading
-        tunTerminal.start(
+        terminal.start(
             onPacket = { packet ->
                 // Packet from TUN (local system) -> send to VPN
                 packetHandler.queuePacket(packet)
@@ -413,7 +425,7 @@ class ConnectionController(
                         result > 0 -> {
                             // Valid data received
                             val packet = receiveBuffer.copyOf(result)
-                            val writeResult = tunTerminal.write(packet)
+                            val writeResult = terminal.write(packet)
                             if (writeResult > 0) {
                                 bytesReceived.addAndGet(result.toLong())
                                 packetsReceived.incrementAndGet()
@@ -447,15 +459,6 @@ class ConnectionController(
 
         // Start keepalive
         startKeepalive(keepAliveManager)
-
-        // Cleanup on disconnect
-        scope.launch {
-            while (isConnected() && !isCancelled.get()) {
-                delay(100)
-            }
-            tunTerminal.stop()
-            packetHandler.clearQueues()
-        }
     }
 
     /**

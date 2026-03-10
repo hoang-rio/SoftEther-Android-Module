@@ -110,8 +110,14 @@ class TunTerminal(
                 }
             } catch (e: Exception) {
                 if (isRunning.get()) {
-                    Log.e(TAG, "Error reading from TUN", e)
-                    onError?.invoke(e)
+                    // Check for EBADF (Bad file descriptor) which happens when interface is closed externally
+                    val msg = e.message ?: ""
+                    if (e is java.io.IOException && (msg.contains("EBADF") || msg.contains("Bad file descriptor"))) {
+                        Log.d(TAG, "TUN interface closed (EBADF), stopping read loop")
+                    } else {
+                        Log.e(TAG, "Error reading from TUN", e)
+                        onError?.invoke(e)
+                    }
                 }
                 break
             }
