@@ -274,11 +274,19 @@ class SoftEtherVpnService : VpnService() {
         val contentIntent = Intent().apply {
             if (notificationTargetActivity != null) {
                 setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+                // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
+                // Similar to OpenVPNService.getContentIntent()
+                try {
+                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
+                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
+                    putExtra(startKey, startValue)
+                } catch (e: Exception) {
+                    // Silent this exception
+                }
             } else {
                 setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+                putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             }
-            // Add extra to indicate launch from notification
-            putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
@@ -373,11 +381,21 @@ class SoftEtherVpnService : VpnService() {
         val contentIntent = Intent().apply {
             if (notificationTargetActivity != null) {
                 setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+                // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
+                // to support different activities without hardcoding keys here
+                // Similar to OpenVPNService.getContentIntent()
+                try {
+                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
+                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
+                    putExtra(startKey, startValue)
+                } catch (e: Exception) {
+                    // Silent this exception
+                }
             } else {
                 setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+                // Fallback hardcoded for DetailActivity if not set
+                putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             }
-            // Add extra to indicate launch from notification
-            putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
