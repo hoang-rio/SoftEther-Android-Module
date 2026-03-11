@@ -19,7 +19,7 @@
     <!-- Server Information Format -->
     <string name="softether_notification_title">SoftEther VPN - %1$s</string>
     <string name="softether_notification_title_notconnect">SoftEther VPN</string>
-    <string name="channel_name_error">Lỗi SoftEther VPN</string>
-    <string name="channel_description_error">Thông báo lỗi SoftEther VPN</string>
-    <string name="notification_disconnected_error">SoftEther VPN bị ngắt kết nối do lỗi</string>
+    <string name="softether_channel_name_error">Lỗi SoftEther VPN</string>
+    <string name="softether_channel_description_error">Thông báo lỗi SoftEther VPN</string>
+    <string name="softether_notification_disconnected_error">SoftEther VPN bị ngắt kết nối do lỗi</string>
 </resources>

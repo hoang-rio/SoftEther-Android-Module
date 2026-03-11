@@ -55,6 +55,8 @@ class ConnectionController(
     private val packetsSent = AtomicLong(0)
     private val packetsReceived = AtomicLong(0)
 
+    private var isNetworkAvailable = true
+    
     private var currentState: ConnectionState = ConnectionState.DISCONNECTED
         set(value) {
             field = value
@@ -65,6 +67,38 @@ class ConnectionController(
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tunTerminal: TunTerminal? = null
 
+    /**
+     * Handle network connectivity changes
+     */
+    fun onNetworkChanged(isConnected: Boolean) {
+        Log.d(TAG, "Network state changed: connected=$isConnected")
+        isNetworkAvailable = isConnected
+        
+        if (isConnected) {
+            // If we were in a "waiting" state (which we are removing), we would resume here.
+            // But since we are failing immediately on network loss, there is nothing to resume.
+            // The user must manually reconnect.
+        } else {
+            // Network lost - Fail immediately in all states
+            if (currentState != ConnectionState.DISCONNECTED && currentState != ConnectionState.ERROR) {
+                Log.w(TAG, "Network lost, forcing disconnect")
+                onError("Network connection lost")
+                disconnect()
+            }
+        }
+    }
+
+    private fun interruptNativeConnection() {
+        val handle = nativeHandle
+        if (handle != 0L) {
+            try {
+                client.nativeDisconnect(handle)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error interrupting native connection", e)
+            }
+        }
+    }
+
     /** DHCP-assigned local IP address (available after successful connect) */
     var assignedLocalIp: String? = null
         private set
@@ -73,34 +107,63 @@ class ConnectionController(
      * Initiates VPN connection with automatic retry logic
      */
     suspend fun connect() {
+        // Check if connection is already active before acquiring lock to avoid waiting
+        if (currentState != ConnectionState.DISCONNECTED && currentState != ConnectionState.ERROR) {
+            Log.w(TAG, "Connection already in progress or established")
+            return
+        }
+
         connectionMutex.withLock {
             if (isCancelled.get()) {
                 Log.w(TAG, "Connection cancelled, not starting")
                 return
             }
             
-            if (currentState != ConnectionState.DISCONNECTED) {
+            // Check network availability
+            if (!isNetworkAvailable) {
+                Log.e(TAG, "Network unavailable, cannot connect")
+                onError("Network unavailable")
+                return
+            }
+            
+            if (currentState != ConnectionState.DISCONNECTED && currentState != ConnectionState.ERROR) {
                 Log.w(TAG, "Connection already in progress or established")
                 return
             }
 
-            try {
-                performConnect()
-            } catch (e: Exception) {
-                if (isCancelled.get()) {
-                    Log.d(TAG, "Connection cancelled, not retrying")
+            reconnectAttempts.set(0)
+            
+            // Iterative connection loop
+            while (reconnectAttempts.get() < MAX_RECONNECT_ATTEMPTS) {
+                try {
+                    performConnect()
+                    // If performConnect returns, it means success (currentState == CONNECTED)
                     return
-                }
-                
-                if (reconnectAttempts.incrementAndGet() < MAX_RECONNECT_ATTEMPTS) {
-                    Log.w(TAG, "Connection failed, attempting retry ${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS")
-                    delay(RECONNECT_DELAY_MS)
-                    connect()
-                } else {
-                    Log.e(TAG, "Connection failed after ${reconnectAttempts.get()} attempts", e)
-                    currentState = ConnectionState.DISCONNECTED
-                    onError(e.message ?: "Unknown error")
-                    throw e
+                } catch (e: Exception) {
+                    if (isCancelled.get()) {
+                        Log.d(TAG, "Connection cancelled, not retrying")
+                        return
+                    }
+                    
+                    // If network is lost during attempt, fail immediately
+                    if (!isNetworkAvailable) {
+                        Log.e(TAG, "Connection aborted due to network loss")
+                        currentState = ConnectionState.DISCONNECTED
+                        onError("Network connection lost")
+                        return
+                    }
+                    
+                    if (reconnectAttempts.incrementAndGet() < MAX_RECONNECT_ATTEMPTS) {
+                        Log.w(TAG, "Connection failed, attempting retry ${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS")
+                        delay(RECONNECT_DELAY_MS)
+                        // Loop continues to next attempt
+                    } else {
+                        Log.e(TAG, "Connection failed after ${reconnectAttempts.get()} attempts", e)
+                        currentState = ConnectionState.DISCONNECTED
+                        onError(e.message ?: "Unknown error")
+                        // Stop loop
+                        return
+                    }
                 }
             }
         }

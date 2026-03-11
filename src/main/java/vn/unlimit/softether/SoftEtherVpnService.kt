@@ -1,6 +1,5 @@
 package vn.unlimit.softether
 
-import android.media.AudioAttributes
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
@@ -17,11 +18,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.media.RingtoneManager
-import android.media.Ringtone
-import android.net.Uri
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -111,11 +107,13 @@ class SoftEtherVpnService : VpnService() {
 
     private val networkReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ConnectivityManager.CONNECTIVITY_ACTION -> {
-                    // Handle network changes
-                    Log.d(TAG, "Network connectivity changed")
-                }
+            if (intent?.action == ConnectivityManager.CONNECTIVITY_ACTION) {
+                val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val activeNetwork = cm?.activeNetworkInfo
+                val isConnected = activeNetwork?.isConnectedOrConnecting == true
+
+                Log.d(TAG, "Network connectivity changed: isConnected=$isConnected")
+                controller?.onNetworkChanged(isConnected)
             }
         }
     }
@@ -128,16 +126,22 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun triggerDisconnectNotification() {
-        val channelId = NOTIFICATION_CHANNEL_ERROR_ID
+        // Cancel the persistent status notification first
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
+
+        val channelId = NOTIFICATION_CHANNEL_ERROR_ID
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Delete old channel to ensure new settings (sound/vibration) take effect
+            // notificationManager.deleteNotificationChannel(channelId) // Use with caution, might be annoying if called often
+
             val channel = NotificationChannel(
                 channelId,
-                getString(R.string.channel_name_error),
+                getString(R.string.softether_channel_name_error),
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = getString(R.string.channel_description_error)
+                description = getString(R.string.softether_channel_description_error)
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 250, 250, 250)
                 
@@ -147,17 +151,49 @@ class SoftEtherVpnService : VpnService() {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .setUsage(AudioAttributes.USAGE_NOTIFICATION)
                     .build())
+                
+                // Force show lights as well for visibility
+                enableLights(true)
+                lightColor = android.graphics.Color.RED
             }
+            // Create (or update) the channel
             notificationManager.createNotificationChannel(channel)
         }
+
+        // Intent to open DetailActivity when notification is tapped
+        val contentIntent = Intent().apply {
+            if (notificationTargetActivity != null) {
+                setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+                // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
+                // to support different activities without hardcoding keys here
+                try {
+                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
+                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
+                    putExtra(startKey, startValue)
+                } catch (e: Exception) {
+                    // Silent this exception
+                }
+            } else {
+                setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+                // Fallback hardcoded for DetailActivity if not set
+                putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
+            }
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            this, 0, contentIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val builder = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.softether_notification_title_notconnect))
-            .setContentText(getString(R.string.notification_disconnected_error))
+            .setContentText(getString(R.string.softether_notification_disconnected_error))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setDefaults(Notification.DEFAULT_ALL)
+            .setVibrate(longArrayOf(0, 250, 250, 250)) // Explicitly set on builder too for pre-O
             .setAutoCancel(true)
+            .setContentIntent(contentPendingIntent)
 
         notificationManager.notify(NOTIFICATION_CHANNEL_ERROR_ID.hashCode(), builder.build())
     }
@@ -253,7 +289,7 @@ class SoftEtherVpnService : VpnService() {
                     },
                     onError = { error ->
                         Log.e(TAG, "VPN Error: $error")
-                        updateNotification(getString(R.string.softether_disconnected_by_error))
+                        // updateNotification(getString(R.string.softether_disconnected_by_error))
                         mIsUserDisconnect = false
                         stopVpn()
                     }
@@ -265,13 +301,13 @@ class SoftEtherVpnService : VpnService() {
                 Log.d(TAG, "VPN connection established")
 
             } catch (e: kotlinx.coroutines.CancellationException) {
-                // Connection was cancelled (user pressed cancel)
+                // Connection was canceled (user pressed cancel)
                 Log.d(TAG, "Connection cancelled by user")
                 mIsUserDisconnect = true
                 sendConnectionStateBroadcast(STATE_DISCONNECTED)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start VPN", e)
-                updateNotification("Connection failed: ${e.message}")
+                // updateNotification("Connection failed: ${e.message}")
                 mIsUserDisconnect = false
                 stopVpn()
             }
@@ -361,7 +397,7 @@ class SoftEtherVpnService : VpnService() {
      * Uses in-process listener pattern (no broadcasts) — works on all Android versions.
      */
     private fun sendConnectionStateBroadcast(state: String, hostname: String = "") {
-        val ip = if (hostname.isNotEmpty()) hostname else currentAssignedIp
+        val ip = hostname.ifEmpty { currentAssignedIp }
         notifyListeners(state, if (state == STATE_DISCONNECTED || state == STATE_ERROR) "" else ip)
         Log.d(TAG, if (ip.isNotEmpty()) "State changed: $state ip=$ip" else "State changed: $state")
     }
@@ -486,6 +522,17 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
+        // If we are in ERROR state or DISCONNECTED (and not user disconnect), 
+        // we suppress the standard status notification because we will show the error notification instead.
+        if ((state == ConnectionState.ERROR || state == ConnectionState.DISCONNECTED) && !mIsUserDisconnect) {
+            // Only handle the error trigger, do NOT update the status notification
+            if (mWasConnected) {
+                triggerDisconnectNotification()
+                mWasConnected = false
+            }
+            return
+        }
+
         val message = when (state) {
             ConnectionState.CONNECTING -> getString(R.string.softether_connecting)
             ConnectionState.TLS_HANDSHAKE -> getString(R.string.softether_tls_handshake)
@@ -504,10 +551,13 @@ class SoftEtherVpnService : VpnService() {
         if (state == ConnectionState.CONNECTED) {
             mWasConnected = true
             mIsUserDisconnect = false
-        } else if ((state == ConnectionState.DISCONNECTED || state == ConnectionState.ERROR) && mWasConnected && !mIsUserDisconnect) {
-            triggerDisconnectNotification()
-            mWasConnected = false
         }
+        
+        // Removed redundant triggerDisconnectNotification logic here because it's handled at the start of the function
+        // else if ((state == ConnectionState.DISCONNECTED || state == ConnectionState.ERROR) && mWasConnected && !mIsUserDisconnect) {
+        //    triggerDisconnectNotification()
+        //    mWasConnected = false
+        // }
 
         // Terminal states (CONNECTED, DISCONNECTED, ERROR) always pass through immediately
         val isTerminalState = state == ConnectionState.CONNECTED ||
@@ -572,10 +622,8 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun registerNetworkReceiver() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
-            registerReceiver(networkReceiver, filter)
-        }
+        val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
+        registerReceiver(networkReceiver, filter)
     }
 
     private fun unregisterNetworkReceiver() {
