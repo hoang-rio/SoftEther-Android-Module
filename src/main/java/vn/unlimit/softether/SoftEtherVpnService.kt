@@ -187,7 +187,7 @@ class SoftEtherVpnService : VpnService() {
 
         val builder = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.softether_notification_title_notconnect))
+            .setContentTitle(getString(R.string.softether_channel_name_error))
             .setContentText(getString(R.string.softether_notification_disconnected_error))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setDefaults(Notification.DEFAULT_ALL)
