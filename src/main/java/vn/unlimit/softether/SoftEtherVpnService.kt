@@ -81,6 +81,8 @@ class SoftEtherVpnService : VpnService() {
             stateListeners.remove(listener)
         }
 
+        var notificationTargetActivity: Class<*>? = null
+
         private fun notifyListeners(state: String, assignedIp: String) {
             currentState = state
             currentAssignedIp = assignedIp
@@ -270,7 +272,13 @@ class SoftEtherVpnService : VpnService() {
     private fun showDisconnectedNotification() {
         // Intent to open DetailActivity when notification is tapped
         val contentIntent = Intent().apply {
-            setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            if (notificationTargetActivity != null) {
+                setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+            } else {
+                setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            }
+            // Add extra to indicate launch from notification
+            putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
@@ -363,7 +371,13 @@ class SoftEtherVpnService : VpnService() {
     private fun createNotification(content: String): Notification {
         // Intent to open DetailActivity when notification is tapped
         val contentIntent = Intent().apply {
-            setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            if (notificationTargetActivity != null) {
+                setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+            } else {
+                setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
+            }
+            // Add extra to indicate launch from notification
+            putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
