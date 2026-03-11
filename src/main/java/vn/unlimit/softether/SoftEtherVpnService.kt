@@ -1,5 +1,6 @@
 package vn.unlimit.softether
 
+import android.media.AudioAttributes
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,6 +17,11 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.media.RingtoneManager
+import android.media.Ringtone
+import android.net.Uri
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -40,6 +46,7 @@ class SoftEtherVpnService : VpnService() {
     companion object {
         private const val TAG = "SoftEtherVpnService"
         private const val NOTIFICATION_CHANNEL_ID = "SoftEtherVPN"
+        private const val NOTIFICATION_CHANNEL_ERROR_ID = "SoftEtherVPN_Error"
         private const val NOTIFICATION_ID = 1001
 
         // Actions (kept for service start/stop intents)
@@ -96,6 +103,8 @@ class SoftEtherVpnService : VpnService() {
     private var controller: ConnectionController? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isRunning = false
+    private var mWasConnected = false
+    private var mIsUserDisconnect = false
     private var lastStateUpdateTime = 0L
     private var pendingStateUpdate: (() -> Unit)? = null
     private var currentSessionName: String? = null
@@ -118,11 +127,47 @@ class SoftEtherVpnService : VpnService() {
         registerNetworkReceiver()
     }
 
+    private fun triggerDisconnectNotification() {
+        val channelId = NOTIFICATION_CHANNEL_ERROR_ID
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                getString(R.string.channel_name_error),
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = getString(R.string.channel_description_error)
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 250, 250, 250)
+                
+                // Set sound
+                val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                setSound(soundUri, AudioAttributes.Builder()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .build())
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val builder = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.softether_notification_title_notconnect))
+            .setContentText(getString(R.string.notification_disconnected_error))
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setDefaults(Notification.DEFAULT_ALL)
+            .setAutoCancel(true)
+
+        notificationManager.notify(NOTIFICATION_CHANNEL_ERROR_ID.hashCode(), builder.build())
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand: action=${intent?.action}")
 
         when (intent?.action) {
             ACTION_CONNECT -> {
+                mIsUserDisconnect = false
                 val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableExtra(EXTRA_CONFIG, ConnectionConfig::class.java)
                 } else {
@@ -138,6 +183,7 @@ class SoftEtherVpnService : VpnService() {
                 }
             }
             ACTION_DISCONNECT -> {
+                mIsUserDisconnect = true
                 stopVpn()
             }
             else -> {
@@ -208,6 +254,7 @@ class SoftEtherVpnService : VpnService() {
                     onError = { error ->
                         Log.e(TAG, "VPN Error: $error")
                         updateNotification(getString(R.string.softether_disconnected_by_error))
+                        mIsUserDisconnect = false
                         stopVpn()
                     }
                 )
@@ -220,10 +267,12 @@ class SoftEtherVpnService : VpnService() {
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Connection was cancelled (user pressed cancel)
                 Log.d(TAG, "Connection cancelled by user")
+                mIsUserDisconnect = true
                 sendConnectionStateBroadcast(STATE_DISCONNECTED)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start VPN", e)
                 updateNotification("Connection failed: ${e.message}")
+                mIsUserDisconnect = false
                 stopVpn()
             }
         }
@@ -451,7 +500,15 @@ class SoftEtherVpnService : VpnService() {
             ConnectionState.DISCONNECTED -> getString(R.string.softether_disconnected)
             ConnectionState.ERROR -> getString(R.string.softether_disconnected_by_error)
         }
-        
+
+        if (state == ConnectionState.CONNECTED) {
+            mWasConnected = true
+            mIsUserDisconnect = false
+        } else if ((state == ConnectionState.DISCONNECTED || state == ConnectionState.ERROR) && mWasConnected && !mIsUserDisconnect) {
+            triggerDisconnectNotification()
+            mWasConnected = false
+        }
+
         // Terminal states (CONNECTED, DISCONNECTED, ERROR) always pass through immediately
         val isTerminalState = state == ConnectionState.CONNECTED ||
                 state == ConnectionState.DISCONNECTED ||
