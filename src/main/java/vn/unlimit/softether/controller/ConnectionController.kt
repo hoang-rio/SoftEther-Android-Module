@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import vn.unlimit.softether.SoftEtherVpnService
+import vn.unlimit.softether.SoftEtherTrafficSnapshot
 import vn.unlimit.softether.client.SoftEtherClient
 import vn.unlimit.softether.client.protocol.KeepAliveManager
 import vn.unlimit.softether.client.protocol.PacketHandler
@@ -31,14 +32,15 @@ class ConnectionController(
     private val service: SoftEtherVpnService,
     private val config: ConnectionConfig,
     private val onStateChange: (ConnectionState) -> Unit,
-    private val onError: (String) -> Unit
+    private val onError: (String) -> Unit,
+    private val onTrafficUpdate: (SoftEtherTrafficSnapshot) -> Unit
 ) {
     companion object {
         private const val TAG = "ConnectionController"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 3000L
         private const val DATA_LOOP_DELAY_MS = 1L
-        private const val STATS_INTERVAL_MS = 10000L
+        private const val STATS_INTERVAL_MS = 1000L
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -54,6 +56,9 @@ class ConnectionController(
     private val bytesReceived = AtomicLong(0)
     private val packetsSent = AtomicLong(0)
     private val packetsReceived = AtomicLong(0)
+    private var lastPublishedSentBytes = 0L
+    private var lastPublishedReceivedBytes = 0L
+    private var lastPublishedAtMs = 0L
 
     private var isNetworkAvailable = true
     
@@ -299,6 +304,7 @@ class ConnectionController(
 
         // Now that we have an IP and VPN interface, transition to CONNECTED
         currentState = ConnectionState.CONNECTED
+        resetTrafficPublishing(publishSnapshot = true)
 
         // Start data forwarding loops
         startDataForwarding()
@@ -455,6 +461,7 @@ class ConnectionController(
                         if (result > 0) {
                             bytesSent.addAndGet(result.toLong())
                             packetsSent.incrementAndGet()
+                            maybePublishTrafficSnapshot()
                         } else if (result < 0) {
                             Log.w(TAG, "Send failed: $result")
                             if (isConnected()) {
@@ -492,6 +499,7 @@ class ConnectionController(
                             if (writeResult > 0) {
                                 bytesReceived.addAndGet(result.toLong())
                                 packetsReceived.incrementAndGet()
+                                maybePublishTrafficSnapshot()
                             }
                         }
                         result == 0 -> {
@@ -601,6 +609,7 @@ class ConnectionController(
             if (currentState != ConnectionState.CONNECTED) {
                 currentState = ConnectionState.CONNECTED
             }
+            resetTrafficPublishing(publishSnapshot = true)
             reconnectAttempts.set(0) // Reset on successful reconnection
             Log.d(TAG, "Reconnection successful")
 
@@ -646,10 +655,14 @@ class ConnectionController(
      */
     private fun startStatisticsLogging() {
         scope.launch {
-            while (isConnected() && !isCancelled.get()) {
+            while (!isCancelled.get() &&
+                currentState != ConnectionState.DISCONNECTED &&
+                currentState != ConnectionState.ERROR
+            ) {
                 try {
                     delay(STATS_INTERVAL_MS)
                     if (isConnected()) {
+                        publishTrafficSnapshot()
                         Log.d(TAG, "Stats: sent=${bytesSent.get()} bytes (${packetsSent.get()} pkts), " +
                                 "received=${bytesReceived.get()} bytes (${packetsReceived.get()} pkts)")
                     }
@@ -657,6 +670,54 @@ class ConnectionController(
                     break
                 }
             }
+        }
+    }
+
+    private fun resetTrafficPublishing(publishSnapshot: Boolean) {
+        lastPublishedSentBytes = bytesSent.get()
+        lastPublishedReceivedBytes = bytesReceived.get()
+        lastPublishedAtMs = System.currentTimeMillis()
+        if (publishSnapshot) {
+            onTrafficUpdate(
+                SoftEtherTrafficSnapshot(
+                    inBytes = lastPublishedReceivedBytes,
+                    outBytes = lastPublishedSentBytes,
+                    diffInBytes = 0L,
+                    diffOutBytes = 0L,
+                    packetsIn = packetsReceived.get(),
+                    packetsOut = packetsSent.get(),
+                    intervalMs = STATS_INTERVAL_MS,
+                    timestampMs = lastPublishedAtMs
+                )
+            )
+        }
+    }
+
+    private fun publishTrafficSnapshot() {
+        val now = System.currentTimeMillis()
+        val currentSentBytes = bytesSent.get()
+        val currentReceivedBytes = bytesReceived.get()
+        val interval = (now - lastPublishedAtMs).coerceAtLeast(1L)
+        val snapshot = SoftEtherTrafficSnapshot(
+            inBytes = currentReceivedBytes,
+            outBytes = currentSentBytes,
+            diffInBytes = (currentReceivedBytes - lastPublishedReceivedBytes).coerceAtLeast(0L),
+            diffOutBytes = (currentSentBytes - lastPublishedSentBytes).coerceAtLeast(0L),
+            packetsIn = packetsReceived.get(),
+            packetsOut = packetsSent.get(),
+            intervalMs = interval,
+            timestampMs = now
+        )
+        lastPublishedSentBytes = currentSentBytes
+        lastPublishedReceivedBytes = currentReceivedBytes
+        lastPublishedAtMs = now
+        onTrafficUpdate(snapshot)
+    }
+
+    private fun maybePublishTrafficSnapshot() {
+        val now = System.currentTimeMillis()
+        if (now - lastPublishedAtMs >= STATS_INTERVAL_MS) {
+            publishTrafficSnapshot()
         }
     }
 

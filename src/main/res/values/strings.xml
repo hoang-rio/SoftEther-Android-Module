@@ -22,4 +22,5 @@
     <string name="softether_channel_name_error">SoftEther VPN Error</string>
     <string name="softether_channel_description_error">Notifications for SoftEther VPN errors</string>
     <string name="softether_notification_disconnected_error">SoftEther VPN disconnected due to error</string>
+    <string name="softether_statusline_bytecount">↓%1$s %2$s - ↑%3$s %4$s</string>
 </resources>

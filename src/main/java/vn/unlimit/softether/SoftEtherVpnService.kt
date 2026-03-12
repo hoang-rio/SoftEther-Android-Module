@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
@@ -33,10 +34,13 @@ import vn.unlimit.softether.model.ConnectionState
  * SoftEther VPN Service - Main VPN service implementation for Android
  */
 class SoftEtherVpnService : VpnService() {
-
     /** Listener interface — same pattern as OpenVPN's VpnStatus.StateListener */
     interface StateListener {
         fun onSoftEtherStateChanged(state: String, assignedIp: String)
+    }
+
+    interface TrafficListener {
+        fun onSoftEtherTrafficUpdated(snapshot: SoftEtherTrafficSnapshot)
     }
 
     companion object {
@@ -44,6 +48,9 @@ class SoftEtherVpnService : VpnService() {
         private const val NOTIFICATION_CHANNEL_ID = "SoftEtherVPN"
         private const val NOTIFICATION_CHANNEL_ERROR_ID = "SoftEtherVPN_Error"
         private const val NOTIFICATION_ID = 1001
+        private const val TRAFFIC_PREFS_SUFFIX = "_preferences"
+        private const val DOWNLOADED_DATA_KEY = "downloaded_data"
+        private const val UPLOADED_DATA_KEY = "uploaded_data"
 
         // Actions (kept for service start/stop intents)
         const val ACTION_CONNECT = "vn.unlimit.softether.CONNECT"
@@ -68,8 +75,14 @@ class SoftEtherVpnService : VpnService() {
             private set
         var currentAssignedIp: String = ""
             private set
+        var currentTrafficSnapshot: SoftEtherTrafficSnapshot = SoftEtherTrafficSnapshot.EMPTY
+            private set
+        var lastTrafficSnapshot: SoftEtherTrafficSnapshot = SoftEtherTrafficSnapshot.EMPTY
+            private set
+        var mDisplaySpeed: Boolean = true
 
         private val stateListeners = mutableListOf<StateListener>()
+        private val trafficListeners = mutableListOf<TrafficListener>()
         private val mainHandler = Handler(Looper.getMainLooper())
 
         fun addStateListener(listener: StateListener) {
@@ -84,6 +97,17 @@ class SoftEtherVpnService : VpnService() {
             stateListeners.remove(listener)
         }
 
+        fun addTrafficListener(listener: TrafficListener) {
+            if (!trafficListeners.contains(listener)) {
+                trafficListeners.add(listener)
+                listener.onSoftEtherTrafficUpdated(currentTrafficSnapshot)
+            }
+        }
+
+        fun removeTrafficListener(listener: TrafficListener) {
+            trafficListeners.remove(listener)
+        }
+
         var notificationTargetActivity: Class<*>? = null
 
         private fun notifyListeners(state: String, assignedIp: String) {
@@ -91,6 +115,16 @@ class SoftEtherVpnService : VpnService() {
             currentAssignedIp = assignedIp
             mainHandler.post {
                 stateListeners.forEach { it.onSoftEtherStateChanged(state, assignedIp) }
+            }
+        }
+
+        private fun notifyTrafficListeners(snapshot: SoftEtherTrafficSnapshot) {
+            currentTrafficSnapshot = snapshot
+            if (snapshot.inBytes > 0L || snapshot.outBytes > 0L || snapshot.diffInBytes > 0L || snapshot.diffOutBytes > 0L) {
+                lastTrafficSnapshot = snapshot
+            }
+            mainHandler.post {
+                trafficListeners.forEach { it.onSoftEtherTrafficUpdated(snapshot) }
             }
         }
     }
@@ -258,6 +292,7 @@ class SoftEtherVpnService : VpnService() {
         }
         
         unregisterNetworkReceiver()
+        notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
         serviceScope.cancel()
     }
 
@@ -271,6 +306,8 @@ class SoftEtherVpnService : VpnService() {
         }
 
         Log.d(TAG, "Starting VPN with config: ${config.serverHost}:${config.serverPort}")
+        lastTrafficSnapshot = SoftEtherTrafficSnapshot.EMPTY
+        notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
 
         // Store session name for use in notifications
         currentSessionName = config.sessionName
@@ -292,6 +329,9 @@ class SoftEtherVpnService : VpnService() {
                         // updateNotification(getString(R.string.softether_disconnected_by_error))
                         mIsUserDisconnect = false
                         stopVpn()
+                    },
+                    onTrafficUpdate = { snapshot ->
+                        handleTrafficUpdate(snapshot)
                     }
                 )
 
@@ -320,6 +360,7 @@ class SoftEtherVpnService : VpnService() {
 
         // Send disconnect broadcast
         sendConnectionStateBroadcast(STATE_DISCONNECTED)
+        notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
 
         // Disconnect controller - this will interrupt any ongoing connection attempt
         try {
@@ -519,6 +560,56 @@ class SoftEtherVpnService : VpnService() {
         val notification = createNotification(content)
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun handleTrafficUpdate(snapshot: SoftEtherTrafficSnapshot) {
+        accumulatePersistedTraffic(snapshot.diffInBytes, snapshot.diffOutBytes)
+        notifyTrafficListeners(snapshot)
+        if (currentState == STATE_CONNECTED && mDisplaySpeed) {
+            updateNotification(formatTrafficSnapshot(snapshot))
+        }
+    }
+
+    private fun accumulatePersistedTraffic(downloadedDelta: Long, uploadedDelta: Long) {
+        if (downloadedDelta <= 0L && uploadedDelta <= 0L) return
+        val prefs = getTrafficPrefs()
+        prefs.edit()
+            .putLong(DOWNLOADED_DATA_KEY, prefs.getLong(DOWNLOADED_DATA_KEY, 0L) + downloadedDelta)
+            .putLong(UPLOADED_DATA_KEY, prefs.getLong(UPLOADED_DATA_KEY, 0L) + uploadedDelta)
+            .apply()
+    }
+
+    private fun getTrafficPrefs(): SharedPreferences {
+        return applicationContext.getSharedPreferences(
+            applicationContext.packageName + TRAFFIC_PREFS_SUFFIX,
+            Context.MODE_PRIVATE
+        )
+    }
+
+    private fun formatTrafficSnapshot(snapshot: SoftEtherTrafficSnapshot): String {
+        return getString(
+            R.string.softether_statusline_bytecount,
+            humanReadableByteCount(snapshot.inBytesPerSecond(), true),
+            humanReadableByteCount(snapshot.inBytes, false),
+            humanReadableByteCount(snapshot.outBytesPerSecond(), true),
+            humanReadableByteCount(snapshot.outBytes, false)
+        )
+    }
+
+    private fun humanReadableByteCount(bytes: Long, speed: Boolean): String {
+        val value = if (speed) bytes * 8.0 else bytes.toDouble()
+        val unit = if (speed) 1000.0 else 1024.0
+        val units = if (speed) {
+            arrayOf("bit/s", "kbit/s", "Mbit/s", "Gbit/s")
+        } else {
+            arrayOf("B", "KB", "MB", "GB")
+        }
+        if (value <= 0.0) {
+            return if (speed) "0 bit/s" else "0 B"
+        }
+        val exp = kotlin.math.min((kotlin.math.ln(value) / kotlin.math.ln(unit)).toInt(), units.lastIndex)
+        val scaled = value / Math.pow(unit, exp.toDouble())
+        return String.format(java.util.Locale.getDefault(), "%.1f %s", scaled, units[exp])
     }
 
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
