@@ -1821,21 +1821,16 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 
         rudp_poll(conn->rudp);
 
-        // Check if data is available on RUDP
-        {
-            uint32_t rudp_len = 0;
-            int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
-            if (r > 0) {
-                have_rudp_data = 1;
-            }
+        uint32_t rudp_len = 0;
+        int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
+        if (r > 0) {
+            have_rudp_data = 1;
         }
 
         if (!have_rudp_data) {
-            // Use poll() to check both UDP and TCP sockets
             struct pollfd fds[2];
             nfds_t nfds = 0;
 
-            // UDP socket
             int udp_fd = rudp_get_udp_fd(conn->rudp);
             if (udp_fd >= 0) {
                 fds[nfds].fd = udp_fd;
@@ -1844,58 +1839,32 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
                 nfds++;
             }
 
-            // TCP socket
             fds[nfds].fd = conn->socket_fd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
             nfds++;
 
-            int poll_ret = poll(fds, nfds, 200);  // 200ms timeout
+            int poll_ret = poll(fds, nfds, 200);
             if (poll_ret > 0) {
-                // Check UDP first
                 for (nfds_t i = 0; i < nfds; i++) {
                     if (udp_fd >= 0 && fds[i].fd == udp_fd &&
                         (fds[i].revents & POLLIN)) {
                         rudp_poll(conn->rudp);
-                        uint32_t rudp_len = 0;
-                        int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
+                        rudp_len = 0;
+                        r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
                         if (r > 0) {
                             have_rudp_data = 1;
                         }
                         break;
                     }
                 }
-
-                // Check TCP (only if no RUDP data)
-                if (!have_rudp_data) {
-                    for (nfds_t i = 0; i < nfds; i++) {
-                        if (fds[i].fd == conn->socket_fd &&
-                            (fds[i].revents & POLLIN)) {
-                            // Will fall through to TCP read below
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!have_rudp_data) {
-                // No data on either socket
-                *received_len = 0;
-                *command = 0;
-                return 0;
             }
         }
 
         if (have_rudp_data) {
-            // Dequeue from RUDP
-            uint32_t rudp_len = 0;
-            int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
-            if (r > 0) {
-                *received_len = rudp_len;
-                *command = CMD_DATA;
-                LOGD("Received data block via RUDP: %u bytes", rudp_len);
-                return 0;
-            }
+            *received_len = rudp_len;
+            *command = CMD_DATA;
+            return 0;
         }
     }
 
