@@ -520,8 +520,8 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     //       support_bulk_on_rudp, support_hmac_on_bulk_of_rudp,
     //       support_udp_recovery, unique_id, rudp_bulk_max_version,
     //       pencore
-    uint32_t num_elems = 30;
-    uint32_t size = 4;        // num_elements field
+    uint32_t num_elems = 20;
+    uint32_t size = 4;
 
     size += PACK_STR_SZ("method", "login");
     size += PACK_STR_SZ("hubname", hub_name);
@@ -542,14 +542,17 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_INT_SZ("require_bridge_routing_mode");
     size += PACK_INT_SZ("require_monitor_mode");
     size += PACK_INT_SZ("qos");
-    size += PACK_INT_SZ("support_bulk_on_rudp");
-    size += PACK_INT_SZ("support_hmac_on_bulk_of_rudp");
-    size += PACK_INT_SZ("support_udp_recovery");
-    size += PACK_DATA_SZ("unique_id", SHA1_SIZE);
-    size += PACK_INT_SZ("rudp_bulk_max_version");
     size += PACK_DATA_SZ("pencore", pencore_size);
 
-    // RUDP client fields
+    // RUDP-related fields (only sent when RUDP mode is active)
+    if (rudp != NULL) {
+        num_elems += 5;
+        size += PACK_INT_SZ("support_bulk_on_rudp");
+        size += PACK_INT_SZ("support_hmac_on_bulk_of_rudp");
+        size += PACK_INT_SZ("support_udp_recovery");
+        size += PACK_DATA_SZ("unique_id", SHA1_SIZE);
+        size += PACK_INT_SZ("rudp_bulk_max_version");
+    }
     if (rudp != NULL) {
         num_elems += 6;
         size += PACK_INT_SZ("use_udp_acceleration");
@@ -594,12 +597,16 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
     pack_add_int(&p, "qos", 1);
-    pack_add_int(&p, "support_bulk_on_rudp", 1);
-    pack_add_int(&p, "support_hmac_on_bulk_of_rudp", 1);
-    pack_add_int(&p, "support_udp_recovery", 1);
-    pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
-    pack_add_int(&p, "rudp_bulk_max_version", 2);
     pack_add_data(&p, "pencore", pencore_data, pencore_size);
+
+    // RUDP-related fields (only sent when RUDP mode is active)
+    if (rudp != NULL) {
+        pack_add_int(&p, "support_bulk_on_rudp", 1);
+        pack_add_int(&p, "support_hmac_on_bulk_of_rudp", 1);
+        pack_add_int(&p, "support_udp_recovery", 1);
+        pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
+        pack_add_int(&p, "rudp_bulk_max_version", 2);
+    }
 
     // RUDP client fields
     if (rudp != NULL) {
@@ -608,11 +615,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         pack_add_data(&p, "udp_acceleration_client_key_v2", rudp->my_key_v2, RUDP_COMMON_KEY_SIZE_V2);
         pack_add_int(&p, "udp_acceleration_client_cookie", rudp->my_cookie);
         pack_add_int(&p, "udp_acceleration_max_version", 2);
-        // Client IP/port - send zeros, server will use TCP connection's remote IP
-        // and we'll respond to whatever the server sends
         pack_add_int(&p, "support_hmac_on_udp_acceleration", 1);
-        // Note: udp_acceleration_version and udp_acceleration_client_ip/port
-        // are omitted; server handles defaults
     }
 
     if (auth_type == 1 && secure_password) {
