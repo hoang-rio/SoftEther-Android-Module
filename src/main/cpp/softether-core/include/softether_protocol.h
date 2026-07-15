@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
+#include "softether_rudp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -97,6 +98,16 @@ typedef struct softether_connection {
     int recv_queue_head;       // read position
     int recv_queue_tail;       // write position
     int recv_queue_count;      // number of queued frames
+    // RUDP (UDP acceleration)
+    rudp_context_t* rudp;
+    int rudp_enabled;
+    uint32_t rudp_server_cookie;
+    uint32_t rudp_client_cookie;
+    uint8_t rudp_server_key[128];
+    int rudp_server_key_size;
+    char rudp_server_ip[64];
+    uint16_t rudp_server_port;
+    int rudp_version;
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     // Callbacks
@@ -114,7 +125,8 @@ void softether_destroy(softether_connection_t* conn);
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password);
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
-                               const char* username, const char* password, const char* hub_name);
+                               const char* username, const char* password, const char* hub_name,
+                               int use_tcp);
 void softether_disconnect(softether_connection_t* conn);
 
 // State management

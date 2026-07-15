@@ -488,6 +488,7 @@ static int pack_get_data(const uint8_t* body, uint32_t body_len,
 static uint8_t* build_login_pack(const char* hub_name, const char* username,
                                   int auth_type, const uint8_t* secure_password,
                                   const char* plain_password,
+                                  rudp_context_t* rudp,
                                   uint32_t* out_len) {
     if (!hub_name || !username || !out_len) return NULL;
 
@@ -519,7 +520,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     //       support_bulk_on_rudp, support_hmac_on_bulk_of_rudp,
     //       support_udp_recovery, unique_id, rudp_bulk_max_version,
     //       pencore
-    uint32_t num_elems = 25;
+    uint32_t num_elems = 30;
     uint32_t size = 4;        // num_elements field
 
     size += PACK_STR_SZ("method", "login");
@@ -547,6 +548,17 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_DATA_SZ("unique_id", SHA1_SIZE);
     size += PACK_INT_SZ("rudp_bulk_max_version");
     size += PACK_DATA_SZ("pencore", pencore_size);
+
+    // RUDP client fields
+    if (rudp != NULL) {
+        num_elems += 6;
+        size += PACK_INT_SZ("use_udp_acceleration");
+        size += PACK_DATA_SZ("udp_acceleration_client_key", RUDP_COMMON_KEY_SIZE_V1);
+        size += PACK_DATA_SZ("udp_acceleration_client_key_v2", RUDP_COMMON_KEY_SIZE_V2);
+        size += PACK_INT_SZ("udp_acceleration_client_cookie");
+        size += PACK_INT_SZ("udp_acceleration_max_version");
+        size += PACK_INT_SZ("support_hmac_on_udp_acceleration");
+    }
 
     if (auth_type == 1 && secure_password) {
         num_elems++;
@@ -588,6 +600,20 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
     pack_add_int(&p, "rudp_bulk_max_version", 2);
     pack_add_data(&p, "pencore", pencore_data, pencore_size);
+
+    // RUDP client fields
+    if (rudp != NULL) {
+        pack_add_int(&p, "use_udp_acceleration", 1);
+        pack_add_data(&p, "udp_acceleration_client_key", rudp->my_key, RUDP_COMMON_KEY_SIZE_V1);
+        pack_add_data(&p, "udp_acceleration_client_key_v2", rudp->my_key_v2, RUDP_COMMON_KEY_SIZE_V2);
+        pack_add_int(&p, "udp_acceleration_client_cookie", rudp->my_cookie);
+        pack_add_int(&p, "udp_acceleration_max_version", 2);
+        // Client IP/port - send zeros, server will use TCP connection's remote IP
+        // and we'll respond to whatever the server sends
+        pack_add_int(&p, "support_hmac_on_udp_acceleration", 1);
+        // Note: udp_acceleration_version and udp_acceleration_client_ip/port
+        // are omitted; server handles defaults
+    }
 
     if (auth_type == 1 && secure_password) {
         pack_add_data(&p, "secure_password", secure_password, SHA1_SIZE);
@@ -998,6 +1024,7 @@ static int perform_authentication_http(softether_connection_t* conn,
                                           auth_type,
                                           (auth_type == CLIENT_AUTHTYPE_PASSWORD) ? secure_password : NULL,
                                           (auth_type == CLIENT_AUTHTYPE_PLAIN_PASSWORD) ? password : NULL,
+                                          conn->rudp,
                                           &pack_len);
     if (pack_buf == NULL || pack_len == 0) {
         LOGE("Failed to build login PACK");
@@ -1133,6 +1160,77 @@ static int perform_authentication_http(softether_connection_t* conn,
         LOGD("Data channel: raw TCP (use_encrypt=%u, use_fast_rc4=%u)",
              conn->server_use_encrypt, conn->server_use_fast_rc4);
     }
+    // Parse RUDP (UDP acceleration) server response from Welcome PACK
+    {
+        uint32_t use_udp = 0;
+        if (pack_get_int((const uint8_t*)body, body_len,
+                         "use_udp_acceleration", &use_udp) == 0 && use_udp) {
+            uint32_t udp_version = 1;
+            pack_get_int((const uint8_t*)body, body_len,
+                         "udp_acceleration_version", &udp_version);
+            conn->rudp_version = (int)udp_version;
+
+            // Server IP
+            if (pack_get_str((const uint8_t*)body, body_len,
+                             "udp_acceleration_server_ip",
+                             conn->rudp_server_ip,
+                             sizeof(conn->rudp_server_ip)) == 0) {
+                LOGD("RUDP: server IP = %s", conn->rudp_server_ip);
+            } else {
+                // Fallback to the TCP server IP
+                strncpy(conn->rudp_server_ip, conn->server_ip,
+                        sizeof(conn->rudp_server_ip) - 1);
+                LOGD("RUDP: using TCP server IP = %s", conn->rudp_server_ip);
+            }
+
+            // Server port
+            uint32_t srv_port = 0;
+            if (pack_get_int((const uint8_t*)body, body_len,
+                             "udp_acceleration_server_port", &srv_port) == 0
+                             && srv_port > 0 && srv_port <= 65535) {
+                conn->rudp_server_port = (uint16_t)srv_port;
+                LOGD("RUDP: server port = %u", conn->rudp_server_port);
+            }
+
+            // Server key (V1)
+            uint32_t key_len = 0;
+            if (pack_get_data((const uint8_t*)body, body_len,
+                              "udp_acceleration_server_key",
+                              conn->rudp_server_key,
+                              sizeof(conn->rudp_server_key),
+                              &key_len) == 0 && key_len > 0) {
+                conn->rudp_server_key_size = (int)key_len;
+                LOGD("RUDP: server key received (%u bytes)", key_len);
+            } else {
+                // Try V2 key
+                key_len = 0;
+                if (pack_get_data((const uint8_t*)body, body_len,
+                                  "udp_acceleration_server_key_v2",
+                                  conn->rudp_server_key,
+                                  sizeof(conn->rudp_server_key),
+                                  &key_len) == 0 && key_len > 0) {
+                    conn->rudp_server_key_size = (int)key_len;
+                    LOGD("RUDP: server key V2 received (%u bytes)", key_len);
+                }
+            }
+
+            // Cookies
+            pack_get_int((const uint8_t*)body, body_len,
+                         "udp_acceleration_server_cookie",
+                         &conn->rudp_server_cookie);
+            pack_get_int((const uint8_t*)body, body_len,
+                         "udp_acceleration_client_cookie",
+                         &conn->rudp_client_cookie);
+            LOGD("RUDP: cookies server=0x%08X client=0x%08X",
+                 conn->rudp_server_cookie, conn->rudp_client_cookie);
+
+            conn->rudp_enabled = 1;
+            LOGD("RUDP: server supports UDP acceleration (v%u)", udp_version);
+        } else {
+            LOGD("RUDP: server does not advertise UDP acceleration");
+        }
+    }
+
     conn->session_established = 1;
 
     return ERR_NONE;
@@ -1141,12 +1239,13 @@ static int perform_authentication_http(softether_connection_t* conn,
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
-    return softether_connect_with_hub(conn, host, port, username, password, "vpngate");
+    return softether_connect_with_hub(conn, host, port, username, password, "vpngate", 1);
 }
 
 // Connect with HubName
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
-                               const char* username, const char* password, const char* hub_name) {
+                               const char* username, const char* password, const char* hub_name,
+                               int use_tcp) {
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
@@ -1226,6 +1325,21 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     // ---- SoftEther Protocol: Step 2 ----
+    // Create RUDP context before building login PACK when UDP mode is requested,
+    // so we can include client's keys/cookies in the login PACK for server negotiation.
+    if (!use_tcp) {
+        conn->rudp = rudp_create(1);  // 1 = client mode
+        if (conn->rudp == NULL) {
+            LOGW("Failed to create RUDP context (UDP acceleration disabled)");
+        } else {
+            LOGD("RUDP context created (my_port=%u, cookie=0x%08X)",
+                 conn->rudp->my_port, conn->rudp->my_cookie);
+        }
+    } else {
+        conn->rudp = NULL;
+        LOGD("TCP mode - skipping RUDP initialization");
+    }
+
     // POST /vpnsvc/vpn.cgi with login PACK.
     // Server responds with Welcome PACK (error=0 on success).
     LOGD("Performing PACK-based authentication...");
@@ -1238,6 +1352,32 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     LOGD("Authentication successful");
+
+    // ---- SoftEther Protocol: Step 3 ----
+    // If server supports RUDP, initialize the RUDP context
+    if (!use_tcp && conn->rudp && conn->rudp_enabled) {
+        if (conn->rudp_server_port == 0 || conn->rudp_server_key_size == 0) {
+            LOGW("RUDP enabled by server but missing port/key - disabling");
+            conn->rudp_enabled = 0;
+        } else {
+            // Init RUDP client with server params
+            int r = rudp_init_client(conn->rudp,
+                                     conn->rudp_server_key,
+                                     conn->rudp_server_key_size,
+                                     conn->rudp_server_ip[0] ?
+                                         conn->rudp_server_ip : conn->server_ip,
+                                     conn->rudp_server_port,
+                                     conn->rudp_server_cookie,
+                                     conn->rudp_client_cookie);
+            if (r == 0) {
+                LOGD("RUDP client initialized successfully");
+                rudp_set_version(conn->rudp, conn->rudp_version);
+            } else {
+                LOGW("RUDP init failed - disabling");
+                conn->rudp_enabled = 0;
+            }
+        }
+    }
 
     // Session is established via the PACK login flow.
     conn->state = STATE_SESSION_SETUP;
@@ -1346,6 +1486,13 @@ void softether_disconnect(softether_connection_t* conn) {
         close(conn->socket_fd);
         conn->socket_fd = -1;
     }
+
+    // Destroy RUDP context if present
+    if (conn->rudp != NULL) {
+        rudp_destroy(conn->rudp);
+        conn->rudp = NULL;
+    }
+    conn->rudp_enabled = 0;
 
     conn->state = STATE_DISCONNECTED;
     conn->session_id = 0;
@@ -1631,13 +1778,27 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
+    // Try RUDP if active and ready
+    if (conn->rudp && conn->rudp_enabled) {
+        rudp_poll(conn->rudp);
+        if (rudp_is_send_ready(conn->rudp, 1)) {
+            int r = rudp_send(conn->rudp, data, data_len, 0);
+            if (r > 0) {
+                LOGD("Sent data block via RUDP: %u bytes", data_len);
+                return (int)data_len;
+            }
+            LOGW("RUDP send failed (%d), falling back to TCP", r);
+        }
+    }
+
+    // Fall back to TCP
     int result = softether_send_packet(conn, CMD_DATA, data, data_len);
     if (result < 0) {
         LOGE("Failed to send data block");
         return -1;
     }
 
-    LOGD("Sent data block: %u bytes", data_len);
+    LOGD("Sent data block via TCP: %u bytes", data_len);
     return result;
 }
 
@@ -1654,23 +1815,109 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
         return -1;
     }
 
-    uint32_t payload_len = 0;
-    int result = softether_receive_packet(conn, command, buffer, &payload_len, max_len);
+    // Try RUDP first if active
+    if (conn->rudp && conn->rudp_enabled) {
+        int have_rudp_data = 0;
 
-    if (result < 0) {
-        // Timeout or error
-        LOGD("No data available from server (timeout or error)");
-        *received_len = 0;
-        *command = 0;
-        return 0;
+        rudp_poll(conn->rudp);
+
+        // Check if data is available on RUDP
+        {
+            uint32_t rudp_len = 0;
+            int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
+            if (r > 0) {
+                have_rudp_data = 1;
+            }
+        }
+
+        if (!have_rudp_data) {
+            // Use poll() to check both UDP and TCP sockets
+            struct pollfd fds[2];
+            nfds_t nfds = 0;
+
+            // UDP socket
+            int udp_fd = rudp_get_udp_fd(conn->rudp);
+            if (udp_fd >= 0) {
+                fds[nfds].fd = udp_fd;
+                fds[nfds].events = POLLIN;
+                fds[nfds].revents = 0;
+                nfds++;
+            }
+
+            // TCP socket
+            fds[nfds].fd = conn->socket_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            nfds++;
+
+            int poll_ret = poll(fds, nfds, 200);  // 200ms timeout
+            if (poll_ret > 0) {
+                // Check UDP first
+                for (nfds_t i = 0; i < nfds; i++) {
+                    if (udp_fd >= 0 && fds[i].fd == udp_fd &&
+                        (fds[i].revents & POLLIN)) {
+                        rudp_poll(conn->rudp);
+                        uint32_t rudp_len = 0;
+                        int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
+                        if (r > 0) {
+                            have_rudp_data = 1;
+                        }
+                        break;
+                    }
+                }
+
+                // Check TCP (only if no RUDP data)
+                if (!have_rudp_data) {
+                    for (nfds_t i = 0; i < nfds; i++) {
+                        if (fds[i].fd == conn->socket_fd &&
+                            (fds[i].revents & POLLIN)) {
+                            // Will fall through to TCP read below
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!have_rudp_data) {
+                // No data on either socket
+                *received_len = 0;
+                *command = 0;
+                return 0;
+            }
+        }
+
+        if (have_rudp_data) {
+            // Dequeue from RUDP
+            uint32_t rudp_len = 0;
+            int r = rudp_recv(conn->rudp, buffer, &rudp_len, max_len);
+            if (r > 0) {
+                *received_len = rudp_len;
+                *command = CMD_DATA;
+                LOGD("Received data block via RUDP: %u bytes", rudp_len);
+                return 0;
+            }
+        }
     }
 
-    *received_len = payload_len;
+    // Fall back to TCP read
+    {
+        uint32_t payload_len = 0;
+        int result = softether_receive_packet(conn, command, buffer, &payload_len, max_len);
 
-    if (*command == CMD_KEEPALIVE) {
-        softether_send_keepalive(conn);
-        LOGD("Received keepalive, sent response");
-        *received_len = 0;
+        if (result < 0) {
+            LOGD("No data available from server (timeout or error)");
+            *received_len = 0;
+            *command = 0;
+            return 0;
+        }
+
+        *received_len = payload_len;
+
+        if (*command == CMD_KEEPALIVE) {
+            softether_send_keepalive(conn);
+            LOGD("Received keepalive, sent response");
+            *received_len = 0;
+        }
     }
 
     return 0;
@@ -1712,7 +1959,7 @@ int softether_reconnect(softether_connection_t* conn) {
         softether_disconnect(conn);
     }
 
-    // Attempt reconnection with stored credentials
+    // Attempt reconnection with stored credentials (use TCP to be safe on reconnect)
     return softether_connect_with_hub(conn, conn->server_ip, conn->server_port,
-                                      conn->username, conn->password, conn->hub_name);
+                                      conn->username, conn->password, conn->hub_name, 1);
 }

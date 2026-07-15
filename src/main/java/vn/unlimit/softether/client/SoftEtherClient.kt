@@ -215,7 +215,8 @@ class SoftEtherClient {
         port: Int,
         username: String,
         password: String,
-        hubName: String
+        hubName: String,
+        useTcp: Boolean = true
     ): Int
     external fun nativeDisconnect(handle: Long)
     external fun nativeGetState(handle: Long): Int

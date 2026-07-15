@@ -223,7 +223,8 @@ class ConnectionController(
                 config.serverPort,
                 config.username,
                 config.password,
-                hubName
+                hubName,
+                config.useTcp
             )
         } finally {
             stopNativeStateMonitor()
@@ -592,7 +593,8 @@ class ConnectionController(
                 config.serverPort,
                 config.username,
                 config.password,
-                hubName
+                hubName,
+                config.useTcp
             )
 
             if (result != 0) {

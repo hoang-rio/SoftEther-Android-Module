@@ -44,6 +44,7 @@ endif()
 set(SOFTETHER_SOURCES
     jni/softether_jni.c
     softether-core/src/proto/softether_protocol.c
+    softether-core/src/proto/softether_rudp.c
     softether-core/src/crypto/aes_wrapper.c
     softether-core/src/socket/tcp_socket.c
     softether-core/src/packet/packet_handler.c

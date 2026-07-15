@@ -162,7 +162,7 @@ test_helper_connect(const native_test_config_t *config,
   const char *password = (config->password) ? config->password : "";
 
   int ret = softether_connect_with_hub(conn, config->host, config->port,
-                                       username, password, "vpngate");
+                                       username, password, "vpngate", 1);  // use_tcp=1
   if (ret != ERR_NONE) {
     long d = get_test_timestamp_ms() - start_time;
     char msg[256];
