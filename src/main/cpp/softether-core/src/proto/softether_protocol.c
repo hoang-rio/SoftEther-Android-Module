@@ -554,13 +554,15 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         size += PACK_INT_SZ("rudp_bulk_max_version");
     }
     if (rudp != NULL) {
-        num_elems += 6;
+        num_elems += 8;
         size += PACK_INT_SZ("use_udp_acceleration");
         size += PACK_DATA_SZ("udp_acceleration_client_key", RUDP_COMMON_KEY_SIZE_V1);
         size += PACK_DATA_SZ("udp_acceleration_client_key_v2", RUDP_COMMON_KEY_SIZE_V2);
         size += PACK_INT_SZ("udp_acceleration_client_cookie");
         size += PACK_INT_SZ("udp_acceleration_max_version");
         size += PACK_INT_SZ("support_hmac_on_udp_acceleration");
+        size += PACK_INT_SZ("udp_acceleration_client_ip");
+        size += PACK_INT_SZ("udp_acceleration_client_port");
     }
 
     if (auth_type == 1 && secure_password) {
@@ -616,6 +618,8 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         pack_add_int(&p, "udp_acceleration_client_cookie", rudp->my_cookie);
         pack_add_int(&p, "udp_acceleration_max_version", 2);
         pack_add_int(&p, "support_hmac_on_udp_acceleration", 1);
+        pack_add_int(&p, "udp_acceleration_client_ip", 0);   // all-zeros IP → server will replace with client's TCP remote IP
+        pack_add_int(&p, "udp_acceleration_client_port", rudp->my_port);
     }
 
     if (auth_type == 1 && secure_password) {
