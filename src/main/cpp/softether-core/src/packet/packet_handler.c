@@ -379,6 +379,51 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) return -1;
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) return -1;
 
+    // Try RUDP first if active
+    if (conn->rudp && conn->rudp_enabled) {
+        rudp_poll(conn->rudp);
+
+        // Check for queued data from RUDP
+        uint32_t rudp_len = 0;
+        uint8_t rudp_buf[MAX_QUEUED_FRAME];
+        int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
+        if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+            uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
+            memcpy(entry->data, rudp_buf, copy_len);
+            entry->len = copy_len;
+            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+            conn->recv_queue_count++;
+            LOGD("fill_recv_queue: queued %u bytes from RUDP", copy_len);
+            return 1;
+        }
+
+        // Also poll UDP socket for incoming RUDP packets
+        int udp_fd = rudp_get_udp_fd(conn->rudp);
+        if (udp_fd >= 0) {
+            struct pollfd udp_pfd;
+            udp_pfd.fd = udp_fd;
+            udp_pfd.events = POLLIN;
+            udp_pfd.revents = 0;
+            int poll_ret = poll(&udp_pfd, 1, 0);
+            if (poll_ret > 0 && (udp_pfd.revents & POLLIN)) {
+                rudp_poll(conn->rudp);
+                rudp_len = 0;
+                r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
+                if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+                    queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+                    uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
+                    memcpy(entry->data, rudp_buf, copy_len);
+                    entry->len = copy_len;
+                    conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                    conn->recv_queue_count++;
+                    LOGD("fill_recv_queue: queued %u bytes from UDP socket", copy_len);
+                    return 1;
+                }
+            }
+        }
+    }
+
     // Check if SSL has buffered data first (may not show up in poll)
     int ssl_pending = conn->use_ssl_data ? ssl_has_pending((ssl_context_t*)conn->ssl) : 0;
 

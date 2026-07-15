@@ -1379,6 +1379,8 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
             if (r == 0) {
                 LOGD("RUDP client initialized successfully");
                 rudp_set_version(conn->rudp, conn->rudp_version);
+                // Start RUDP poll immediately to send initial keepalive
+                rudp_poll(conn->rudp);
             } else {
                 LOGW("RUDP init failed - disabling");
                 conn->rudp_enabled = 0;
@@ -1561,8 +1563,8 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
         return -1;
     }
 
-    // Send as a single data block using real SoftEther format
-    int sent = softether_send_packet(conn, CMD_DATA, frame, (uint32_t)frame_len);
+    // Send as a single data block using real SoftEther format (with RUDP if active)
+    int sent = softether_send_data(conn, frame, (uint32_t)frame_len);
     if (sent < 0) {
         LOGE("Failed to send data block");
         return -1;
@@ -1664,7 +1666,7 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
 int softether_send_raw(softether_connection_t* conn, const uint8_t* frame, size_t len) {
     if (conn == NULL || frame == NULL || len == 0) return -1;
     if (conn->state != STATE_CONNECTED) return -1;
-    return softether_send_packet(conn, CMD_DATA, frame, (uint32_t)len);
+    return softether_send_data(conn, frame, (uint32_t)len);
 }
 
 // Raw L2 receive — uses queue; returns raw Ethernet frame (for DHCP)
