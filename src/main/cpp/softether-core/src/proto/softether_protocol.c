@@ -586,7 +586,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "client_ver", client_ver);
     pack_add_int(&p, "client_build", client_build);
     pack_add_int(&p, "client_id", 0);
-    pack_add_int(&p, "protocol", 0);          // 0 = TCP
+    pack_add_int(&p, "protocol", rudp ? 1 : 0);   // 0 = TCP, 1 = UDP
     pack_add_int(&p, "max_connection", 1);
     pack_add_int(&p, "use_encrypt", 1);
     pack_add_int(&p, "use_compress", 0);
