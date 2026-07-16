@@ -1371,7 +1371,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     socket_destroy(sock);
 
     // TLS handshake
-    int result = perform_tls_handshake(conn, connect_host);
+    result = perform_tls_handshake(conn, connect_host);
     if (result != ERR_NONE) {
         LOGE("TLS handshake failed");
         close(conn->socket_fd);
