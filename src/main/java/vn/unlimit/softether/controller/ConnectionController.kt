@@ -13,7 +13,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import vn.unlimit.softether.BuildConfig
 import vn.unlimit.softether.SoftEtherVpnService
 import vn.unlimit.softether.SoftEtherTrafficSnapshot
 import vn.unlimit.softether.client.SoftEtherClient
@@ -184,10 +183,6 @@ class ConnectionController(
      * Build client info for reporting to server
      */
     private fun buildClientInfo(rudpPort: Int): ClientInfo {
-        val productName = if (BuildConfig.FLAVOR == "pro") 
-            "VPN Gate Connector Pro" 
-            else "VPN Gate Connector"
-        
         // Get local non-loopback IP
         var clientIp = "0.0.0.0"
         try {
@@ -225,9 +220,9 @@ class ConnectionController(
         }
         
         return ClientInfo(
-            productName = productName,
-            productVersion = BuildConfig.VERSION_NAME,
-            productBuild = BuildConfig.VERSION_CODE,
+            productName = config.clientProductName,
+            productVersion = config.clientVersion,
+            productBuild = config.clientBuild,
             osName = "${Build.MANUFACTURER} ${Build.MODEL}",
             osVersion = Build.VERSION.RELEASE,
             osProductId = Build.FINGERPRINT,
