@@ -441,8 +441,12 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             LOGE("fill_recv_queue: poll error: %d", poll_ret);
             return -1;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            LOGE("fill_recv_queue: socket error (revents=0x%x)", pfd.revents);
+        if (pfd.revents & POLLNVAL) {
+            LOGE("fill_recv_queue: socket invalid (revents=0x%x)", pfd.revents);
+            return -1;
+        }
+        if ((pfd.revents & (POLLERR | POLLHUP)) && !(pfd.revents & POLLIN)) {
+            LOGE("fill_recv_queue: socket error without data (revents=0x%x)", pfd.revents);
             return -1;
         }
     }

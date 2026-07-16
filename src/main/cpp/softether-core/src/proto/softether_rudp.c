@@ -190,7 +190,7 @@ void rudp_set_tick(rudp_context_t* ctx, uint64_t tick) {
 
 void rudp_set_version(rudp_context_t* ctx, int version) {
     if (ctx == NULL) return;
-    ctx->version = (version == 2) ? 2 : 1;
+    ctx->version = 1; // only V1 implemented
 }
 
 void rudp_set_fast_detect(rudp_context_t* ctx, int fast) {

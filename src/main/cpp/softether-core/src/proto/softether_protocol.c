@@ -492,7 +492,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
                                   uint32_t* out_len) {
     if (!hub_name || !username || !out_len) return NULL;
 
-    const char* client_hello = "SoftEther VPN Client";
+    const char* client_hello = "SoftEther VPN Client"; // Must be exactly this string, server rejects unrecognized values
     const uint32_t client_ver = 420;
     const uint32_t client_build = 9699;
 
@@ -1787,17 +1787,15 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
-    // Try RUDP if active and ready
+    // Try RUDP if active
     if (conn->rudp && conn->rudp_enabled) {
         rudp_poll(conn->rudp);
-        if (rudp_is_send_ready(conn->rudp, 1)) {
-            int r = rudp_send(conn->rudp, data, data_len, 0);
-            if (r > 0) {
-                LOGD("Sent data block via RUDP: %u bytes", data_len);
-                return (int)data_len;
-            }
-            LOGW("RUDP send failed (%d), falling back to TCP", r);
+        int r = rudp_send(conn->rudp, data, data_len, 0);
+        if (r > 0) {
+            LOGD("Sent data block via RUDP: %u bytes", data_len);
+            return (int)data_len;
         }
+        LOGW("RUDP send failed (%d), falling back to TCP", r);
     }
 
     // Fall back to TCP
