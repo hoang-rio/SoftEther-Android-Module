@@ -77,7 +77,11 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
 
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeConnectWithHub(
     JNIEnv *env, jobject thiz, jlong handle, jstring host, jint port, 
-    jstring username, jstring password, jstring hubName, jboolean useTcp) {
+    jstring username, jstring password, jstring hubName, jboolean useTcp,
+    jstring clientProductName, jstring clientVersion, jint clientBuild,
+    jstring clientOsName, jstring clientOsVersion, jstring clientOsProductId,
+    jstring clientHostName, jstring clientIpAddress, jint clientPort,
+    jstring serverHostName, jstring serverIpAddress, jint serverPort) {
     LOGD("nativeConnectWithHub called (useTcp=%d)", (int)useTcp);    
     if (handle == 0) {
         LOGE("Invalid handle");
@@ -88,23 +92,57 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeCo
     const char* username_str = (*env)->GetStringUTFChars(env, username, NULL);
     const char* password_str = (*env)->GetStringUTFChars(env, password, NULL);
     const char* hub_name_str = (*env)->GetStringUTFChars(env, hubName, NULL);
+    const char* client_product_name_str = (*env)->GetStringUTFChars(env, clientProductName, NULL);
+    const char* client_version_str = (*env)->GetStringUTFChars(env, clientVersion, NULL);
+    const char* client_os_name_str = (*env)->GetStringUTFChars(env, clientOsName, NULL);
+    const char* client_os_version_str = (*env)->GetStringUTFChars(env, clientOsVersion, NULL);
+    const char* client_os_product_id_str = (*env)->GetStringUTFChars(env, clientOsProductId, NULL);
+    const char* client_host_name_str = (*env)->GetStringUTFChars(env, clientHostName, NULL);
+    const char* client_ip_address_str = (*env)->GetStringUTFChars(env, clientIpAddress, NULL);
+    const char* server_host_name_str = (*env)->GetStringUTFChars(env, serverHostName, NULL);
+    const char* server_ip_address_str = (*env)->GetStringUTFChars(env, serverIpAddress, NULL);
     
-    if (host_str == NULL || username_str == NULL || password_str == NULL || hub_name_str == NULL) {
+    if (host_str == NULL || username_str == NULL || password_str == NULL || hub_name_str == NULL ||
+        client_product_name_str == NULL || client_version_str == NULL || client_os_name_str == NULL ||
+        client_os_version_str == NULL || client_os_product_id_str == NULL || client_host_name_str == NULL ||
+        client_ip_address_str == NULL || server_host_name_str == NULL || server_ip_address_str == NULL) {
         LOGE("Failed to get string parameters");
         if (host_str) (*env)->ReleaseStringUTFChars(env, host, host_str);
         if (username_str) (*env)->ReleaseStringUTFChars(env, username, username_str);
         if (password_str) (*env)->ReleaseStringUTFChars(env, password, password_str);
         if (hub_name_str) (*env)->ReleaseStringUTFChars(env, hubName, hub_name_str);
+        if (client_product_name_str) (*env)->ReleaseStringUTFChars(env, clientProductName, client_product_name_str);
+        if (client_version_str) (*env)->ReleaseStringUTFChars(env, clientVersion, client_version_str);
+        if (client_os_name_str) (*env)->ReleaseStringUTFChars(env, clientOsName, client_os_name_str);
+        if (client_os_version_str) (*env)->ReleaseStringUTFChars(env, clientOsVersion, client_os_version_str);
+        if (client_os_product_id_str) (*env)->ReleaseStringUTFChars(env, clientOsProductId, client_os_product_id_str);
+        if (client_host_name_str) (*env)->ReleaseStringUTFChars(env, clientHostName, client_host_name_str);
+        if (client_ip_address_str) (*env)->ReleaseStringUTFChars(env, clientIpAddress, client_ip_address_str);
+        if (server_host_name_str) (*env)->ReleaseStringUTFChars(env, serverHostName, server_host_name_str);
+        if (server_ip_address_str) (*env)->ReleaseStringUTFChars(env, serverIpAddress, server_ip_address_str);
         return ERR_UNKNOWN;
     }
     
     softether_connection_t* conn = (softether_connection_t*)handle;
-    int result = softether_connect_with_hub(conn, host_str, port, username_str, password_str, hub_name_str, (int)useTcp);
+    int result = softether_connect_with_hub(conn, host_str, port, username_str, password_str, hub_name_str, (int)useTcp,
+        client_product_name_str, client_version_str, (int)clientBuild,
+        client_os_name_str, client_os_version_str, client_os_product_id_str,
+        client_host_name_str, client_ip_address_str, (int)clientPort,
+        server_host_name_str, server_ip_address_str, (int)serverPort);
     
     (*env)->ReleaseStringUTFChars(env, host, host_str);
     (*env)->ReleaseStringUTFChars(env, username, username_str);
     (*env)->ReleaseStringUTFChars(env, password, password_str);
     (*env)->ReleaseStringUTFChars(env, hubName, hub_name_str);
+    (*env)->ReleaseStringUTFChars(env, clientProductName, client_product_name_str);
+    (*env)->ReleaseStringUTFChars(env, clientVersion, client_version_str);
+    (*env)->ReleaseStringUTFChars(env, clientOsName, client_os_name_str);
+    (*env)->ReleaseStringUTFChars(env, clientOsVersion, client_os_version_str);
+    (*env)->ReleaseStringUTFChars(env, clientOsProductId, client_os_product_id_str);
+    (*env)->ReleaseStringUTFChars(env, clientHostName, client_host_name_str);
+    (*env)->ReleaseStringUTFChars(env, clientIpAddress, client_ip_address_str);
+    (*env)->ReleaseStringUTFChars(env, serverHostName, server_host_name_str);
+    (*env)->ReleaseStringUTFChars(env, serverIpAddress, server_ip_address_str);
     
     return result;
 }
@@ -208,6 +246,16 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGe
     }
     softether_connection_t* conn = (softether_connection_t*)handle;
     return conn->socket_fd;
+}
+
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetRudpSocketFd(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return -1;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    if (conn->rudp) {
+        return rudp_get_udp_fd(conn->rudp);
+    }
+    return -1;
 }
 
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetOption(

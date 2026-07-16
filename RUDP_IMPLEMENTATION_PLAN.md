@@ -9,85 +9,58 @@ This document outlines the plan to implement SoftEther's UDP Acceleration (RUDP)
 
 ## 1. Technical Analysis
 
+### Protocol Versions
+
+| Feature | V1 (Current) | V2 (Planned) |
+|---------|--------------|--------------|
+| **Encryption** | RC4 (stream cipher) | ChaCha20-Poly1305 AEAD |
+| **Key Derivation** | SHA1(common_key \|\| IV) | HKDF-like with 128-byte keys |
+| **IV Size** | 20 bytes | 12 bytes |
+| **Authentication** | 20-byte zero verify field | 16-byte Poly1305 MAC |
+| **Security** | Stream cipher + manual verify | Authenticated encryption (AEAD) |
+| **Key Size** | 20 bytes | 128 bytes |
+| **Status** | ✅ **Implemented & Working** | 📋 **Planned** |
+
 ### Protocol Flow
 1.  **Control Channel (TCP)**: The standard HTTPS/SoftEther connection is established first.
 2.  **Negotiation**: During the handshake, the client advertises `support_udp_recovery=1`. The server responds with `udp_acceleration_server_ip`, `udp_acceleration_server_port`, `udp_acceleration_server_key`, and `udp_acceleration_client_key`.
 3.  **NAT Traversal**: The client sends UDP packets to the server's UDP port to "punch" a hole in the NAT.
 4.  **Data Transport**: Once the server receives the UDP packets and verifies the key, it switches data transmission to UDP. Control packets (KeepAlive) may continue on TCP or move to UDP.
 
-### Packet Format (Based on SoftEther Source)
-SoftEther RUDP packets are encrypted and authenticated.
--   **IV**: Initialization Vector (random).
--   **MAC**: Message Authentication Code (HMAC-SHA1 or similar).
--   **Payload**: Encrypted data (likely RC4 or AES, depending on negotiation).
--   **Reliability**: Sequence numbers and ACKs are used to ensure delivery and ordering, mimicking a TCP stream over UDP.
+### Packet Format (V1 - Implemented)
+SoftEther RUDP V1 packets are encrypted and authenticated:
+-   **IV**: Initialization Vector (20 bytes, random).
+-   **Cookie**: 4-byte session identifier (encrypted).
+-   **My Tick / Your Tick**: 8-byte timestamps for windowing (big-endian).
+-   **Inner Size**: 2-byte payload length (big-endian).
+-   **Flag**: 1-byte flags (compression, etc.).
+-   **Payload**: Encrypted data (RC4 with key derived from SHA1(common_key \|\| IV)).
+-   **Padding + Verify**: Random padding + 20-byte zero verify field.
+-   **Reliability**: Sequence numbers and ACKs ensure delivery and ordering, mimicking a TCP stream over UDP.
 
 ---
 
-## 2. Implementation Steps
+## 2. Implementation Status
 
-### Phase 1: Data Structures & Infrastructure
-Create `softether_rudp.h` and `softether_rudp.c`.
+### Phase 1-4: V1 Implementation (✅ **Complete**)
+- `softether_rudp.h` / `softether_rudp.c`: V1 context, packet build/parse, encryption/decryption
+- Handshake integration in `softether_protocol.c`: parse Welcome PACK for UDP params
+- Data path integration: `softether_send_data` / `softether_receive_data` with UDP/TCP fallback
+- Keep-alive polling: `rudp_poll` in receive loop
+- DHCP support over RUDP: poll UDP socket in DHCP wait loop
+- Socket protection: `VpnService.protect()` for RUDP UDP fd to prevent TUN routing loop
 
-*   **`softether_rudp_context_t`**:
-    *   `int udp_socket_fd`: The UDP socket.
-    *   `struct sockaddr_in server_addr`: Server's UDP address.
-    *   `uint8_t client_key[20]`: Key for sending.
-    *   `uint8_t server_key[20]`: Key for receiving.
-    *   `uint32_t my_cookie`: Client session ID.
-    *   `uint32_t your_cookie`: Server session ID.
-    *   `uint64_t next_iv`: For encryption.
-    *   `uint32_t seq_num`: Outgoing sequence number.
-    *   `uint32_t ack_num`: Incoming ACK number.
-    *   `bool active`: Flag indicating if UDP is currently working.
+### Phase 5: V2 Support (📋 **Planned**)
+- Implement ChaCha20-Poly1305 AEAD encryption
+- 128-byte common keys + HKDF key derivation
+- 12-byte IV + 16-byte Poly1305 MAC
+- V2 packet format (different from V1)
+- Version negotiation (server supports both, client selects highest common)
 
-### Phase 2: Handshake Integration
-Modify `softether_protocol.c`: `softether_connect_with_hub`.
-
-*   **Parsing**: After the main login PACK is processed, check for:
-    *   `udp_acceleration_server_ip`
-    *   `udp_acceleration_server_port`
-    *   `udp_acceleration_server_key`
-    *   `udp_acceleration_client_key`
-    *   `udp_acceleration_server_cookie`
-    *   `udp_acceleration_client_cookie`
-*   **Initialization**: If parameters are present, call `softether_rudp_init()` to set up the UDP socket and context.
-
-### Phase 3: RUDP Protocol Logic
-Implement core functions in `softether_rudp.c`.
-
-*   **`softether_rudp_handshake()`**:
-    *   Send initial "Hello" packets to the server's UDP port.
-    *   These packets contain the `client_cookie` and `server_cookie` to verify identity.
-    *   Repeat until a valid response is received or timeout.
-
-*   **`softether_rudp_send(ctx, data, len)`**:
-    *   Encapsulate data: `IV + MAC + Encrypt(Payload)`.
-    *   Send via `sendto()`.
-    *   Handle sequence numbers (if using full reliable mode) or raw tunneling.
-
-*   **`softether_rudp_receive(ctx, buffer, max_len)`**:
-    *   Receive via `recvfrom()`.
-    *   Verify MAC.
-    *   Decrypt payload.
-    *   Check sequence numbers (deduplication/ordering).
-
-### Phase 4: Integration with Data Loop
-Modify the main data loop in `softether_protocol.c` (or `ConnectionController` logic).
-
-*   **`softether_send_data()`**:
-    *   Check `conn->rudp->active`.
-    *   If active, try `softether_rudp_send()`.
-    *   If RUDP send fails or is inactive, fall back to `softether_send_packet()` (TCP).
-
-*   **`softether_read_data()`**:
-    *   Use `poll()` or `select()` to listen on **both** the TCP socket and the UDP socket.
-    *   If UDP socket is readable -> `softether_rudp_receive()`.
-    *   If TCP socket is readable -> `softether_receive_raw()`.
-
-### Phase 5: Keep-Alive & Reliability
-*   **Heartbeat**: Send periodic UDP keep-alives (empty packets or special command) to keep the NAT mapping open.
-*   **Failover**: If UDP packets stop arriving (timeout), set `rudp->active = false` and revert to TCP. Retry RUDP handshake periodically.
+### Phase 6: NAT-T / NAT Traversal (📋 **Planned**)
+- NAT-T server integration for clients behind symmetric NAT
+- Port mapping discovery via NAT-T server
+- Fallback to NAT-T when direct UDP fails
 
 ---
 
@@ -95,8 +68,18 @@ Modify the main data loop in `softether_protocol.c` (or `ConnectionController` l
 *   **POSIX Sockets**: Use standard `<sys/socket.h>`, `<netinet/in.h>`.
 *   **OpenSSL**: Use existing `softether_crypto` wrappers for RC4/AES and HMAC-SHA1.
 *   **Threads**: Use `pthread` for background keep-alive if necessary (or integrate into main non-blocking loop).
+*   **V2**: Will require ChaCha20-Poly1305 implementation (OpenSSL 1.1.1+ or libsodium).
+
+---
 
 ## 4. Testing Plan
 1.  **Unit Test**: Create a mock UDP server to verify packet formatting and encryption.
 2.  **Integration Test**: Connect to a known SoftEther server with UDP enabled.
 3.  **Wireshark**: Capture traffic to verify UDP packets are flowing and falling back to TCP when blocked.
+4.  **V2 Test**: Once implemented, test V2 handshake and AEAD packet format.
+
+---
+
+## 5. References
+- SoftEtherVPN Source: `src/Cedar/UdpAccel.c` / `UdpAccel.h`
+- Official protocol constants match: `UDP_ACCELERATION_COMMON_KEY_SIZE_V1=20`, `UDP_ACCELERATION_PACKET_IV_SIZE_V1=20`, etc.

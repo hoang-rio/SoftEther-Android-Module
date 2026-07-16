@@ -489,6 +489,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
                                   int auth_type, const uint8_t* secure_password,
                                   const char* plain_password,
                                   rudp_context_t* rudp,
+                                  softether_connection_t* conn,
                                   uint32_t* out_len) {
     if (!hub_name || !username || !out_len) return NULL;
 
@@ -543,6 +544,21 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_INT_SZ("require_monitor_mode");
     size += PACK_INT_SZ("qos");
     size += PACK_DATA_SZ("pencore", pencore_size);
+
+    // Client info fields (always sent for server session list)
+    num_elems += 12;
+    size += PACK_STR_SZ("ClientProductName", conn->client_product_name);
+    size += PACK_STR_SZ("ClientProductVer", conn->client_product_version);
+    size += PACK_INT_SZ("ClientProductBuild");
+    size += PACK_STR_SZ("ClientOsName", conn->client_os_name);
+    size += PACK_STR_SZ("ClientOsVersion", conn->client_os_version);
+    size += PACK_STR_SZ("ClientOsProductId", conn->client_os_product_id);
+    size += PACK_STR_SZ("ClientHostName", conn->client_host_name);
+    size += PACK_STR_SZ("ClientIpAddress", conn->client_ip_address);
+    size += PACK_INT_SZ("ClientPort");
+    size += PACK_STR_SZ("ServerHostName", conn->server_host_name);
+    size += PACK_STR_SZ("ServerIpAddress", conn->server_ip_address);
+    size += PACK_INT_SZ("ServerPort");
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
@@ -601,13 +617,27 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "qos", 1);
     pack_add_data(&p, "pencore", pencore_data, pencore_size);
 
+    // Client info fields (reported in server session list)
+    pack_add_str(&p, "ClientProductName", conn->client_product_name);
+    pack_add_str(&p, "ClientProductVer", conn->client_product_version);
+    pack_add_int(&p, "ClientProductBuild", (uint32_t)conn->client_product_build);
+    pack_add_str(&p, "ClientOsName", conn->client_os_name);
+    pack_add_str(&p, "ClientOsVersion", conn->client_os_version);
+    pack_add_str(&p, "ClientOsProductId", conn->client_os_product_id);
+    pack_add_str(&p, "ClientHostName", conn->client_host_name);
+    pack_add_str(&p, "ClientIpAddress", conn->client_ip_address);
+    pack_add_int(&p, "ClientPort", (uint32_t)conn->client_port);
+    pack_add_str(&p, "ServerHostName", conn->server_host_name);
+    pack_add_str(&p, "ServerIpAddress", conn->server_ip_address);
+    pack_add_int(&p, "ServerPort", (uint32_t)conn->server_port);
+
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
         pack_add_int(&p, "support_bulk_on_rudp", 1);
         pack_add_int(&p, "support_hmac_on_bulk_of_rudp", 1);
         pack_add_int(&p, "support_udp_recovery", 1);
         pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
-        pack_add_int(&p, "rudp_bulk_max_version", 2);
+        pack_add_int(&p, "rudp_bulk_max_version", 1);
     }
 
     // RUDP client fields
@@ -616,7 +646,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         pack_add_data(&p, "udp_acceleration_client_key", rudp->my_key, RUDP_COMMON_KEY_SIZE_V1);
         pack_add_data(&p, "udp_acceleration_client_key_v2", rudp->my_key_v2, RUDP_COMMON_KEY_SIZE_V2);
         pack_add_int(&p, "udp_acceleration_client_cookie", rudp->my_cookie);
-        pack_add_int(&p, "udp_acceleration_max_version", 2);
+        pack_add_int(&p, "udp_acceleration_max_version", 1);
         pack_add_int(&p, "support_hmac_on_udp_acceleration", 1);
         pack_add_int(&p, "udp_acceleration_client_ip", 0);   // all-zeros IP → server will replace with client's TCP remote IP
         pack_add_int(&p, "udp_acceleration_client_port", rudp->my_port);
@@ -1032,6 +1062,7 @@ static int perform_authentication_http(softether_connection_t* conn,
                                           (auth_type == CLIENT_AUTHTYPE_PASSWORD) ? secure_password : NULL,
                                           (auth_type == CLIENT_AUTHTYPE_PLAIN_PASSWORD) ? password : NULL,
                                           conn->rudp,
+                                          conn,
                                           &pack_len);
     if (pack_buf == NULL || pack_len == 0) {
         LOGE("Failed to build login PACK");
@@ -1252,7 +1283,11 @@ int softether_connect(softether_connection_t* conn, const char* host, int port,
 // Connect with HubName
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
                                const char* username, const char* password, const char* hub_name,
-                               int use_tcp) {
+                               int use_tcp,
+                               const char* client_product_name, const char* client_product_version, int client_product_build,
+                               const char* client_os_name, const char* client_os_version, const char* client_os_product_id,
+                               const char* client_host_name, const char* client_ip_address, int client_port,
+                               const char* server_host_name, const char* server_ip_address, int server_port) {
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
@@ -1270,47 +1305,54 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
     const char* connect_host = resolved_ip;
 
+    // Store client info for login PACK
+    if (client_product_name && client_product_name[0]) {
+        strncpy(conn->client_product_name, client_product_name, sizeof(conn->client_product_name) - 1);
+    }
+    if (client_product_version && client_product_version[0]) {
+        strncpy(conn->client_product_version, client_product_version, sizeof(conn->client_product_version) - 1);
+    }
+    conn->client_product_build = client_product_build;
+    if (client_os_name && client_os_name[0]) {
+        strncpy(conn->client_os_name, client_os_name, sizeof(conn->client_os_name) - 1);
+    }
+    if (client_os_version && client_os_version[0]) {
+        strncpy(conn->client_os_version, client_os_version, sizeof(conn->client_os_version) - 1);
+    }
+    if (client_os_product_id && client_os_product_id[0]) {
+        strncpy(conn->client_os_product_id, client_os_product_id, sizeof(conn->client_os_product_id) - 1);
+    }
+    if (client_host_name && client_host_name[0]) {
+        strncpy(conn->client_host_name, client_host_name, sizeof(conn->client_host_name) - 1);
+    }
+    if (client_ip_address && client_ip_address[0]) {
+        strncpy(conn->client_ip_address, client_ip_address, sizeof(conn->client_ip_address) - 1);
+    }
+    conn->client_port = client_port;
+    if (server_host_name && server_host_name[0]) {
+        strncpy(conn->server_host_name, server_host_name, sizeof(conn->server_host_name) - 1);
+    }
+    if (server_ip_address && server_ip_address[0]) {
+        strncpy(conn->server_ip_address, server_ip_address, sizeof(conn->server_ip_address) - 1);
+    }
+    conn->server_port = server_port;
+
+    LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
+    conn->state = STATE_CONNECTING;
+
+    // Resolve hostname to IP upfront — use the IP for both TCP connect and TLS handshake.
+    // This ensures domain names are treated identically to IPs throughout the protocol.
+    char resolved_ip[64];
+    if (resolve_hostname(host, resolved_ip, sizeof(resolved_ip)) != 0) {
+        LOGE("Failed to resolve hostname: %s", host);
+        conn->state = STATE_DISCONNECTED;
+        return ERR_TCP_CONNECT;
+    }
+    const char* connect_host = resolved_ip;
+
     // Store server info
     strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
-    
-    // Store hub name
-    if (hub_name != NULL && hub_name[0] != '\0') {
-        strncpy(conn->hub_name, hub_name, sizeof(conn->hub_name) - 1);
-    } else {
-        strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
-    }
-
-    // Create socket and connect
-    softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
-    if (sock == NULL) {
-        LOGE("Failed to create socket");
-        conn->state = STATE_DISCONNECTED;
-        return ERR_TCP_CONNECT;
-    }
-
-    // Connect to server using resolved IP
-    if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
-        LOGE("Failed to connect to server");
-        socket_destroy(sock);
-        conn->state = STATE_DISCONNECTED;
-        return ERR_TCP_CONNECT;
-    }
-
-    conn->socket_fd = sock->fd;
-    // Keep the socket fd, destroy the wrapper
-    sock->fd = -1;
-    socket_destroy(sock);
-
-    // Perform TLS handshake using resolved IP (not domain) — avoids domain-SNI rejection
-    int result = perform_tls_handshake(conn, connect_host);
-    if (result != ERR_NONE) {
-        LOGE("TLS handshake failed");
-        close(conn->socket_fd);
-        conn->socket_fd = -1;
-        conn->state = STATE_DISCONNECTED;
-        return result;
-    }
 
     // ---- SoftEther Protocol: Step 1 ----
     // POST /vpnsvc/connect.cgi with "VPNCONNECT" watermark.

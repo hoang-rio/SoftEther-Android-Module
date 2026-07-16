@@ -1,5 +1,6 @@
 package vn.unlimit.softether.controller
 
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.CancellationException
@@ -12,14 +13,19 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import vn.unlimit.softether.BuildConfig
 import vn.unlimit.softether.SoftEtherVpnService
 import vn.unlimit.softether.SoftEtherTrafficSnapshot
 import vn.unlimit.softether.client.SoftEtherClient
 import vn.unlimit.softether.client.protocol.KeepAliveManager
 import vn.unlimit.softether.client.protocol.PacketHandler
+import vn.unlimit.softether.model.ClientInfo
 import vn.unlimit.softether.model.ConnectionConfig
 import vn.unlimit.softether.model.ConnectionState
 import vn.unlimit.softether.terminal.TunTerminal
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -175,6 +181,66 @@ class ConnectionController(
     }
 
     /**
+     * Build client info for reporting to server
+     */
+    private fun buildClientInfo(rudpPort: Int): ClientInfo {
+        val productName = BuildConfig.FLAVOR == "pro" 
+            ? "VPN Gate Connector Pro" 
+            : "VPN Gate Connector"
+        
+        // Get local non-loopback IP
+        var clientIp = "0.0.0.0"
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        clientIp = addr.hostAddress
+                        break
+                    }
+                }
+                if (clientIp != "0.0.0.0") break
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get local IP", e)
+        }
+        
+        // Get hostname
+        var hostName = ""
+        try {
+            hostName = java.net.InetAddress.getLocalHost().hostName
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get hostname", e)
+        }
+        
+        // Resolve server IP
+        var serverIp = "0.0.0.0"
+        try {
+            serverIp = java.net.InetAddress.getByName(config.serverHost).hostAddress
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to resolve server IP", e)
+        }
+        
+        return ClientInfo(
+            productName = productName,
+            productVersion = BuildConfig.VERSION_NAME,
+            productBuild = BuildConfig.VERSION_CODE,
+            osName = "${Build.MANUFACTURER} ${Build.MODEL}",
+            osVersion = Build.VERSION.RELEASE,
+            osProductId = Build.FINGERPRINT,
+            hostName = hostName,
+            clientIpAddress = clientIp,
+            clientPort = rudpPort,
+            serverHostName = config.serverHost,
+            serverIpAddress = serverIp,
+            serverPort = config.serverPort
+        )
+    }
+
+    /**
      * Perform actual connection
      */
     private suspend fun performConnect() {
@@ -216,6 +282,8 @@ class ConnectionController(
             client.nativeSetAuthType(nativeHandle, authTypeInt)
         }
         startNativeStateMonitor()
+        // Build client info (rudpPort will be filled in by native code during RUDP init)
+        val clientInfo = buildClientInfo(0)
         val result = try {
             client.nativeConnectWithHub(
                 nativeHandle,
@@ -224,7 +292,19 @@ class ConnectionController(
                 config.username,
                 config.password,
                 hubName,
-                config.useTcp
+                config.useTcp,
+                clientInfo.productName,
+                clientInfo.productVersion,
+                clientInfo.productBuild,
+                clientInfo.osName,
+                clientInfo.osVersion,
+                clientInfo.osProductId,
+                clientInfo.hostName,
+                clientInfo.clientIpAddress,
+                clientInfo.clientPort,
+                clientInfo.serverHostName,
+                clientInfo.serverIpAddress,
+                clientInfo.serverPort
             )
         } finally {
             stopNativeStateMonitor()

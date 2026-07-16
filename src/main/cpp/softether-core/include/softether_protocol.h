@@ -108,6 +108,19 @@ typedef struct softether_connection {
     char rudp_server_ip[64];
     uint16_t rudp_server_port;
     int rudp_version;
+    // Client info for server session list
+    char client_product_name[128];
+    char client_product_version[32];
+    int client_product_build;
+    char client_os_name[128];
+    char client_os_version[64];
+    char client_os_product_id[128];
+    char client_host_name[128];
+    char client_ip_address[64];
+    int client_port;
+    char server_host_name[128];
+    char server_ip_address[64];
+    int server_port;
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     // Callbacks
@@ -126,7 +139,11 @@ int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password);
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
                                const char* username, const char* password, const char* hub_name,
-                               int use_tcp);
+                               int use_tcp,
+                               const char* client_product_name, const char* client_product_version, int client_product_build,
+                               const char* client_os_name, const char* client_os_version, const char* client_os_product_id,
+                               const char* client_host_name, const char* client_ip_address, int client_port,
+                               const char* server_host_name, const char* server_ip_address, int server_port);
 void softether_disconnect(softether_connection_t* conn);
 
 // State management

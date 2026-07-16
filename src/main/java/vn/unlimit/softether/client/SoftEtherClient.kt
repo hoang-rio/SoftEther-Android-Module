@@ -216,7 +216,19 @@ class SoftEtherClient {
         username: String,
         password: String,
         hubName: String,
-        useTcp: Boolean = true
+        useTcp: Boolean,
+        clientProductName: String,
+        clientVersion: String,
+        clientBuild: Int,
+        clientOsName: String,
+        clientOsVersion: String,
+        clientOsProductId: String,
+        clientHostName: String,
+        clientIpAddress: String,
+        clientPort: Int,
+        serverHostName: String,
+        serverIpAddress: String,
+        serverPort: Int
     ): Int
     external fun nativeDisconnect(handle: Long)
     external fun nativeGetState(handle: Long): Int
@@ -224,6 +236,7 @@ class SoftEtherClient {
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
     external fun nativeGetSocketFd(handle: Long): Int
+    external fun nativeGetRudpSocketFd(handle: Long): Int
     external fun nativeDoDhcp(handle: Long): IntArray?
     external fun nativeSetAuthType(handle: Long, authType: Int)
 
