@@ -1291,6 +1291,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                                const char* client_os_name, const char* client_os_version, const char* client_os_product_id,
                                const char* client_host_name, const char* client_ip_address, int client_port,
                                const char* server_host_name, const char* server_ip_address, int server_port) {
+    int result;
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
