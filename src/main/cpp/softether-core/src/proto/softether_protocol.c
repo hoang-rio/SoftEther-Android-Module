@@ -1331,11 +1331,14 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
     conn->server_port_reported = server_port;
 
-    LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
-    conn->state = STATE_CONNECTING;
+    // Store hub name
+    if (hub_name != NULL && hub_name[0] != '\0') {
+        strncpy(conn->hub_name, hub_name, sizeof(conn->hub_name) - 1);
+    } else {
+        strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
+    }
 
     // Resolve hostname to IP upfront — use the IP for both TCP connect and TLS handshake.
-    // This ensures domain names are treated identically to IPs throughout the protocol.
     char resolved_ip[64];
     if (resolve_hostname(host, resolved_ip, sizeof(resolved_ip)) != 0) {
         LOGE("Failed to resolve hostname: %s", host);
@@ -1347,6 +1350,35 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // Store server info
     strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
+
+    // Create TCP socket and connect
+    softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
+    if (sock == NULL) {
+        LOGE("Failed to create socket");
+        conn->state = STATE_DISCONNECTED;
+        return ERR_TCP_CONNECT;
+    }
+
+    if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
+        LOGE("Failed to connect to server");
+        socket_destroy(sock);
+        conn->state = STATE_DISCONNECTED;
+        return ERR_TCP_CONNECT;
+    }
+
+    conn->socket_fd = sock->fd;
+    sock->fd = -1;
+    socket_destroy(sock);
+
+    // TLS handshake
+    int result = perform_tls_handshake(conn, connect_host);
+    if (result != ERR_NONE) {
+        LOGE("TLS handshake failed");
+        close(conn->socket_fd);
+        conn->socket_fd = -1;
+        conn->state = STATE_DISCONNECTED;
+        return result;
+    }
 
     // ---- SoftEther Protocol: Step 1 ----
     // POST /vpnsvc/connect.cgi with "VPNCONNECT" watermark.
