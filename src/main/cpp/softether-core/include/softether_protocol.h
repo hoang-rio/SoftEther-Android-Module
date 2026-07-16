@@ -120,7 +120,7 @@ typedef struct softether_connection {
     int client_port;
     char server_host_name[128];
     char server_ip_address[64];
-    int server_port;
+    int server_port_reported;
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     // Callbacks

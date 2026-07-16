@@ -629,7 +629,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "ClientPort", (uint32_t)conn->client_port);
     pack_add_str(&p, "ServerHostName", conn->server_host_name);
     pack_add_str(&p, "ServerIpAddress", conn->server_ip_address);
-    pack_add_int(&p, "ServerPort", (uint32_t)conn->server_port);
+    pack_add_int(&p, "ServerPort", (uint32_t)conn->server_port_reported);
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
@@ -1277,7 +1277,10 @@ static int perform_authentication_http(softether_connection_t* conn,
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
-    return softether_connect_with_hub(conn, host, port, username, password, "vpngate", 1);
+    return softether_connect_with_hub(conn, host, port, username, password, "vpngate", 1,
+        "", "", 0, "", "", "",
+        "", "", 0,
+        "", "", 0);
 }
 
 // Connect with HubName
@@ -1335,7 +1338,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     if (server_ip_address && server_ip_address[0]) {
         strncpy(conn->server_ip_address, server_ip_address, sizeof(conn->server_ip_address) - 1);
     }
-    conn->server_port = server_port;
+    conn->server_port_reported = server_port;
 
     LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
     conn->state = STATE_CONNECTING;
@@ -1979,5 +1982,8 @@ int softether_reconnect(softether_connection_t* conn) {
 
     // Attempt reconnection with stored credentials (use TCP to be safe on reconnect)
     return softether_connect_with_hub(conn, conn->server_ip, conn->server_port,
-                                      conn->username, conn->password, conn->hub_name, 1);
+                                      conn->username, conn->password, conn->hub_name, 1,
+        "", "", 0, "", "", "",
+        "", "", 0,
+        "", "", 0);
 }
