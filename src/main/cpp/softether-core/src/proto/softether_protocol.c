@@ -1298,16 +1298,6 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
     conn->state = STATE_CONNECTING;
 
-    // Resolve hostname to IP upfront — use the IP for both TCP connect and TLS handshake.
-    // This ensures domain names are treated identically to IPs throughout the protocol.
-    char resolved_ip[64];
-    if (resolve_hostname(host, resolved_ip, sizeof(resolved_ip)) != 0) {
-        LOGE("Failed to resolve hostname: %s", host);
-        conn->state = STATE_DISCONNECTED;
-        return ERR_TCP_CONNECT;
-    }
-    const char* connect_host = resolved_ip;
-
     // Store client info for login PACK
     if (client_product_name && client_product_name[0]) {
         strncpy(conn->client_product_name, client_product_name, sizeof(conn->client_product_name) - 1);
