@@ -184,9 +184,9 @@ class ConnectionController(
      * Build client info for reporting to server
      */
     private fun buildClientInfo(rudpPort: Int): ClientInfo {
-        val productName = BuildConfig.FLAVOR == "pro" 
-            ? "VPN Gate Connector Pro" 
-            : "VPN Gate Connector"
+        val productName = if (BuildConfig.FLAVOR == "pro") 
+            "VPN Gate Connector Pro" 
+            else "VPN Gate Connector"
         
         // Get local non-loopback IP
         var clientIp = "0.0.0.0"
@@ -674,7 +674,11 @@ class ConnectionController(
                 config.username,
                 config.password,
                 hubName,
-                config.useTcp
+                config.useTcp,
+                "", "", 0, // client info placeholders for reconnection
+                "", "", "",
+                "", "",
+                0, "", "", 0
             )
 
             if (result != 0) {

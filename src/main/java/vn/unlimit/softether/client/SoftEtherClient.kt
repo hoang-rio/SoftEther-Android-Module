@@ -88,7 +88,8 @@ class SoftEtherClient {
         }
 
         // Connect to server with hub name
-        val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName)
+        val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName,
+            false, "", "", 0, "", "", "", "", "", 0, "", "", 0)
 
         if (result != SoftEtherError.ERR_NONE) {
             nativeDestroy(nativeHandle)
