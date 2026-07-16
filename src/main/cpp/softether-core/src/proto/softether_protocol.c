@@ -269,13 +269,17 @@ static int parse_server_hello(const uint8_t* body, uint32_t body_len, server_hel
 }
 
 // PACK serialization helpers
-// NOTE: SoftEther PACK format (from Pack.c / Memory.c in original source):
-//   Element NAME:  WriteBufStr → uint32(strlen+1) + strlen bytes (no null)
-//   INT value:     uint32 big-endian
-//   STR value:     uint32(strlen) + strlen bytes (no null)  [note: no +1]
-//   DATA value:    uint32(size) + size bytes
+// Verified against official SoftEther source (Pack.c, Memory.c):
+//   Element names:  WriteBufStr → uint32(strlen+1) + strlen bytes (no null)
+//   Element type:   WriteBufInt  → uint32 big-endian (via Endian32)
+//   Num values:     WriteBufInt  → uint32 big-endian
+//   INT value:      WriteBufInt  → uint32 big-endian (via Endian32)
+//   STR value:      WriteBufInt(strlen) + strlen bytes (no null) — WriteValue for VALUE_STR
+//   DATA value:     WriteBufInt(size) + size bytes
+// IMPORTANT: WriteBufInt/ReadBufInt both use Endian32() which converts to/from
+// network byte order (big-endian) regardless of host platform.
 
-// Write big-endian uint32
+// Write big-endian uint32 (matching Endian32)
 static void pack_write_uint32(uint8_t** buf, uint32_t val) {
     (*buf)[0] = (val >> 24) & 0xFF;
     (*buf)[1] = (val >> 16) & 0xFF;
