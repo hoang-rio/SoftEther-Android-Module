@@ -21,12 +21,12 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // PACK serialization types
-// SoftEther PACK element types (from Pack.h VALUE_* constants)
+// VPNGate server PACK element types (from Pack.h VALUE_* constants)
 #define PACK_TYPE_INT      0    // VALUE_INT
-#define PACK_TYPE_INT64    1    // VALUE_INT64
-#define PACK_TYPE_DATA     2    // VALUE_DATA
-#define PACK_TYPE_STR      3    // VALUE_STR
-#define PACK_TYPE_UNISTR   4    // VALUE_UNISTR
+#define PACK_TYPE_DATA     1    // VALUE_DATA
+#define PACK_TYPE_STR      2    // VALUE_STR
+#define PACK_TYPE_UNISTR   3    // VALUE_UNISTR
+#define PACK_TYPE_INT64    4    // VALUE_INT64
 
 #define SHA1_SIZE 20
 
