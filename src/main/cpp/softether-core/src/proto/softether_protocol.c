@@ -30,6 +30,12 @@
 
 #define SHA1_SIZE 20
 
+// SoftEther NODE_INFO stores int fields in big-endian byte order via Endian32().
+// On little-endian ARM, Endian32 = byte-swap. We need the same for NODE_INFO fields.
+static uint32_t softether_endian32(uint32_t x) {
+    return __builtin_bswap32(x);
+}
+
 // Server Hello information extracted from PACK
 typedef struct {
     uint32_t version;
@@ -558,19 +564,23 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_INT_SZ("qos");
     size += PACK_DATA_SZ("pencore", pencore_size);
 
-    // Client info fields (always sent for server session list)
+    // Client info fields (reported in server session list)
+    // Server reads via InRpcNodeInfo which expects:
+    //   STR fields: ClientProductName, ClientOsName, ClientOsVer, ClientOsProductId, ClientHostname, ServerHostname, HubName
+    //   INT fields (Endian32'd): ClientProductVer, ClientProductBuild, ClientPort, ServerPort2
+    //   IP fields (as INT via PackAddIp32): ClientIpAddress, ServerIpAddress
     num_elems += 12;
     size += PACK_STR_SZ("ClientProductName", conn->client_product_name);
     size += PACK_INT_SZ("ClientProductVer");
     size += PACK_INT_SZ("ClientProductBuild");
     size += PACK_STR_SZ("ClientOsName", conn->client_os_name);
-    size += PACK_STR_SZ("ClientOsVersion", conn->client_os_version);
+    size += PACK_STR_SZ("ClientOsVer", conn->client_os_version);
     size += PACK_STR_SZ("ClientOsProductId", conn->client_os_product_id);
-    size += PACK_STR_SZ("ClientHostName", conn->client_host_name);
-    size += PACK_STR_SZ("ClientIpAddress", conn->client_ip_address);
+    size += PACK_STR_SZ("ClientHostname", conn->client_host_name);
+    size += PACK_INT_SZ("ClientIpAddress");
     size += PACK_INT_SZ("ClientPort");
-    size += PACK_STR_SZ("ServerHostName", conn->server_host_name);
-    size += PACK_STR_SZ("ServerIpAddress", conn->server_ip_address);
+    size += PACK_STR_SZ("ServerHostname", conn->server_host_name);
+    size += PACK_INT_SZ("ServerIpAddress");
     size += PACK_INT_SZ("ServerPort2");
 
     // RUDP-related fields (only sent when RUDP mode is active)
@@ -631,14 +641,21 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_data(&p, "pencore", pencore_data, pencore_size);
 
     // Client info fields (reported in server session list)
+    // InRpcNodeInfo expects NODE_INFO int fields pre-Endian32'd (big-endian as native uint),
+    // because the display code applies Endian32() to convert back to actual values.
     pack_add_str(&p, "ClientProductName", conn->client_product_name);
-    pack_add_int(&p, "ClientProductVer", client_product_ver_int);
-    pack_add_int(&p, "ClientProductBuild", (uint32_t)conn->client_product_build);
+    pack_add_int(&p, "ClientProductVer", softether_endian32(client_product_ver_int));
+    pack_add_int(&p, "ClientProductBuild", softether_endian32((uint32_t)conn->client_product_build));
     pack_add_str(&p, "ClientOsName", conn->client_os_name);
-    pack_add_str(&p, "ClientOsVersion", conn->client_os_version);
+    pack_add_str(&p, "ClientOsVer", conn->client_os_version);
     pack_add_str(&p, "ClientOsProductId", conn->client_os_product_id);
-    pack_add_str(&p, "ClientHostName", conn->client_host_name);
-    pack_add_str(&p, "ClientIpAddress", conn->client_ip_address);
+    pack_add_str(&p, "ClientHostname", conn->client_host_name);
+    // ClientIpAddress: PackGetIp32 reads INT, stores as UINT via inet_addr
+    uint32_t client_ip_uint = 0;
+    if (conn->client_ip_address[0]) {
+        client_ip_uint = (uint32_t)inet_addr(conn->client_ip_address);
+    }
+    pack_add_int(&p, "ClientIpAddress", client_ip_uint);
     // Get actual local port from connected socket (like original SoftEther: c->FirstSock->LocalPort)
     uint32_t client_port = (uint32_t)conn->client_port;
     if (client_port == 0 && conn->socket_fd >= 0) {
@@ -648,10 +665,15 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
             client_port = ntohs(local_addr.sin_port);
         }
     }
-    pack_add_int(&p, "ClientPort", client_port);
-    pack_add_str(&p, "ServerHostName", conn->server_host_name);
-    pack_add_str(&p, "ServerIpAddress", conn->server_ip_address);
-    pack_add_int(&p, "ServerPort2", (uint32_t)conn->server_port_reported);
+    pack_add_int(&p, "ClientPort", softether_endian32(client_port));
+    pack_add_str(&p, "ServerHostname", conn->server_host_name);
+    // ServerIpAddress: same format as ClientIpAddress
+    uint32_t server_ip_uint = 0;
+    if (conn->server_ip_address[0]) {
+        server_ip_uint = (uint32_t)inet_addr(conn->server_ip_address);
+    }
+    pack_add_int(&p, "ServerIpAddress", server_ip_uint);
+    pack_add_int(&p, "ServerPort2", softether_endian32((uint32_t)conn->server_port_reported));
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
