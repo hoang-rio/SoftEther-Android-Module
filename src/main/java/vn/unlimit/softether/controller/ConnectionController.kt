@@ -355,6 +355,16 @@ class ConnectionController(
             Log.e(TAG, "Invalid socket fd, cannot protect")
         }
 
+        // Also protect RUDP UDP socket from routing through TUN (prevents RUDP routing loop)
+        val rudpFd = client.nativeGetRudpSocketFd(nativeHandle)
+        if (rudpFd >= 0) {
+            if (!service.protect(rudpFd)) {
+                Log.e(TAG, "Failed to protect RUDP socket fd=$rudpFd")
+            } else {
+                Log.d(TAG, "RUDP socket fd=$rudpFd protected from TUN routing")
+            }
+        }
+
         // Perform DHCP over the SoftEther tunnel to get IP configuration
         Log.d(TAG, "Starting DHCP over SoftEther tunnel...")
         val dhcpResult = client.doDhcp(nativeHandle)
