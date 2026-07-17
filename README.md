@@ -7,11 +7,11 @@ SoftEther-Android-Module for [vpngate-connector](https://github.com/hoang-rio/vp
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | 🚧 Planned |
+| UDP (SoftEther RUDP) | 🔄 In Progress |
 
 **TCP** is the only currently supported transport. It connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
 
-**UDP (RUDP)** support is planned for a future release. The SoftEther RUDP transport requires a full reliable-UDP layer including NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures (~5000+ lines in the reference implementation). See the [RUDP Implementation Plan](RUDP_IMPLEMENTATION_PLAN.md) for details.
+**UDP (RUDP)** support is currently in progress. The SoftEther RUDP transport requires a full reliable-UDP layer including NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures (~5000+ lines in the reference implementation). See the [RUDP Implementation Plan](RUDP_IMPLEMENTATION_PLAN.md) for details.
 
 # Implementation Status
 
