@@ -1859,15 +1859,19 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
-    // Try RUDP if active
+    // Try RUDP if active and channel is established (server has responded)
     if (conn->rudp && conn->rudp_enabled) {
         rudp_poll(conn->rudp);
-        int r = rudp_send(conn->rudp, data, data_len, 0);
-        if (r > 0) {
-            LOGD("Sent data block via RUDP: %u bytes", data_len);
-            return (int)data_len;
+        if (!rudp_is_active(conn->rudp)) {
+            LOGW("RUDP channel not established yet, falling back to TCP");
+        } else {
+            int r = rudp_send(conn->rudp, data, data_len, 0);
+            if (r > 0) {
+                LOGD("Sent data block via RUDP: %u bytes", data_len);
+                return (int)data_len;
+            }
+            LOGW("RUDP send failed (%d), falling back to TCP", r);
         }
-        LOGW("RUDP send failed (%d), falling back to TCP", r);
     }
 
     // Fall back to TCP

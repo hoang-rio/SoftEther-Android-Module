@@ -428,12 +428,14 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     int ssl_pending = conn->use_ssl_data ? ssl_has_pending((ssl_context_t*)conn->ssl) : 0;
 
     if (ssl_pending <= 0) {
-        // No SSL-buffered data — poll the underlying socket with short timeout
+        // No SSL-buffered data — poll the underlying socket
+        // Use shorter timeout when RUDP is active (TCP only carries control messages)
+        int tcp_timeout_ms = (conn->rudp && conn->rudp_enabled) ? 5 : 50;
         struct pollfd pfd;
         pfd.fd = conn->socket_fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        int poll_ret = poll(&pfd, 1, 50);  // 50ms poll timeout
+        int poll_ret = poll(&pfd, 1, tcp_timeout_ms);
         if (poll_ret == 0) {
             return 0;  // No data available — normal timeout
         }
