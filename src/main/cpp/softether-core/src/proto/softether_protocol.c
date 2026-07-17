@@ -1859,12 +1859,14 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
-    // Try RUDP if active and channel is established (server has responded)
+    // Try RUDP if active
     if (conn->rudp && conn->rudp_enabled) {
         rudp_poll(conn->rudp);
-        if (!rudp_is_active(conn->rudp)) {
-            LOGW("RUDP channel not established yet, falling back to TCP");
-        } else {
+
+        // Use check_keepalive=0 for initial data (DHCP), check_keepalive=1 for VPN data
+        // This allows initial packets through while waiting for server to be ready for VPN data
+        int check_keepalive = conn->session_established ? 1 : 0;
+        if (rudp_is_send_ready(conn->rudp, check_keepalive)) {
             int r = rudp_send(conn->rudp, data, data_len, 0);
             if (r > 0) {
                 LOGD("Sent data block via RUDP: %u bytes", data_len);
