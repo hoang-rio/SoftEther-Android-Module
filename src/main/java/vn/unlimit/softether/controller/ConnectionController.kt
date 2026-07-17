@@ -187,17 +187,19 @@ class ConnectionController(
         var clientIp = "0.0.0.0"
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val iface = interfaces.nextElement()
-                val addresses = iface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        clientIp = addr.hostAddress
-                        break
+            if (interfaces != null) {
+                while (interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    val addresses = iface.inetAddresses
+                    while (addresses.hasMoreElements()) {
+                        val addr = addresses.nextElement()
+                        if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                            clientIp = addr.hostAddress
+                            break
+                        }
                     }
+                    if (clientIp != "0.0.0.0") break
                 }
-                if (clientIp != "0.0.0.0") break
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to get local IP", e)
@@ -214,16 +216,18 @@ class ConnectionController(
         // Resolve server IP
         var serverIp = "0.0.0.0"
         try {
-            serverIp = java.net.InetAddress.getByName(config.serverHost).hostAddress
+            serverIp = java.net.InetAddress.getByName(config.serverHost).hostAddress ?: "0.0.0.0"
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to resolve server IP", e)
+            Log.w(TAG, "Failed to resolve server IP for ${config.serverHost}", e)
         }
+        
+        Log.d(TAG, "Client IP: $clientIp, Server IP: $serverIp, Port: ${config.serverPort}")
         
         return ClientInfo(
             productName = config.clientProductName,
             productVersion = config.clientVersion,
             productBuild = config.clientBuild,
-            osName = "${Build.MANUFACTURER} ${Build.MODEL}",
+            osName = "Android",
             osVersion = Build.VERSION.RELEASE,
             osProductId = Build.FINGERPRINT,
             hostName = hostName,

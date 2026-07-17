@@ -76,7 +76,7 @@ object ClientInfoFactory {
             productName = productName,
             productVersion = productVersion,
             productBuild = productBuild,
-            osName = "${Build.MANUFACTURER} ${Build.MODEL}",
+            osName = "Android",
             osVersion = Build.VERSION.RELEASE,
             osProductId = Build.FINGERPRINT,
             hostName = hostName,

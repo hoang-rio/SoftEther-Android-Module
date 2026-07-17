@@ -23,10 +23,10 @@
 // PACK serialization types
 // SoftEther PACK element types (from Pack.h VALUE_* constants)
 #define PACK_TYPE_INT      0    // VALUE_INT
-#define PACK_TYPE_DATA     1    // VALUE_DATA
-#define PACK_TYPE_STR      2    // VALUE_STR
-#define PACK_TYPE_UNISTR   3    // VALUE_UNISTR
-#define PACK_TYPE_INT64    4    // VALUE_INT64
+#define PACK_TYPE_INT64    1    // VALUE_INT64
+#define PACK_TYPE_DATA     2    // VALUE_DATA
+#define PACK_TYPE_STR      3    // VALUE_STR
+#define PACK_TYPE_UNISTR   4    // VALUE_UNISTR
 
 #define SHA1_SIZE 20
 
@@ -501,6 +501,15 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     const uint32_t client_ver = 420;
     const uint32_t client_build = 9699;
 
+    // Parse product version string (e.g. "2.3.2") into int for ClientProductVer
+    // Server displays as "%u.%02u" = val/100 . val%100, so "2.3.2" → 232 → displays "2.32"
+    uint32_t client_product_ver_int = 0;
+    if (conn->client_product_version[0]) {
+        int major = 0, minor = 0, patch = 0;
+        sscanf(conn->client_product_version, "%d.%d.%d", &major, &minor, &patch);
+        client_product_ver_int = (uint32_t)(major * 100 + minor * 10 + patch);
+    }
+
     // Generate a dummy "pencore" random data (matching CreateDummyValue)
     uint32_t pencore_size = (uint32_t)(rand() % 1000);  // HTTP_PACK_RAND_SIZE_MAX
     uint8_t* pencore_data = (uint8_t*)malloc(pencore_size > 0 ? pencore_size : 1);
@@ -552,7 +561,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     // Client info fields (always sent for server session list)
     num_elems += 12;
     size += PACK_STR_SZ("ClientProductName", conn->client_product_name);
-    size += PACK_STR_SZ("ClientProductVer", conn->client_product_version);
+    size += PACK_INT_SZ("ClientProductVer");
     size += PACK_INT_SZ("ClientProductBuild");
     size += PACK_STR_SZ("ClientOsName", conn->client_os_name);
     size += PACK_STR_SZ("ClientOsVersion", conn->client_os_version);
@@ -562,7 +571,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_INT_SZ("ClientPort");
     size += PACK_STR_SZ("ServerHostName", conn->server_host_name);
     size += PACK_STR_SZ("ServerIpAddress", conn->server_ip_address);
-    size += PACK_INT_SZ("ServerPort");
+    size += PACK_INT_SZ("ServerPort2");
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
@@ -623,17 +632,26 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
 
     // Client info fields (reported in server session list)
     pack_add_str(&p, "ClientProductName", conn->client_product_name);
-    pack_add_str(&p, "ClientProductVer", conn->client_product_version);
+    pack_add_int(&p, "ClientProductVer", client_product_ver_int);
     pack_add_int(&p, "ClientProductBuild", (uint32_t)conn->client_product_build);
     pack_add_str(&p, "ClientOsName", conn->client_os_name);
     pack_add_str(&p, "ClientOsVersion", conn->client_os_version);
     pack_add_str(&p, "ClientOsProductId", conn->client_os_product_id);
     pack_add_str(&p, "ClientHostName", conn->client_host_name);
     pack_add_str(&p, "ClientIpAddress", conn->client_ip_address);
-    pack_add_int(&p, "ClientPort", (uint32_t)conn->client_port);
+    // Get actual local port from connected socket (like original SoftEther: c->FirstSock->LocalPort)
+    uint32_t client_port = (uint32_t)conn->client_port;
+    if (client_port == 0 && conn->socket_fd >= 0) {
+        struct sockaddr_in local_addr;
+        socklen_t addr_len = sizeof(local_addr);
+        if (getsockname(conn->socket_fd, (struct sockaddr*)&local_addr, &addr_len) == 0) {
+            client_port = ntohs(local_addr.sin_port);
+        }
+    }
+    pack_add_int(&p, "ClientPort", client_port);
     pack_add_str(&p, "ServerHostName", conn->server_host_name);
     pack_add_str(&p, "ServerIpAddress", conn->server_ip_address);
-    pack_add_int(&p, "ServerPort", (uint32_t)conn->server_port_reported);
+    pack_add_int(&p, "ServerPort2", (uint32_t)conn->server_port_reported);
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
