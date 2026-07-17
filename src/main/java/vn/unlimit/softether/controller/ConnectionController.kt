@@ -676,6 +676,7 @@ class ConnectionController(
                 }
                 client.nativeSetAuthType(nativeHandle, authTypeInt)
             }
+            val reconnectClientInfo = buildClientInfo(0)
             val result = client.nativeConnectWithHub(
                 nativeHandle,
                 config.serverHost,
@@ -684,10 +685,10 @@ class ConnectionController(
                 config.password,
                 hubName,
                 config.useTcp,
-                "", "", 0, // client info placeholders for reconnection
-                "", "", "",
-                "", "",
-                0, "", "", 0
+                reconnectClientInfo.productName, reconnectClientInfo.productVersion, reconnectClientInfo.productBuild,
+                reconnectClientInfo.osName, reconnectClientInfo.osVersion, reconnectClientInfo.osProductId,
+                reconnectClientInfo.hostName, reconnectClientInfo.clientIpAddress, reconnectClientInfo.clientPort,
+                reconnectClientInfo.serverHostName, reconnectClientInfo.serverIpAddress, reconnectClientInfo.serverPort
             )
 
             if (result != 0) {

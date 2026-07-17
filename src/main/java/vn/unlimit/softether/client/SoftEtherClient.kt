@@ -87,9 +87,27 @@ class SoftEtherClient {
             nativeSetAuthType(nativeHandle, authTypeInt)
         }
 
+        // Build client info for server session list
+        val clientInfo = vn.unlimit.softether.model.ClientInfoFactory.build(
+            productName = "SoftEther VPN Client for Android",
+            productVersion = "2.3.2",
+            productBuild = 132,
+            config = vn.unlimit.softether.model.ConnectionConfig(
+                serverHost = host,
+                serverPort = port,
+                username = username,
+                password = password,
+                virtualHub = hubName
+            )
+        )
+
         // Connect to server with hub name
         val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName,
-            false, "", "", 0, "", "", "", "", "", 0, "", "", 0)
+            false,
+            clientInfo.productName, clientInfo.productVersion, clientInfo.productBuild,
+            clientInfo.osName, clientInfo.osVersion, clientInfo.osProductId,
+            clientInfo.hostName, clientInfo.clientIpAddress, clientInfo.clientPort,
+            clientInfo.serverHostName, clientInfo.serverIpAddress, clientInfo.serverPort)
 
         if (result != SoftEtherError.ERR_NONE) {
             nativeDestroy(nativeHandle)
