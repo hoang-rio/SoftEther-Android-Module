@@ -576,10 +576,10 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_STR_SZ("ClientOsName", conn->client_os_name);
     size += PACK_STR_SZ("ClientOsVer", conn->client_os_version);
     size += PACK_STR_SZ("ClientOsProductId", conn->client_os_product_id);
-    size += PACK_STR_SZ("ClientHostname", conn->client_host_name);
+    size += PACK_STR_SZ("ClientHostName", conn->client_host_name);
     size += PACK_INT_SZ("ClientIpAddress");
     size += PACK_INT_SZ("ClientPort");
-    size += PACK_STR_SZ("ServerHostname", conn->server_host_name);
+    size += PACK_STR_SZ("ServerHostName", conn->server_host_name);
     size += PACK_INT_SZ("ServerIpAddress");
     size += PACK_INT_SZ("ServerPort2");
 
@@ -649,7 +649,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_str(&p, "ClientOsName", conn->client_os_name);
     pack_add_str(&p, "ClientOsVer", conn->client_os_version);
     pack_add_str(&p, "ClientOsProductId", conn->client_os_product_id);
-    pack_add_str(&p, "ClientHostname", conn->client_host_name);
+    pack_add_str(&p, "ClientHostName", conn->client_host_name);
     // ClientIpAddress: PackGetIp32 reads INT, stores as UINT via inet_addr
     uint32_t client_ip_uint = 0;
     if (conn->client_ip_address[0]) {
@@ -666,7 +666,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         }
     }
     pack_add_int(&p, "ClientPort", softether_endian32(client_port));
-    pack_add_str(&p, "ServerHostname", conn->server_host_name);
+    pack_add_str(&p, "ServerHostName", conn->server_host_name);
     // ServerIpAddress: same format as ClientIpAddress
     uint32_t server_ip_uint = 0;
     if (conn->server_ip_address[0]) {
