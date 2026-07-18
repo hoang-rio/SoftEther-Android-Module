@@ -70,9 +70,11 @@ All core implementation phases are complete and stable:
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | 🚧 Planned (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
+| UDP (SoftEther RUDP) | ✅ V1 Working (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
 
-**TCP** is the only currently supported transport. UDP (RUDP) support is planned and requires implementing ~5000+ lines of reliable-UDP layer with NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures.
+**TCP** connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
+
+**UDP (RUDP) V1** is implemented and working. Data is transported via UDP with RC4 encryption, keepalive polling, and TCP fallback. V2 (ChaCha20-Poly1305 AEAD) is planned.
 
 ---
 
