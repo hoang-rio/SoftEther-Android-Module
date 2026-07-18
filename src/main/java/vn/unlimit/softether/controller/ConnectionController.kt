@@ -790,6 +790,20 @@ class ConnectionController(
 
         } catch (e: Exception) {
             Log.e(TAG, "Reconnection attempt failed", e)
+            // Clean up partial native state left by failed reconnect
+            if (nativeHandle != 0L) {
+                val handle = nativeHandle
+                nativeHandle = 0
+                try {
+                    client.nativeDisconnect(handle)
+                    client.nativeDestroy(handle)
+                } catch (ex: Exception) {
+                    Log.e(TAG, "Error cleaning up failed reconnect handle", ex)
+                }
+            }
+            // Transition to DISCONNECTED so the activity learns the connection is gone
+            currentState = ConnectionState.DISCONNECTED
+            onStateChange(ConnectionState.DISCONNECTED)
         } finally {
             isReconnecting.set(false)
         }
