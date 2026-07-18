@@ -78,23 +78,18 @@ class ConnectionController(
     private var tunTerminal: TunTerminal? = null
 
     /**
-     * Handle network connectivity changes
+     * Handle network connectivity changes.
+     * On network loss, do NOT destroy the connection — the data forwarding loops will
+     * detect send/receive errors and trigger attemptReconnect() automatically.
+     * Calling disconnect() or onError() here kills the scope permanently and makes
+     * reconnect impossible.
      */
     fun onNetworkChanged(isConnected: Boolean) {
         Log.d(TAG, "Network state changed: connected=$isConnected")
         isNetworkAvailable = isConnected
         
-        if (isConnected) {
-            // If we were in a "waiting" state (which we are removing), we would resume here.
-            // But since we are failing immediately on network loss, there is nothing to resume.
-            // The user must manually reconnect.
-        } else {
-            // Network lost - Fail immediately in all states
-            if (currentState != ConnectionState.DISCONNECTED && currentState != ConnectionState.ERROR) {
-                Log.w(TAG, "Network lost, forcing disconnect")
-                onError("Network connection lost")
-                disconnect()
-            }
+        if (!isConnected) {
+            Log.w(TAG, "Network lost — data loops will detect and attempt reconnect")
         }
     }
 
@@ -404,7 +399,8 @@ class ConnectionController(
     }
 
     /**
-     * Attempt to reconnect using stored credentials
+     * Attempt to reconnect using stored credentials.
+     * Fully disconnects, waits, then performs a fresh connect() with full lifecycle.
      */
     suspend fun reconnect(): Boolean {
         if (isReconnecting.getAndSet(true)) {
@@ -416,6 +412,8 @@ class ConnectionController(
             Log.d(TAG, "Attempting to reconnect...")
             disconnect()
             delay(RECONNECT_DELAY_MS)
+            // Reset isCancelled so connect() doesn't bail out immediately
+            isCancelled.set(false)
             connect()
             true
         } catch (e: Exception) {
@@ -479,8 +477,9 @@ class ConnectionController(
         }
         vpnInterface = null
 
-        // Cancel all coroutines
-        scope.cancel()
+        // Don't call scope.cancel() — it permanently kills the scope, making reconnect impossible.
+        // The isCancelled flag (set above) causes all data forwarding loops, keepalive,
+        // and statistics logging to exit naturally via their while-loop conditions.
 
         currentState = ConnectionState.DISCONNECTED
         Log.d(TAG, "VPN disconnected. Stats: sent=${bytesSent.get()} bytes (${packetsSent.get()} pkts), " +
@@ -534,7 +533,9 @@ class ConnectionController(
             onError = { error ->
                 Log.e(TAG, "TUN interface error", error)
                 if (!isCancelled.get()) {
-                    onError("TUN error: ${error.message}")
+                    // Don't call onError() here — it triggers stopVpn() in VpnService
+                    // which destroys everything. Instead, let attemptReconnect handle
+                    // the full lifecycle (tear down + reconnect + new TUN).
                     scope.launch { attemptReconnect() }
                 }
             }
@@ -623,29 +624,54 @@ class ConnectionController(
     }
 
     /**
-     * Attempt automatic reconnection if enabled and under max attempts
+     * Attempt automatic reconnection with full lifecycle:
+     * tear down old TUN/native → reconnect → DHCP → establish VPN interface → restart data forwarding
      */
     private suspend fun attemptReconnect() {
-        if (isCancelled.get() || isReconnecting.get()) {
+        if (isReconnecting.getAndSet(true)) {
+            Log.w(TAG, "Reconnection already in progress")
             return
         }
-
-        if (reconnectAttempts.incrementAndGet() >= MAX_RECONNECT_ATTEMPTS) {
-            Log.e(TAG, "Max reconnection attempts reached")
-            onError("Connection lost - max reconnection attempts reached")
-            disconnect()
-            return
-        }
-
-        Log.w(TAG, "Attempting automatic reconnection (${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS)")
 
         try {
-            // Disconnect current connection
+            if (reconnectAttempts.incrementAndGet() >= MAX_RECONNECT_ATTEMPTS) {
+                Log.e(TAG, "Max reconnection attempts reached")
+                onError("Connection lost - max reconnection attempts reached")
+                disconnect()
+                return
+            }
+
+            Log.w(TAG, "Attempting automatic reconnection (${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS)")
+
+            // Reset isCancelled so loops and subsequent operations can proceed
+            isCancelled.set(false)
+
+            // Tear down old data forwarding (stop TunTerminal to avoid reading from stale fd)
+            try {
+                tunTerminal?.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping TunTerminal during reconnect", e)
+            }
+            tunTerminal = null
+
+            // Close old VPN interface
+            try {
+                vpnInterface?.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing VPN interface during reconnect", e)
+            }
+            vpnInterface = null
+
+            // Disconnect old native handle
             if (nativeHandle != 0L) {
                 val handle = nativeHandle
-                nativeHandle = 0  // Clear handle first
-                client.nativeDisconnect(handle)
-                client.nativeDestroy(handle)
+                nativeHandle = 0
+                try {
+                    client.nativeDisconnect(handle)
+                    client.nativeDestroy(handle)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error disconnecting old native handle", e)
+                }
             }
 
             currentState = ConnectionState.CONNECTING
@@ -657,7 +683,7 @@ class ConnectionController(
                 return
             }
 
-            // Create new connection
+            // Create new native connection
             nativeHandle = client.nativeCreate()
             if (nativeHandle == 0L) {
                 throw Exception("Failed to create native connection for reconnect")
@@ -665,7 +691,7 @@ class ConnectionController(
 
             client.setTimeout(config.connectTimeoutMs)
 
-            // Use hub name for reconnection
+            // Set auth type
             val hubName = config.virtualHub.ifEmpty { "VPN" }
             if (config.authMethod != vn.unlimit.softether.model.AuthMethod.AUTO) {
                 val authTypeInt = when (config.authMethod) {
@@ -676,42 +702,96 @@ class ConnectionController(
                 }
                 client.nativeSetAuthType(nativeHandle, authTypeInt)
             }
+
+            // Connect to server (TLS + protocol + auth + session)
+            startNativeStateMonitor()
             val reconnectClientInfo = buildClientInfo(0)
-            val result = client.nativeConnectWithHub(
-                nativeHandle,
-                config.serverHost,
-                config.serverPort,
-                config.username,
-                config.password,
-                hubName,
-                config.useTcp,
-                reconnectClientInfo.productName, reconnectClientInfo.productVersion, reconnectClientInfo.productBuild,
-                reconnectClientInfo.osName, reconnectClientInfo.osVersion, reconnectClientInfo.osProductId,
-                reconnectClientInfo.hostName, reconnectClientInfo.clientIpAddress, reconnectClientInfo.clientPort,
-                reconnectClientInfo.serverHostName, reconnectClientInfo.serverIpAddress, reconnectClientInfo.serverPort
-            )
+            val result = try {
+                client.nativeConnectWithHub(
+                    nativeHandle,
+                    config.serverHost,
+                    config.serverPort,
+                    config.username,
+                    config.password,
+                    hubName,
+                    config.useTcp,
+                    reconnectClientInfo.productName, reconnectClientInfo.productVersion, reconnectClientInfo.productBuild,
+                    reconnectClientInfo.osName, reconnectClientInfo.osVersion, reconnectClientInfo.osProductId,
+                    reconnectClientInfo.hostName, reconnectClientInfo.clientIpAddress, reconnectClientInfo.clientPort,
+                    reconnectClientInfo.serverHostName, reconnectClientInfo.serverIpAddress, reconnectClientInfo.serverPort
+                )
+            } finally {
+                stopNativeStateMonitor()
+            }
 
             if (result != 0) {
                 throw Exception("Reconnection failed with error code: $result")
             }
 
-            // Protect socket during reconnect too
+            if (isCancelled.get()) {
+                val handle = nativeHandle
+                nativeHandle = 0
+                client.nativeDisconnect(handle)
+                client.nativeDestroy(handle)
+                return
+            }
+
+            // Protect VPN socket from routing through TUN
             val socketFd = client.nativeGetSocketFd(nativeHandle)
             if (socketFd >= 0) {
-                service.protect(socketFd)
+                if (!service.protect(socketFd)) {
+                    Log.e(TAG, "Failed to protect VPN socket fd=$socketFd during reconnect")
+                } else {
+                    Log.d(TAG, "VPN socket fd=$socketFd protected during reconnect")
+                }
             }
+
+            // Protect RUDP UDP socket
+            val rudpFd = client.nativeGetRudpSocketFd(nativeHandle)
+            if (rudpFd >= 0) {
+                if (!service.protect(rudpFd)) {
+                    Log.e(TAG, "Failed to protect RUDP socket fd=$rudpFd during reconnect")
+                } else {
+                    Log.d(TAG, "RUDP socket fd=$rudpFd protected during reconnect")
+                }
+            }
+
             client.externalHandle = nativeHandle
 
-            if (currentState != ConnectionState.CONNECTED) {
-                currentState = ConnectionState.CONNECTED
+            // Perform DHCP over the new tunnel
+            Log.d(TAG, "Starting DHCP over reconnected tunnel...")
+            val dhcpResult = client.doDhcp(nativeHandle)
+            if (dhcpResult != null) {
+                Log.d(TAG, "DHCP success on reconnect: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength}")
+                assignedLocalIp = dhcpResult.assignedIp
+                val dhcpConfig = config.copy(
+                    localAddress = dhcpResult.assignedIp,
+                    prefixLength = dhcpResult.prefixLength,
+                    dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
+                    secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
+                )
+                vpnInterface = service.establishVpnInterface(dhcpConfig)
+                    ?: throw Exception("Failed to establish VPN interface during reconnect")
+            } else {
+                Log.w(TAG, "DHCP failed on reconnect, falling back to hardcoded config")
+                assignedLocalIp = config.localAddress
+                vpnInterface = service.establishVpnInterface(config)
+                    ?: throw Exception("Failed to establish VPN interface during reconnect")
             }
+
+            // Transition to CONNECTED and restart data forwarding
+            currentState = ConnectionState.CONNECTED
             resetTrafficPublishing(publishSnapshot = true)
-            reconnectAttempts.set(0) // Reset on successful reconnection
-            Log.d(TAG, "Reconnection successful")
+            startDataForwarding()
+            startStatisticsLogging()
+
+            reconnectAttempts.set(0)
+            Log.d(TAG, "Reconnection successful — data forwarding restarted")
 
         } catch (e: Exception) {
             Log.e(TAG, "Reconnection attempt failed", e)
-            // Will retry on next failure if under max attempts
+        } finally {
+            isReconnecting.set(false)
         }
     }
 
