@@ -1,4 +1,5 @@
 #include "softether_rudp.h"
+#include "softether_compress.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -400,14 +401,31 @@ void rudp_poll(rudp_context_t* ctx) {
 
             // Queue the data if present
             if (inner_size > 0 && inner_data != NULL) {
-                if (inner_size <= RUDP_MAX_PAYLOAD_SIZE &&
+                // Decompress if RUDP_FLAG_COMPRESSED is set
+                const uint8_t* queue_data = inner_data;
+                uint32_t queue_len = inner_size;
+                uint8_t decomp_buf[RUDP_MAX_PAYLOAD_SIZE + 256];
+
+                if (flag & RUDP_FLAG_COMPRESSED) {
+                    uint32_t decomp_len = sizeof(decomp_buf);
+                    if (uncompress_data(inner_data, inner_size,
+                                        decomp_buf, &decomp_len) != 0) {
+                        LOGE("rudp_poll: decompression failed (%u bytes)", inner_size);
+                        continue;
+                    }
+                    queue_data = decomp_buf;
+                    queue_len = decomp_len;
+                }
+
+                if (queue_len <= RUDP_MAX_PAYLOAD_SIZE &&
                     ctx->recv_queue_count < RUDP_RECV_QUEUE_SIZE) {
                     rudp_queued_block_t* entry = &ctx->recv_queue[ctx->recv_queue_tail];
-                    memcpy(entry->data, inner_data, inner_size);
-                    entry->len = inner_size;
+                    memcpy(entry->data, queue_data, queue_len);
+                    entry->len = queue_len;
                     ctx->recv_queue_tail = (ctx->recv_queue_tail + 1) % RUDP_RECV_QUEUE_SIZE;
                     ctx->recv_queue_count++;
-                    LOGD("rudp_poll: queued %u bytes", inner_size);
+                    LOGD("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
+                         (flag & RUDP_FLAG_COMPRESSED) ? 1 : 0);
                 }
             }
         }
@@ -419,6 +437,22 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
     if (data_size > 0 && data == NULL) return -1;
 
     ctx->now = tick64();
+
+    // Attempt zlib compression on payload
+    const uint8_t* send_data = data;
+    uint32_t send_size = data_size;
+    uint8_t compress_buf[RUDP_MAX_PAYLOAD_SIZE + 256];
+    uint8_t send_flag = flag;
+
+    if (data_size > 1) {
+        uint32_t comp_len = sizeof(compress_buf);
+        if (compress_data(data, data_size, compress_buf, &comp_len) == 0 &&
+            comp_len < data_size) {
+            send_data = compress_buf;
+            send_size = comp_len;
+            send_flag |= RUDP_FLAG_COMPRESSED;
+        }
+    }
 
     uint8_t tmp[RUDP_TMP_BUF_SIZE];
     uint8_t* buf = tmp;
@@ -455,32 +489,32 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
     size += sizeof(uint64_t);
 
     // Size
-    uint16_t inner_size_be = htons((uint16_t)data_size);
+    uint16_t inner_size_be = htons((uint16_t)send_size);
     memcpy(buf, &inner_size_be, sizeof(uint16_t));
     buf += sizeof(uint16_t);
     size += sizeof(uint16_t);
 
     // Flag
-    *buf = flag;
+    *buf = send_flag;
     buf += sizeof(uint8_t);
     size += sizeof(uint8_t);
 
     // Data
-    if (data_size > 0) {
-        if (size + data_size > RUDP_TMP_BUF_SIZE - RUDP_PACKET_IV_SIZE_V1 - 8) {
-            LOGE("rudp_send: data too large (%u bytes)", data_size);
+    if (send_size > 0) {
+        if (size + send_size > RUDP_TMP_BUF_SIZE - RUDP_PACKET_IV_SIZE_V1 - 8) {
+            LOGE("rudp_send: data too large (%u bytes)", send_size);
             return -1;
         }
-        memcpy(buf, data, data_size);
-        buf += data_size;
-        size += data_size;
+        memcpy(buf, send_data, send_size);
+        buf += send_size;
+        size += send_size;
     }
 
     if (ctx->version == 1) {
         // Padding + Verify
         uint32_t current_size = RUDP_PACKET_IV_SIZE_V1 + sizeof(uint32_t) +
             sizeof(uint64_t) * 2 + sizeof(uint16_t) + sizeof(uint8_t) +
-            data_size + RUDP_PACKET_IV_SIZE_V1;
+            send_size + RUDP_PACKET_IV_SIZE_V1;
 
         if (current_size < ctx->max_udp_packet_size) {
             uint32_t pad_size = ctx->max_udp_packet_size - current_size;
@@ -521,7 +555,7 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
         return -1;
     }
 
-    LOGD("rudp_send: %u bytes -> %u bytes (flag=0x%02X)", data_size, size, flag);
+    LOGD("rudp_send: %u bytes -> %u bytes (flag=0x%02X)", data_size, size, send_flag);
     return (int)size;
 }
 

@@ -633,7 +633,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "protocol", rudp ? 1 : 0);   // 0 = TCP, 1 = UDP
     pack_add_int(&p, "max_connection", 1);
     pack_add_int(&p, "use_encrypt", 1);
-    pack_add_int(&p, "use_compress", 0);
+    pack_add_int(&p, "use_compress", 1);
     pack_add_int(&p, "half_connection", 0);
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);

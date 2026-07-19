@@ -7,6 +7,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Find required libraries
 find_library(log-lib log)
 find_library(android-lib android)
+find_library(z-lib z)
 
 # Directories
 set(PREBUILT_JNILIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs)
@@ -46,6 +47,7 @@ set(SOFTETHER_SOURCES
     softether-core/src/proto/softether_protocol.c
     softether-core/src/proto/softether_rudp.c
     softether-core/src/crypto/aes_wrapper.c
+    softether-core/src/crypto/compress.c
     softether-core/src/socket/tcp_socket.c
     softether-core/src/packet/packet_handler.c
     softether-core/src/net/dhcp_client.c
@@ -58,6 +60,7 @@ add_library(softether SHARED ${SOFTETHER_SOURCES})
 target_link_libraries(softether
     ${log-lib}
     ${android-lib}
+    ${z-lib}
 )
 
 # Link prebuilt OpenSSL if available
@@ -103,6 +106,7 @@ target_include_directories(softether_test PRIVATE
 target_link_libraries(softether_test
     ${log-lib}
     ${android-lib}
+    ${z-lib}
 )
 
 # Link prebuilt OpenSSL for test library if available
