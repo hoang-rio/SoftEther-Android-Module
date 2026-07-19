@@ -95,6 +95,24 @@ Key V2 differences:
 - Port mapping discovery via NAT-T server
 - Fallback to NAT-T when direct UDP fails
 
+### Phase 7: Compression Support (📋 Planned)
+- [ ] Link zlib in CMakeLists.txt (Android NDK built-in)
+- [ ] Implement zlib wrapper functions: `Compress()`, `Uncompress()`, `CalcCompress()`
+- [ ] Enable `use_compress=1` in login PACK (currently hardcoded to 0)
+- [ ] Compress data blocks before RUDP/TCP send
+- [ ] Decompress data blocks on RUDP/TCP receive
+- [ ] Set `RUDP_FLAG_COMPRESSED` (0x01) flag in RUDP packet header when compressed
+
+### Phase 8: Multi-Connection Support (📋 Planned)
+- [ ] Extend `softether_connection_t` to manage multiple socket+SSL pairs (array/list)
+- [ ] Send `max_connection=4` (or configurable) instead of hardcoded `1` in login PACK
+- [ ] Implement `ClientAdditionalConnect`: open additional TCP sockets after initial connection
+- [ ] Implement session key-based authentication for additional connections
+- [ ] Add send-side socket selection (lowest latency)
+- [ ] Add receive-side multi-socket polling
+- [ ] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
+- [ ] Support `half_connection` mode (unidirectional sockets, optional)
+
 ---
 
 ## 3. V2 Implementation Details
@@ -237,3 +255,229 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 - V1 constants: `UDP_ACCELERATION_COMMON_KEY_SIZE_V1=20`, `UDP_ACCELERATION_PACKET_IV_SIZE_V1=20`
 - V2 constants: `UDP_ACCELERATION_COMMON_KEY_SIZE_V2=128`, `UDP_ACCELERATION_PACKET_IV_SIZE_V2=12`, `UDP_ACCELERATION_PACKET_MAC_SIZE_V2=16`
 - OpenSSL API: `EVP_chacha20_poly1305()`, `EVP_CTRL_AEAD_SET_IVLEN`, `EVP_CTRL_AEAD_GET_TAG`, `EVP_CTRL_AEAD_SET_TAG`
+- Compression: zlib `compress2()` / `uncompress()` (RFC 1951 deflate)
+- Multi-connection: `ClientAdditionalConnect()` in `Protocol.c`, `TCP TcpSockList` in `Connection.c`
+- Upstream constants: `MAX_TCP_CONNECTION=32`, `NUM_TCP_CONNECTION_FOR_UDP_RECOVERY=2`, `ADDITIONAL_CONNECTION_INTERVAL=1s`
+
+---
+
+## 8. Compression Implementation Details
+
+### Current State
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `RUDP_FLAG_COMPRESSED` (0x01) | Defined, unused | Flag constant in `softether_rudp.h:43`, never set or checked |
+| `use_compress` login PACK | Hardcoded to 0 | `softether_protocol.c:636` |
+| RUDP send | No compression | `rudp_send()` always called with `flag=0` |
+| RUDP receive | No decompression | `flag` byte extracted but ignored |
+| TCP send/receive | No compression | Raw data blocks, no framing signature |
+| zlib linkage | Not linked | Only OpenSSL in CMakeLists.txt |
+
+### How Upstream SoftEther Handles Compression
+
+SoftEther uses **zlib deflate** (RFC 1951) for data block compression:
+
+- **Send path**: Before sending, data blocks are compressed with `compress2()`. The compressed block is marked with `Compressed = TRUE`.
+- **RUDP framing**: Compressed RUDP blocks are prefixed with an 8-byte magic signature `0xDEADBEEFCAFEFACE` (`CONNECTION_BULK_COMPRESS_SIGNATURE`), followed by compressed data.
+- **TCP framing**: TCP blocks use a `Compressed` flag in the block header.
+- **Receive path**: The receiver checks for the magic signature or block flag, then calls `uncompress()` to decompress.
+- **Negotiation**: The `use_compress` field in the login PACK is bidirectional — if the client sends `use_compress=0`, the server should not compress data sent to the client.
+
+### Implementation Steps
+
+**Step 1: Link zlib**
+
+`CMakeLists.txt`:
+```cmake
+find_library(z-lib z)
+target_link_libraries(softether ${z-lib})
+```
+
+Android NDK includes zlib as a system library — no separate build needed.
+
+**Step 2: Add compression wrapper functions**
+
+New file `softether-core/src/crypto/compress.c`:
+```c
+#include <zlib.h>
+
+int compress_data(const uint8_t* src, uint32_t src_size,
+                  uint8_t* dst, uint32_t* dst_size) {
+    return compress2(dst, dst_size, src, src_size, Z_DEFAULT_COMPRESSION);
+}
+
+int uncompress_data(const uint8_t* src, uint32_t src_size,
+                    uint8_t* dst, uint32_t* dst_size) {
+    return uncompress(dst, dst_size, src, src_size);
+}
+
+uint32_t calc_compress_bound(uint32_t src_size) {
+    return compressBound(src_size);
+}
+```
+
+**Step 3: Enable `use_compress` in login PACK**
+
+`softether_protocol.c:636`:
+```c
+pack_add_int(&p, "use_compress", 1);  // was 0
+```
+
+**Step 4: Compress before RUDP send**
+
+In `softether_send_data` (or a new `softether_send_compressed_block`):
+```c
+if (conn->use_compress) {
+    uint32_t comp_size = calc_compress_bound(data_len);
+    uint8_t* comp_buf = malloc(comp_size);
+    if (compress_data(data, data_len, comp_buf, &comp_size) == 0) {
+        rudp_send(conn->rudp, comp_buf, comp_size, RUDP_FLAG_COMPRESSED);
+        free(comp_buf);
+        return data_len;
+    }
+    free(comp_buf);
+    // Fallback to uncompressed on failure
+}
+rudp_send(conn->rudp, data, data_len, 0);
+```
+
+**Step 5: Decompress on RUDP receive**
+
+In `rudp_poll()` after extracting the flag byte (line ~352):
+```c
+if (flag & RUDP_FLAG_COMPRESSED) {
+    uint32_t decomp_size = RUDP_MAX_PAYLOAD_SIZE;
+    uint8_t* decomp_buf = malloc(decomp_size);
+    if (uncompress_data(inner_data, inner_size, decomp_buf, &decomp_size) == 0) {
+        // Queue decompressed data
+        memcpy(entry->data, decomp_buf, decomp_size);
+        entry->len = decomp_size;
+    }
+    free(decomp_buf);
+} else {
+    // Queue raw data
+}
+```
+
+**Step 6: TCP path compression (optional)**
+
+The TCP path uses a different framing format (`CONNECTION_BULK_COMPRESS_SIGNATURE`). This can be added later as a separate step — the RUDP path is higher priority.
+
+### Risks
+
+| Risk | Mitigation |
+|------|-----------|
+| CPU overhead on compress/decompress | Use `Z_DEFAULT_COMPRESSION` (level 6); skip compression for small packets (< 256 bytes) |
+| Buffer overflow from decompression | Always check `uncompress()` return value; use `compressBound()` for max size estimates |
+| Server doesn't honor `use_compress=0` | Server should respect client's setting; if not, disable compression and log error |
+
+---
+
+## 9. Multi-Connection Implementation Details
+
+### Current State
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `max_connection` in login PACK | Hardcoded to 1 | `softether_protocol.c:634` |
+| `half_connection` in login PACK | Hardcoded to 0 | `softether_protocol.c:637` |
+| Socket management | Single `socket_fd` / `ssl` / `ssl_ctx` | `softether_connection_t` has no array |
+| `server_max_connection` | Parsed but never used | `softether_protocol.h:82` |
+| Additional connections | Not implemented | No equivalent of `ClientAdditionalConnect()` |
+| Traffic distribution | N/A | Single connection |
+
+### How Upstream SoftEther Multi-Connection Works
+
+**Architecture:**
+- The client opens 1 initial TCP connection during login.
+- After login, `ClientAdditionalConnectChance()` periodically checks if more connections are needed.
+- Additional connections are opened via `ClientAdditionalConnect()` which:
+  1. Opens a new TCP socket + TLS handshake
+  2. Validates server certificate against the existing `ServerX`
+  3. Sends `"additional_connect"` method with the `session_key` to authenticate
+  4. Server validates the key, adds the socket to `TcpSockList`
+- The `TcpSockList` is a `LIST` of `TCPSOCK` structs, each containing a socket, direction, and latency stats.
+
+**Traffic Distribution:**
+- **Send**: Socket with lowest `LateCount` (latency) is selected. Send quota = `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`.
+- **Receive**: All sockets are polled via `select()`. Blocks from any socket are added to the same receive queue.
+- **Half-connection**: Each socket is unidirectional (upload or download only), effectively doubling bandwidth.
+
+**Server Constraints:**
+- Server enforces `max_connection <= policy->MaxConnection` (usually 32)
+- For R-UDP without UDP recovery: forced to `max_connection = 2`
+- For QoS: forced to `max_connection >= 2` (or 4 with half-connection)
+
+### Implementation Steps
+
+**Step 1: Extend `softether_connection_t`**
+
+Add multi-connection support to the struct:
+```c
+// Additional connections (index 0 = primary)
+#define MAX_SE_CONNECTIONS 8
+
+typedef struct {
+    int socket_fd;
+    void* ssl_ctx;
+    void* ssl;
+    int direction;        // TCP_BOTH, TCP_SERVER_TO_CLIENT, TCP_CLIENT_TO_SERVER
+    uint64_t last_recv;
+    uint32_t late_count;
+} softether_tcp_sock_t;
+
+// In softether_connection_t:
+softether_tcp_sock_t connections[MAX_SE_CONNECTIONS];
+int num_connections;
+int max_connection;      // negotiated max (from server)
+int half_connection;     // 0 or 1
+```
+
+**Step 2: Update login PACK**
+
+`softether_protocol.c`:
+```c
+pack_add_int(&p, "max_connection", 4);        // was 1
+pack_add_int(&p, "half_connection", 0);        // keep 0 initially
+```
+
+**Step 3: Implement additional connection handshake**
+
+New function `softether_additional_connect()`:
+1. Open new TCP socket + connect to server IP:port
+2. TLS handshake (reuse existing CA cert from primary connection)
+3. Send SoftEther signature + Hello exchange
+4. Send `"additional_connect"` method with `session_key`
+5. Server validates and adds socket to session
+6. Add socket to `connections[]` array
+
+**Step 4: Connection manager in receive loop**
+
+In `softether_fill_recv_queue()` or a new polling function:
+1. `select()` / `poll()` across all active socket FDs
+2. Read from all readable sockets
+3. Queue received blocks into the same receive queue
+4. Track `last_recv` and `late_count` per socket
+
+**Step 5: Send-side socket selection**
+
+In `softether_send_packet()` or a new send function:
+1. Pick socket with lowest `late_count`
+2. Apply send quota: `MAX_SEND_QUEUE_SIZE / num_connections`
+3. Write to the selected socket's SSL context
+
+**Step 6: Additional connection lifecycle**
+
+- Open additional connections gradually (1 per second, matching upstream's `AdditionalConnectionInterval`)
+- Close additional connections on disconnect
+- Handle individual socket failures gracefully (fall back to remaining connections)
+
+### Risks
+
+| Risk | Mitigation |
+|------|-----------|
+| Server rejects additional connections | Check `server_max_connection` from Welcome PACK; don't exceed it |
+| Thread safety for concurrent send/recv | Use `write_mutex` per connection or per-socket locks |
+| Memory overhead (multiple SSL contexts) | Limit to 4 connections initially; make configurable |
+| TLS certificate reuse for additional connections | Cache `ServerX` from primary connection; validate on each new socket |

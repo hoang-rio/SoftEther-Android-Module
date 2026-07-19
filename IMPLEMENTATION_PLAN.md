@@ -167,11 +167,24 @@ Client                              Server
 ## Remaining Tasks
 
 1. **UDP (RUDP) Support**
-   - Implement reliable UDP transport layer with sequence numbers, ACKs, retransmission
-   - Add NAT traversal support
-   - Integrate with existing native layer
+   - ~~Implement reliable UDP transport layer with sequence numbers, ACKs, retransmission~~ (✅ V1 complete)
+   - RUDP V2 (ChaCha20-Poly1305 AEAD) encryption
+   - NAT traversal support (NAT-T)
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) for full details
 
-2. **Additional Stability & Testing**
+2. **Compression Support**
+   - Link zlib, implement compress/decompress wrappers
+   - Enable `use_compress=1` in login PACK
+   - Compress/decompress data blocks on RUDP and TCP paths
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 7
+
+3. **Multi-Connection Support**
+   - Extend connection struct for multiple socket+SSL pairs
+   - Open additional TCP connections with session key auth
+   - Implement send-side socket selection and receive-side multi-socket polling
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 8
+
+4. **Additional Stability & Testing**
    - Run full instrumentation suite periodically
    - Validate behavior across diverse VPNGate server profiles
    - Monitor for any edge cases in domain resolution or SSL handshakes
