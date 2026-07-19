@@ -16,6 +16,7 @@
 #include "softether_protocol.h"
 #include "softether_socket.h"
 #include "softether_crypto.h"
+#include "softether_compress.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -31,6 +32,7 @@
 
 #define KEEP_ALIVE_MAGIC 0xFFFFFFFF
 #define MAX_BLOCK_SIZE   (1600 * 1600)  // same as SoftEther MAX_PACKET_SIZE safety
+#define COMPRESS_MAGIC   0xDEADBEEFCAFEFACELL
 
 // Read exactly `len` bytes from the SSL connection. Returns 0 on success, -1 on error.
 static int ssl_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
@@ -162,12 +164,41 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
 
     pthread_mutex_lock(&conn->write_mutex);
 
+    // Try compression on the payload
+    const uint8_t* send_payload = payload;
+    uint32_t send_len = payload_len;
+    uint8_t* comp_buf = NULL;
+
+    if (payload_len > 1) {
+        uint32_t comp_bound = calc_compress_bound(payload_len);
+        comp_buf = (uint8_t*)malloc(8 + comp_bound);
+        if (comp_buf != NULL) {
+            uint32_t comp_len = comp_bound;
+            if (compress_data(payload, payload_len, comp_buf + 8, &comp_len) == 0 &&
+                comp_len < payload_len) {
+                // Compression helped — prepend 8-byte magic
+                uint64_t magic = COMPRESS_MAGIC;
+                comp_buf[0] = (magic >> 56) & 0xFF;
+                comp_buf[1] = (magic >> 48) & 0xFF;
+                comp_buf[2] = (magic >> 40) & 0xFF;
+                comp_buf[3] = (magic >> 32) & 0xFF;
+                comp_buf[4] = (magic >> 24) & 0xFF;
+                comp_buf[5] = (magic >> 16) & 0xFF;
+                comp_buf[6] = (magic >> 8) & 0xFF;
+                comp_buf[7] = magic & 0xFF;
+                send_payload = comp_buf;
+                send_len = 8 + comp_len;
+            }
+        }
+    }
+
     // Build entire data block as single buffer (matching reference ConnectionSend)
-    // Format: [block_count=1(4)][block_size(4)][block_data(payload_len)]
-    uint32_t total_size = 4 + 4 + payload_len;
+    // Format: [block_count=1(4)][block_size(4)][block_data(send_len)]
+    uint32_t total_size = 4 + 4 + send_len;
     uint8_t* buf = (uint8_t*)malloc(total_size);
     if (buf == NULL) {
         LOGE("Failed to allocate send buffer");
+        free(comp_buf);
         pthread_mutex_unlock(&conn->write_mutex);
         return -1;
     }
@@ -175,17 +206,18 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     // block_count = 1 in big-endian
     buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
     // block_size in big-endian
-    buf[4] = (payload_len >> 24) & 0xFF;
-    buf[5] = (payload_len >> 16) & 0xFF;
-    buf[6] = (payload_len >> 8) & 0xFF;
-    buf[7] = payload_len & 0xFF;
+    buf[4] = (send_len >> 24) & 0xFF;
+    buf[5] = (send_len >> 16) & 0xFF;
+    buf[6] = (send_len >> 8) & 0xFF;
+    buf[7] = send_len & 0xFF;
     // block data
-    if (payload_len > 0 && payload != NULL) {
-        memcpy(buf + 8, payload, payload_len);
+    if (send_len > 0 && send_payload != NULL) {
+        memcpy(buf + 8, send_payload, send_len);
     }
 
     int ret = data_write_all(conn, buf, (int)total_size);
     free(buf);
+    free(comp_buf);
 
     if (ret != 0) {
         LOGE("Failed to send data block");
@@ -194,7 +226,7 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     }
 
     pthread_mutex_unlock(&conn->write_mutex);
-    LOGD("Sent 1 data block (%u bytes)", payload_len);
+    LOGD("Sent 1 data block (%u bytes, compressed=%d)", payload_len, (send_len < payload_len) ? 1 : 0);
     return (int)total_size;
 }
 
@@ -272,10 +304,44 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         if (!first_block_stored && payload != NULL && payload_len != NULL && block_size <= max_payload) {
             // Store first block in caller's buffer
             if (block_size > 0) {
-                if (data_read_all(conn, payload, (int)block_size) != 0) {
-                    LOGE("Failed to read block %u data", i);
+                // Read into temp buffer to check for compression magic
+                uint8_t* tmp_block = (uint8_t*)malloc(block_size);
+                if (tmp_block == NULL) {
+                    LOGE("Failed to allocate block buffer");
                     return -1;
                 }
+                if (data_read_all(conn, tmp_block, (int)block_size) != 0) {
+                    LOGE("Failed to read block %u data", i);
+                    free(tmp_block);
+                    return -1;
+                }
+
+                // Check for compression magic signature
+                if (block_size > 8) {
+                    uint64_t sig = 0;
+                    for (int b = 0; b < 8; b++) {
+                        sig = (sig << 8) | tmp_block[b];
+                    }
+                    if (sig == COMPRESS_MAGIC) {
+                        // Decompress
+                        uint32_t raw_len = max_payload;
+                        if (uncompress_data(tmp_block + 8, block_size - 8,
+                                            payload, &raw_len) != 0) {
+                            LOGE("Failed to decompress block %u", i);
+                            free(tmp_block);
+                            return -1;
+                        }
+                        *payload_len = raw_len;
+                        free(tmp_block);
+                        first_block_stored = 1;
+                        total_read += (int)block_size;
+                        continue;  // skip the general block_size assignment below
+                    }
+                }
+
+                // Uncompressed — copy as-is
+                memcpy(payload, tmp_block, block_size);
+                free(tmp_block);
             }
             *payload_len = block_size;
             first_block_stored = 1;
@@ -495,12 +561,46 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         if (block_size == 0) continue;
 
         if (block_size <= MAX_QUEUED_FRAME && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-            // Read directly into queue slot
-            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-            if (data_read_all(conn, entry->data, (int)block_size) != 0) {
-                LOGE("fill_recv_queue: failed to read block %u", i);
+            // Read into temp buffer to check for compression magic
+            uint8_t* tmp_block = (uint8_t*)malloc(block_size);
+            if (tmp_block == NULL) {
+                LOGE("fill_recv_queue: allocation failed for block %u", i);
                 return -1;
             }
+            if (data_read_all(conn, tmp_block, (int)block_size) != 0) {
+                LOGE("fill_recv_queue: failed to read block %u", i);
+                free(tmp_block);
+                return -1;
+            }
+
+            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+
+            // Check for compression magic signature
+            if (block_size > 8) {
+                uint64_t sig = 0;
+                for (int b = 0; b < 8; b++) {
+                    sig = (sig << 8) | tmp_block[b];
+                }
+                if (sig == COMPRESS_MAGIC) {
+                    // Decompress
+                    uint32_t raw_len = MAX_QUEUED_FRAME;
+                    if (uncompress_data(tmp_block + 8, block_size - 8,
+                                        entry->data, &raw_len) != 0) {
+                        LOGE("fill_recv_queue: decompression failed for block %u", i);
+                        free(tmp_block);
+                        return -1;
+                    }
+                    entry->len = raw_len;
+                    free(tmp_block);
+                    conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                    conn->recv_queue_count++;
+                    continue;
+                }
+            }
+
+            // Uncompressed — copy as-is
+            memcpy(entry->data, tmp_block, block_size);
+            free(tmp_block);
             entry->len = block_size;
             conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
             conn->recv_queue_count++;
