@@ -1310,7 +1310,7 @@ static int perform_authentication_http(softether_connection_t* conn,
 
             conn->rudp_enabled = 1;
             LOGD("RUDP: server supports UDP acceleration (v%u)", udp_version);
-        } else {
+        } else if (conn->rudp != NULL) {
             LOGD("RUDP: server does not advertise UDP acceleration");
         }
     }
