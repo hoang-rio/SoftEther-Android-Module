@@ -25,7 +25,7 @@ This document outlines the plan for implementing SoftEther VPN protocol in C lan
 
 ---
 
-## Current Status (2026-03-09)
+## Current Status (2026-07-20)
 
 ### Implementation Complete ✅
 
@@ -38,6 +38,8 @@ All core implementation phases are complete and stable:
 - ✅ Domain-to-IP resolution before TLS handshake (matching SoftEther client behavior)
 - ✅ Redundant DNS lookup elimination in TCP socket layer
 - ✅ Enhanced SSL error logging with errno and OpenSSL error details
+- ✅ RUDP V1 with `protect(rudpFd)` to prevent TUN routing loop
+- ✅ zlib compression on RUDP and TCP data paths
 
 ### Key Improvements (2026-02-27 → 2026-03-09)
 
@@ -74,7 +76,7 @@ All core implementation phases are complete and stable:
 
 **TCP** connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
 
-**UDP (RUDP) V1** is implemented and working. Data is transported via UDP with RC4 encryption, keepalive polling, and TCP fallback. V2 (ChaCha20-Poly1305 AEAD) is planned.
+**UDP (RUDP) V1** is implemented and working. Data is transported via UDP with RC4 encryption, keepalive polling, zlib compression, and TCP fallback. V2 (ChaCha20-Poly1305 AEAD) is planned.
 
 ---
 
@@ -166,33 +168,33 @@ Client                              Server
 
 ## Remaining Tasks
 
-1. **UDP (RUDP) Support**
-   - ~~Implement reliable UDP transport layer with sequence numbers, ACKs, retransmission~~ (✅ V1 complete)
-   - RUDP V2 (ChaCha20-Poly1305 AEAD) encryption
-   - NAT traversal support (NAT-T)
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) for full details
+1. **NAT Traversal (NAT-T)**
+   - NAT-T server integration for clients behind symmetric NAT
+   - Port mapping discovery via NAT-T server
+   - Fallback to NAT-T when direct UDP fails
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 3 (Phase 6)
 
-2. **Compression Support**
-   - Link zlib, implement compress/decompress wrappers
-   - Enable `use_compress=1` in login PACK
-   - Compress/decompress data blocks on RUDP and TCP paths
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 7
-
-3. **Multi-Connection Support**
+2. **Multi-Connection Support**
    - Extend connection struct for multiple socket+SSL pairs
    - Open additional TCP connections with session key auth
    - Implement send-side socket selection and receive-side multi-socket polling
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 8
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 4
+
+3. **V2 (ChaCha20-Poly1305 AEAD)**
+   - Replace RC4+zero-verify with AEAD encryption
+   - Persistent EVP_CIPHER_CTX for ChaCha20-Poly1305
+   - Version negotiation (`udp_acceleration_max_version=2`)
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 5
 
 4. **Additional Stability & Testing**
    - Run full instrumentation suite periodically
    - Validate behavior across diverse VPNGate server profiles
    - Monitor for any edge cases in domain resolution or SSL handshakes
 
-3. **Optional Cleanup (Non-blocking)**
+5. **Optional Cleanup (Non-blocking)**
    - Address compiler warnings (unused helpers, deprecated connectivity broadcast)
 
 ---
 
-*Last Updated: 2026-03-09*
-*Status: ✅ TCP protocol fully working, dialog merged, domain→IP resolution implemented, button states consistent with OpenVPN/SoftEther*
+*Last Updated: 2026-07-20*
+*Status: ✅ TCP + RUDP V1 working, compression implemented, V2/multi-connection/NAT-T planned*

@@ -23,7 +23,7 @@ This document outlines the plan to implement SoftEther's UDP Acceleration (RUDP)
 
 ### Protocol Flow
 1.  **Control Channel (TCP)**: The standard HTTPS/SoftEther connection is established first.
-2.  **Negotiation**: During the handshake, the client advertises `support_udp_recovery=1` and `udp_acceleration_max_version=2`. The server responds with `udp_acceleration_version` (selected version), `udp_acceleration_server_ip`, `udp_acceleration_server_port`, `udp_acceleration_server_key`, and `udp_acceleration_server_key_v2`.
+2.  **Negotiation**: During the handshake, the client advertises `support_udp_recovery=1` and `udp_acceleration_max_version=1` (will be `2` once V2 is implemented). The server responds with `udp_acceleration_version` (selected version), `udp_acceleration_server_ip`, `udp_acceleration_server_port`, `udp_acceleration_server_key`, and optionally `udp_acceleration_server_key_v2`.
 3.  **NAT Traversal**: The client sends UDP packets to the server's UDP port to "punch" a hole in the NAT.
 4.  **Data Transport**: Once the server receives the UDP packets and verifies the key, it switches data transmission to UDP. Control packets (KeepAlive) may continue on TCP or move to UDP.
 
@@ -81,29 +81,21 @@ Key V2 differences:
 - DHCP over RUDP: poll UDP socket during DHCP wait loop
 - TCP poll timeout reduction (5ms) when RUDP active
 
-### Phase 5: V2 Support (📋 Planned)
-- [ ] Add V2 AEAD cipher context fields to `rudp_context_t`
-- [ ] Init ChaCha20-Poly1305 cipher contexts in `rudp_init_client` / `rudp_init_server`
-- [ ] Implement V2 send: AEAD encrypt inner fields, append 16-byte Poly1305 MAC
-- [ ] Implement V2 receive: AEAD decrypt + MAC verify, parse inner fields
-- [ ] Enable version negotiation: advertise `max_version=2`, remove V1 cap
-- [ ] Free cipher contexts in `rudp_destroy`
-- [ ] V2 MSS calculation (8 bytes less overhead than V1)
+### Phase 5: Compression Support (✅ Complete)
+- ✅ Link zlib in CMakeLists.txt (Android NDK built-in)
+- ✅ Implement zlib wrapper functions: `compress_data()`, `uncompress_data()`, `calc_compress_bound()`
+- ✅ Enable `use_compress=1` in login PACK (`softether_protocol.c:636`)
+- ✅ RUDP: auto-compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` when smaller (`softether_rudp.c:447-455`)
+- ✅ RUDP: decompress on receive if flag set (`softether_rudp.c:409-418`)
+- ✅ TCP: compress when `server_use_compress` set (`packet_handler.c:173-183`)
+- ✅ Skip compression for small packets (≤1 byte)
 
 ### Phase 6: NAT-T / NAT Traversal (📋 Planned)
 - NAT-T server integration for clients behind symmetric NAT
 - Port mapping discovery via NAT-T server
 - Fallback to NAT-T when direct UDP fails
 
-### Phase 7: Compression Support (📋 Planned)
-- [ ] Link zlib in CMakeLists.txt (Android NDK built-in)
-- [ ] Implement zlib wrapper functions: `Compress()`, `Uncompress()`, `CalcCompress()`
-- [ ] Enable `use_compress=1` in login PACK (currently hardcoded to 0)
-- [ ] Compress data blocks before RUDP/TCP send
-- [ ] Decompress data blocks on RUDP/TCP receive
-- [ ] Set `RUDP_FLAG_COMPRESSED` (0x01) flag in RUDP packet header when compressed
-
-### Phase 8: Multi-Connection Support (📋 Planned)
+### Phase 7: Multi-Connection Support (📋 Planned)
 - [ ] Extend `softether_connection_t` to manage multiple socket+SSL pairs (array/list)
 - [ ] Send `max_connection=4` (or configurable) instead of hardcoded `1` in login PACK
 - [ ] Implement `ClientAdditionalConnect`: open additional TCP sockets after initial connection
@@ -113,166 +105,30 @@ Key V2 differences:
 - [ ] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
 - [ ] Support `half_connection` mode (unidirectional sockets, optional)
 
----
-
-## 3. V2 Implementation Details
-
-### Files Modified
-
-| File | Changes |
-|---|---|
-| `softether_rudp.h` | Add V2 cipher context fields (`evp_encrypt_ctx`, `evp_decrypt_ctx`, `v2_cipher_inited`) to `rudp_context_t` |
-| `softether_rudp.c` | V2 send, V2 receive, V2 cipher init/destroy, version logic, MSS calculation |
-| `softether_protocol.c` | Advertise `udp_acceleration_max_version=2`, `rudp_bulk_max_version=2` |
-
-### Step 1: Add V2 cipher context to `rudp_context_t`
-
-**File**: `softether_rudp.h`
-
-Add to the context struct:
-```c
-// V2 AEAD cipher contexts (persistent, not per-packet)
-void* evp_encrypt_ctx;   // EVP_CIPHER_CTX* for ChaCha20-Poly1305 encrypt
-void* evp_decrypt_ctx;   // EVP_CIPHER_CTX* for ChaCha20-Poly1305 decrypt
-int v2_cipher_inited;    // Whether V2 cipher contexts are ready
-```
-
-**Why persistent**: V2 keeps the cipher context alive across packets (unlike V1 which creates RC4 per-packet). The `NextIv_V2` is updated after each send/recv, and the cipher state carries the ChaCha20 counter forward.
-
-### Step 2: Implement V2 cipher init in `rudp_init_client`
-
-**File**: `softether_rudp.c`
-
-After V1 key setup, when `server_key_size >= RUDP_COMMON_KEY_SIZE_V2`:
-1. Create `EVP_CIPHER_CTX` for encrypt using `EVP_chacha20_poly1305()`
-2. Set encrypt key = `ctx->my_key_v2` (our 128-byte key)
-3. Set decrypt key = `server_key` (server's 128-byte key)
-4. Store in `ctx->evp_encrypt_ctx` / `ctx->evp_decrypt_ctx`
-5. Set `ctx->v2_cipher_inited = 1`
-
-**OpenSSL API**:
-```c
-#include <openssl/evp.h>
-EVP_CIPHER_CTX *enc_ctx = EVP_CIPHER_CTX_new();
-EVP_EncryptInit_ex(enc_ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL);
-EVP_CIPHER_CTX_ctrl(enc_ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL);
-EVP_EncryptInit_ex(enc_ctx, NULL, NULL, my_key_v2, NULL);
-```
-
-**Note**: OpenSSL 1.1.1+ supports `EVP_chacha20_poly1305()`. Android NDK bundles OpenSSL 1.1.1+.
-
-### Step 3: Implement V2 send path
-
-**File**: `softether_rudp.c` — `rudp_send()`
-
-1. Write IV (12 bytes): `ctx->next_iv_v2`
-2. Build inner plaintext: `[Cookie:4][MyTick:8][YourTick:8][Size:2][Flag:1][Data:N][Pad:M]`
-3. Pad to `max_udp_packet_size - 12 (IV) - 16 (MAC)`
-4. Encrypt + authenticate with AEAD:
-   ```c
-   EVP_EncryptInit_ex(ctx->evp_encrypt_ctx, NULL, NULL, NULL, ctx->next_iv_v2);
-   EVP_EncryptUpdate(ctx->evp_encrypt_ctx, NULL, &outlen, inner, inner_size);
-   EVP_EncryptFinal_ex(ctx->evp_encrypt_ctx, NULL, &outlen);
-   EVP_CIPHER_CTX_ctrl(ctx->evp_encrypt_ctx, EVP_CTRL_AEAD_GET_TAG, 16, mac_tag);
-   ```
-5. Append 16-byte Poly1305 MAC tag
-6. Update `ctx->next_iv_v2` = first 12 bytes of ciphertext (matching upstream)
-7. Send via `sendto()`
-
-### Step 4: Implement V2 receive path
-
-**File**: `softether_rudp.c` — inside `rudp_poll()` receive loop
-
-1. Extract IV (12 bytes) from packet start
-2. Extract MAC tag (16 bytes) from packet end
-3. Extract ciphertext (everything between IV and MAC)
-4. Decrypt + verify with AEAD:
-   ```c
-   EVP_DecryptInit_ex(ctx->evp_decrypt_ctx, NULL, NULL, NULL, iv);
-   EVP_CIPHER_CTX_ctrl(ctx->evp_decrypt_ctx, EVP_CTRL_AEAD_SET_TAG, 16, mac_tag);
-   EVP_DecryptUpdate(ctx->evp_decrypt_ctx, NULL, &outlen, ciphertext, ciphertext_len);
-   int ret = EVP_DecryptFinal_ex(ctx->evp_decrypt_ctx, NULL, &outlen);
-   // ret == 1 means MAC verified, ret == 0 means authentication failure
-   ```
-5. Parse decrypted inner fields: Cookie, MyTick, YourTick, Size, Flag, Data
-6. Update `ctx->next_iv_v2` = first 12 bytes of ciphertext
-7. Queue data if present
-
-### Step 5: Enable V2 version negotiation
-
-**File**: `softether_protocol.c`
-
-1. Advertise V2 capability: change `udp_acceleration_max_version` from `1` to `2`
-2. Change `rudp_bulk_max_version` from `1` to `2`
-3. Remove V1 cap in `rudp_set_version`: allow `version = min(version, 2)`
-
-### Step 6: Clean up cipher contexts on destroy
-
-**File**: `softether_rudp.c` — `rudp_destroy()`
-
-```c
-if (ctx->evp_encrypt_ctx) EVP_CIPHER_CTX_free(ctx->evp_encrypt_ctx);
-if (ctx->evp_decrypt_ctx) EVP_CIPHER_CTX_free(ctx->evp_decrypt_ctx);
-```
-
-### Step 7: V2 MSS calculation
-
-V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes less overhead → MSS increases by 8.
+### Phase 8: V2 Support (📋 Planned)
+- [ ] Add V2 AEAD cipher context fields to `rudp_context_t`
+- [ ] Init ChaCha20-Poly1305 cipher contexts in `rudp_init_client` / `rudp_init_server`
+- [ ] Implement V2 send: AEAD encrypt inner fields, append 16-byte Poly1305 MAC
+- [ ] Implement V2 receive: AEAD decrypt + MAC verify, parse inner fields
+- [ ] Enable version negotiation: advertise `max_version=2`, remove V1 cap
+- [ ] Free cipher contexts in `rudp_destroy`
+- [ ] V2 MSS calculation (8 bytes less overhead than V1)
 
 ---
 
-## 4. Risks & Mitigations
-
-| Risk | Mitigation |
-|---|---|
-| OpenSSL prebuilt lib lacks `EVP_chacha20_poly1305()` | Verify with compile test; fallback to libsodium if unavailable |
-| Server doesn't support V2 | Graceful fallback — server responds with `version=1`, client stays on V1 |
-| AEAD nonce reuse vulnerability | Always update `next_iv_v2` after each encrypt/decrypt (matching upstream) |
-| V2 cipher context lifecycle | Create once in init, free in destroy — no per-packet allocation |
-
----
-
-## 5. Dependencies
-*   **POSIX Sockets**: Standard `<sys/socket.h>`, `<netinet/in.h>`.
-*   **OpenSSL 1.1.1+**: `EVP_chacha20_poly1305()` for V2 AEAD. Android NDK bundles compatible version.
-*   **Existing V1**: V2 builds on top of V1 infrastructure (socket, polling, queue, keepalive).
-
----
-
-## 6. Testing Plan
-1.  **V1 Regression**: Connect with `max_version=1`, verify V1 still works unchanged.
-2.  **V2 Negotiation**: Connect with `max_version=2`, check server responds `version=2`.
-3.  **V2 Data**: Send/receive VPN traffic over V2 channel.
-4.  **V2 Keepalive**: Verify keepalive timing works identically.
-5.  **V2 Fallback**: If server sends `version=1` despite client advertising 2, confirm V1 is used.
-6.  **V2 AEAD Failure**: Corrupt a packet in transit, verify it's rejected (not accepted like V1 zero-verify).
-7.  **Wireshark**: Capture traffic to verify correct V1/V2 packet format.
-
----
-
-## 7. References
-- SoftEtherVPN Source: `src/Cedar/UdpAccel.c` / `UdpAccel.h`
-- V1 constants: `UDP_ACCELERATION_COMMON_KEY_SIZE_V1=20`, `UDP_ACCELERATION_PACKET_IV_SIZE_V1=20`
-- V2 constants: `UDP_ACCELERATION_COMMON_KEY_SIZE_V2=128`, `UDP_ACCELERATION_PACKET_IV_SIZE_V2=12`, `UDP_ACCELERATION_PACKET_MAC_SIZE_V2=16`
-- OpenSSL API: `EVP_chacha20_poly1305()`, `EVP_CTRL_AEAD_SET_IVLEN`, `EVP_CTRL_AEAD_GET_TAG`, `EVP_CTRL_AEAD_SET_TAG`
-- Compression: zlib `compress2()` / `uncompress()` (RFC 1951 deflate)
-- Multi-connection: `ClientAdditionalConnect()` in `Protocol.c`, `TCP TcpSockList` in `Connection.c`
-- Upstream constants: `MAX_TCP_CONNECTION=32`, `NUM_TCP_CONNECTION_FOR_UDP_RECOVERY=2`, `ADDITIONAL_CONNECTION_INTERVAL=1s`
-
----
-
-## 8. Compression Implementation Details
+## 3. Compression Implementation Details
 
 ### Current State
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| `RUDP_FLAG_COMPRESSED` (0x01) | Defined, unused | Flag constant in `softether_rudp.h:43`, never set or checked |
-| `use_compress` login PACK | Hardcoded to 0 | `softether_protocol.c:636` |
-| RUDP send | No compression | `rudp_send()` always called with `flag=0` |
-| RUDP receive | No decompression | `flag` byte extracted but ignored |
-| TCP send/receive | No compression | Raw data blocks, no framing signature |
-| zlib linkage | Not linked | Only OpenSSL in CMakeLists.txt |
+| `RUDP_FLAG_COMPRESSED` (0x01) | ✅ Used | Set automatically in `rudp_send()` when compressed payload is smaller |
+| `use_compress` login PACK | ✅ Enabled | Set to 1 in `softether_protocol.c:636` |
+| RUDP send | ✅ Compresses | `rudp_send()` auto-compresses, sets `RUDP_FLAG_COMPRESSED` flag |
+| RUDP receive | ✅ Decompresses | `rudp_poll()` checks flag, calls `uncompress_data()` |
+| TCP send | ✅ Compresses | `packet_handler.c` compresses when `server_use_compress` is set |
+| zlib linkage | ✅ Linked | `find_library(z-lib z)` in CMakeLists.txt |
+| Wrapper functions | ✅ Implemented | `compress_data()`, `uncompress_data()`, `calc_compress_bound()` in `compress.c` |
 
 ### How Upstream SoftEther Handles Compression
 
@@ -350,13 +206,13 @@ if (flag & RUDP_FLAG_COMPRESSED) {
     uint32_t decomp_size = RUDP_MAX_PAYLOAD_SIZE;
     uint8_t* decomp_buf = malloc(decomp_size);
     if (uncompress_data(inner_data, inner_size, decomp_buf, &decomp_size) == 0) {
-        // Queue decompressed data
         memcpy(entry->data, decomp_buf, decomp_size);
         entry->len = decomp_size;
     }
     free(decomp_buf);
 } else {
-    // Queue raw data
+    memcpy(entry->data, inner_data, inner_size);
+    entry->len = inner_size;
 }
 ```
 
@@ -364,17 +220,9 @@ if (flag & RUDP_FLAG_COMPRESSED) {
 
 The TCP path uses a different framing format (`CONNECTION_BULK_COMPRESS_SIGNATURE`). This can be added later as a separate step — the RUDP path is higher priority.
 
-### Risks
-
-| Risk | Mitigation |
-|------|-----------|
-| CPU overhead on compress/decompress | Use `Z_DEFAULT_COMPRESSION` (level 6); skip compression for small packets (< 256 bytes) |
-| Buffer overflow from decompression | Always check `uncompress()` return value; use `compressBound()` for max size estimates |
-| Server doesn't honor `use_compress=0` | Server should respect client's setting; if not, disable compression and log error |
-
 ---
 
-## 9. Multi-Connection Implementation Details
+## 4. Multi-Connection Implementation Details
 
 ### Current State
 
@@ -415,7 +263,6 @@ The TCP path uses a different framing format (`CONNECTION_BULK_COMPRESS_SIGNATUR
 
 Add multi-connection support to the struct:
 ```c
-// Additional connections (index 0 = primary)
 #define MAX_SE_CONNECTIONS 8
 
 typedef struct {
@@ -473,11 +320,175 @@ In `softether_send_packet()` or a new send function:
 - Close additional connections on disconnect
 - Handle individual socket failures gracefully (fall back to remaining connections)
 
-### Risks
+---
 
-| Risk | Mitigation |
-|------|-----------|
-| Server rejects additional connections | Check `server_max_connection` from Welcome PACK; don't exceed it |
-| Thread safety for concurrent send/recv | Use `write_mutex` per connection or per-socket locks |
-| Memory overhead (multiple SSL contexts) | Limit to 4 connections initially; make configurable |
-| TLS certificate reuse for additional connections | Cache `ServerX` from primary connection; validate on each new socket |
+## 5. V2 (AEAD) Implementation Details
+
+### Current State
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `udp_acceleration_max_version` | Hardcoded to 1 | `softether_protocol.c` |
+| `rudp_bulk_max_version` | Hardcoded to 1 | `softether_protocol.c` |
+| `udp_acceleration_server_key_v2` | Parsed but unused | `softether_protocol.h:83` |
+| `v2_common_key` | Parsed but unused | `softether_connection_t` |
+| V2 cipher context | Not implemented | No `EVP_CIPHER_CTX` for ChaCha20-Poly1305 |
+| `rudp_set_version` | Caps at 1 | `softether_rudp.c` |
+
+### How Upstream SoftEther V2 Works
+
+V2 replaces RC4 + zero-verify with ChaCha20-Poly1305 AEAD:
+
+- **Key exchange**: Server sends `udp_acceleration_server_key_v2` (128 bytes) during login. Client sends `udp_acceleration_client_key_v2` (128 bytes). These are used directly — no per-packet SHA1 derivation.
+- **Cipher context**: A single `EVP_CIPHER_CTX` is created per direction (send/recv) and persists across packets. The ChaCha20 counter carries forward from packet to packet.
+- **IV**: 12 bytes (vs V1's 20). After each encrypt/decrypt, `NextIv` is updated to the first 12 bytes of ciphertext.
+- **MAC**: 16-byte Poly1305 tag appended after ciphertext (replaces V1's 20-byte zero verify).
+- **Inner structure**: Same fields (Cookie, MyTick, YourTick, Size, Flag, Data, Padding) but encrypted as a single AEAD operation.
+
+### Implementation Steps
+
+**Step 1: Add V2 cipher context fields to `rudp_context_t`**
+
+`softether_rudp.h`:
+```c
+// In rudp_context_t:
+void* evp_encrypt_ctx;   // EVP_CIPHER_CTX* for ChaCha20-Poly1305
+void* evp_decrypt_ctx;   // EVP_CIPHER_CTX* for ChaCha20-Poly1305
+int v2_cipher_inited;    // Whether V2 cipher contexts are ready
+```
+
+**Step 2: Init V2 cipher in `rudp_init_client`**
+
+After V1 key setup, when `server_key_size >= RUDP_COMMON_KEY_SIZE_V2` (128):
+```c
+#include <openssl/evp.h>
+
+EVP_CIPHER_CTX *enc = EVP_CIPHER_CTX_new();
+EVP_EncryptInit_ex(enc, EVP_chacha20_poly1305(), NULL, NULL, NULL);
+EVP_CIPHER_CTX_ctrl(enc, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL);
+EVP_EncryptInit_ex(enc, NULL, NULL, my_key_v2, NULL);
+ctx->evp_encrypt_ctx = enc;
+
+EVP_CIPHER_CTX *dec = EVP_CIPHER_CTX_new();
+EVP_DecryptInit_ex(dec, EVP_chacha20_poly1305(), NULL, NULL, NULL);
+EVP_CIPHER_CTX_ctrl(dec, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL);
+EVP_DecryptInit_ex(dec, NULL, NULL, server_key_v2, NULL);
+ctx->evp_decrypt_ctx = dec;
+
+ctx->v2_cipher_inited = 1;
+```
+
+**Step 3: V2 send path in `rudp_send()`**
+
+1. Write IV (12 bytes): `ctx->next_iv_v2`
+2. Build inner plaintext: `[Cookie:4][MyTick:8][YourTick:8][Size:2][Flag:1][Data:N][Pad:M]`
+3. Pad to `max_udp_packet_size - 12 (IV) - 16 (MAC)`
+4. AEAD encrypt:
+   ```c
+   EVP_EncryptInit_ex(ctx->evp_encrypt_ctx, NULL, NULL, NULL, ctx->next_iv_v2);
+   EVP_EncryptUpdate(ctx->evp_encrypt_ctx, NULL, &outlen, inner, inner_size);
+   EVP_EncryptFinal_ex(ctx->evp_encrypt_ctx, NULL, &outlen);
+   EVP_CIPHER_CTX_ctrl(ctx->evp_encrypt_ctx, EVP_CTRL_AEAD_GET_TAG, 16, mac_tag);
+   ```
+5. Output: `[IV:12][Ciphertext:N][MAC:16]`
+6. Update `ctx->next_iv_v2` = first 12 bytes of ciphertext
+
+**Step 4: V2 receive path in `rudp_poll()`**
+
+1. Extract IV (first 12 bytes), MAC (last 16 bytes), ciphertext (middle)
+2. AEAD decrypt:
+   ```c
+   EVP_DecryptInit_ex(ctx->evp_decrypt_ctx, NULL, NULL, NULL, iv);
+   EVP_CIPHER_CTX_ctrl(ctx->evp_decrypt_ctx, EVP_CTRL_AEAD_SET_TAG, 16, mac_tag);
+   EVP_DecryptUpdate(ctx->evp_decrypt_ctx, NULL, &outlen, ciphertext, ciphertext_len);
+   int ret = EVP_DecryptFinal_ex(ctx->evp_decrypt_ctx, NULL, &outlen);
+   // ret == 1: MAC verified, ret == 0: authentication failure → drop packet
+   ```
+3. Parse decrypted inner fields
+4. Update `ctx->next_iv_v2` = first 12 bytes of ciphertext
+
+**Step 5: Enable version negotiation**
+
+`softether_protocol.c`:
+```c
+// Advertise V2
+pack_add_int(&p, "udp_acceleration_max_version", 2);  // was 1
+pack_add_int(&p, "rudp_bulk_max_version", 2);          // was 1
+```
+
+Remove V1 cap in `rudp_set_version`: allow `version = min(version, 2)`.
+
+**Step 6: Clean up on destroy**
+
+`rudp_destroy()`:
+```c
+if (ctx->evp_encrypt_ctx) EVP_CIPHER_CTX_free(ctx->evp_encrypt_ctx);
+if (ctx->evp_decrypt_ctx) EVP_CIPHER_CTX_free(ctx->evp_decrypt_ctx);
+```
+
+**Step 7: V2 MSS calculation**
+
+V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes less overhead → MSS increases by 8.
+
+---
+
+## 6. Risks & Mitigations
+
+| Risk | Feature | Mitigation |
+|------|---------|------------|
+| CPU overhead on compress/decompress | Compression | Use `Z_DEFAULT_COMPRESSION` (level 6); skip compression for small packets (< 256 bytes) |
+| Buffer overflow from decompression | Compression | Always check `uncompress()` return value; use `compressBound()` for max size estimates |
+| Server doesn't honor `use_compress=0` | Compression | Server should respect client's setting; if not, disable compression and log error |
+| OpenSSL prebuilt lib lacks `EVP_chacha20_poly1305()` | V2 | Verify with compile test; fallback to V1 if unavailable |
+| Server doesn't support V2 | V2 | Graceful fallback — server responds with `version=1`, client stays on V1 |
+| AEAD nonce reuse vulnerability | V2 | Always update `next_iv_v2` after each encrypt/decrypt (matching upstream) |
+| V2 cipher context lifecycle | V2 | Create once in init, free in destroy — no per-packet allocation |
+| Server rejects additional connections | Multi-Connection | Check `server_max_connection` from Welcome PACK; don't exceed it |
+| Thread safety for concurrent send/recv | Multi-Connection | Use `write_mutex` per connection or per-socket locks |
+| Memory overhead (multiple SSL contexts) | Multi-Connection | Limit to 4 connections initially; make configurable |
+| TLS certificate reuse for additional connections | Multi-Connection | Cache `ServerX` from primary connection; validate on each new socket |
+
+---
+
+## 7. Dependencies
+
+| Dependency | Required By | Notes |
+|------------|-------------|-------|
+| zlib | Compression | Android NDK built-in system library; `compress2()` / `uncompress()` (RFC 1951 deflate) |
+| OpenSSL 1.1.1+ | V2 AEAD | `EVP_chacha20_poly1305()`, `EVP_CTRL_AEAD_SET_IVLEN`, `EVP_CTRL_AEAD_GET_TAG`. Android NDK bundles compatible version |
+| POSIX sockets | All | `<sys/socket.h>`, `<netinet/in.h>` — already in use |
+| Existing V1 infrastructure | All | Socket, polling, queue, keepalive — V2/compression/multi-connection build on top |
+
+---
+
+## 8. Testing Plan
+
+| Test | Feature | Steps |
+|------|---------|-------|
+| RUDP V1 regression | V1 | Connect, send/receive VPN traffic, verify unchanged behavior |
+| Compression send/receive | Compression | Enable `use_compress=1`, verify data arrives and is smaller on wire |
+| Compress flag propagation | Compression | Verify `RUDP_FLAG_COMPRESSED` (0x01) is set in RUDP header when compressed |
+| Small packet skip | Compression | Verify packets < 256 bytes are not compressed |
+| V2 negotiation | V2 | Connect with `max_version=2`, check server responds `version=2` |
+| V2 data transfer | V2 | Send/receive VPN traffic over V2 channel |
+| V2 keepalive | V2 | Verify keepalive timing works identically to V1 |
+| V2 fallback | V2 | If server sends `version=1` despite client advertising 2, confirm V1 is used |
+| V2 AEAD failure | V2 | Corrupt a packet in transit, verify it's rejected (not accepted like V1 zero-verify) |
+| Multi-connection handshake | Multi-Connection | Request `max_connection=4`, verify server accepts |
+| Multi-connection throughput | Multi-Connection | Measure throughput improvement with 2+ connections |
+| Multi-connection resilience | Multi-Connection | Kill one socket, verify VPN continues on remaining connections |
+| Wireshark capture | All | Capture traffic to verify correct packet formats |
+
+---
+
+## 9. References
+
+| Topic | Source |
+|-------|--------|
+| RUDP V1 protocol | `src/Cedar/UdpAccel.c` / `UdpAccel.h` in SoftEtherVPN upstream |
+| V1 constants | `UDP_ACCELERATION_COMMON_KEY_SIZE_V1=20`, `IV_SIZE_V1=20` |
+| V2 constants | `UDP_ACCELERATION_COMMON_KEY_SIZE_V2=128`, `IV_SIZE_V2=12`, `MAC_SIZE_V2=16` |
+| ChaCha20-Poly1305 | OpenSSL `EVP_chacha20_poly1305()`, RFC 7539 |
+| Compression | zlib `compress2()` / `uncompress()` (RFC 1951 deflate) |
+| Multi-connection | `ClientAdditionalConnect()` in `Protocol.c`, `TcpSockList` in `Connection.c` |
+| Multi-connection constants | `MAX_TCP_CONNECTION=32`, `NUM_TCP_CONNECTION_FOR_UDP_RECOVERY=2`, `ADDITIONAL_CONNECTION_INTERVAL=1s` |
