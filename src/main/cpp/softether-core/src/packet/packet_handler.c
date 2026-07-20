@@ -433,11 +433,10 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) return -1;
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) return -1;
 
-    // Try RUDP first if active
+    // Check for queued RUDP data first (non-blocking)
     if (conn->rudp && conn->rudp_enabled) {
         rudp_poll(conn->rudp);
 
-        // Check for queued data from RUDP
         uint32_t rudp_len = 0;
         uint8_t rudp_buf[MAX_QUEUED_FRAME];
         int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
@@ -448,33 +447,8 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             entry->len = copy_len;
             conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
             conn->recv_queue_count++;
-            LOGD("fill_recv_queue: queued %u bytes from RUDP", copy_len);
+            LOGD("fill_recv_queue: queued %u bytes from RUDP (buffered)", copy_len);
             return 1;
-        }
-
-        // Also poll UDP socket for incoming RUDP packets
-        int udp_fd = rudp_get_udp_fd(conn->rudp);
-        if (udp_fd >= 0) {
-            struct pollfd udp_pfd;
-            udp_pfd.fd = udp_fd;
-            udp_pfd.events = POLLIN;
-            udp_pfd.revents = 0;
-            int poll_ret = poll(&udp_pfd, 1, 0);
-            if (poll_ret > 0 && (udp_pfd.revents & POLLIN)) {
-                rudp_poll(conn->rudp);
-                rudp_len = 0;
-                r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
-                if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-                    queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-                    uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
-                    memcpy(entry->data, rudp_buf, copy_len);
-                    entry->len = copy_len;
-                    conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                    conn->recv_queue_count++;
-                    LOGD("fill_recv_queue: queued %u bytes from UDP socket", copy_len);
-                    return 1;
-                }
-            }
         }
     }
 
@@ -482,14 +456,33 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     int ssl_pending = conn->use_ssl_data ? ssl_has_pending((ssl_context_t*)conn->ssl) : 0;
 
     if (ssl_pending <= 0) {
-        // No SSL-buffered data — poll the underlying socket
-        // Use shorter timeout when RUDP is active (TCP only carries control messages)
-        int tcp_timeout_ms = (conn->rudp && conn->rudp_enabled) ? 5 : 50;
-        struct pollfd pfd;
-        pfd.fd = conn->socket_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int poll_ret = poll(&pfd, 1, tcp_timeout_ms);
+        // No SSL-buffered data — poll socket(s) for new data.
+        // When RUDP is active, poll BOTH UDP and TCP simultaneously so we
+        // don't miss data arriving on either channel.  Use a reasonable
+        // timeout (100 ms) instead of the previous 0 ms / 5 ms which was
+        // too short and caused the receive loop to spin without ever
+        // seeing data on the RUDP channel.
+        struct pollfd fds[2];
+        nfds_t nfds = 0;
+
+        if (conn->rudp && conn->rudp_enabled) {
+            int udp_fd = rudp_get_udp_fd(conn->rudp);
+            if (udp_fd >= 0) {
+                fds[nfds].fd = udp_fd;
+                fds[nfds].events = POLLIN;
+                fds[nfds].revents = 0;
+                nfds++;
+            }
+        }
+
+        fds[nfds].fd = conn->socket_fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        nfds++;
+
+        int poll_timeout_ms = (conn->rudp && conn->rudp_enabled) ? 100 : 50;
+        int poll_ret = poll(fds, nfds, poll_timeout_ms);
+
         if (poll_ret == 0) {
             return 0;  // No data available — normal timeout
         }
@@ -497,13 +490,52 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             LOGE("fill_recv_queue: poll error: %d", poll_ret);
             return -1;
         }
-        if (pfd.revents & POLLNVAL) {
-            LOGE("fill_recv_queue: socket invalid (revents=0x%x)", pfd.revents);
-            return -1;
+
+        // Check which socket(s) have data
+        int have_tcp_data = 0;
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].revents & POLLNVAL) {
+                LOGE("fill_recv_queue: socket fd=%d invalid (revents=0x%x)", fds[i].fd, fds[i].revents);
+                return -1;
+            }
+            if ((fds[i].revents & (POLLERR | POLLHUP)) && !(fds[i].revents & POLLIN)) {
+                LOGE("fill_recv_queue: socket fd=%d error (revents=0x%x)", fds[i].fd, fds[i].revents);
+                return -1;
+            }
+            if (fds[i].revents & POLLIN) {
+                // Is this the UDP (RUDP) socket?
+                if (conn->rudp && conn->rudp_enabled) {
+                    int udp_fd = rudp_get_udp_fd(conn->rudp);
+                    if (udp_fd >= 0 && fds[i].fd == udp_fd) {
+                        // UDP socket has data — process via RUDP
+                        rudp_poll(conn->rudp);
+                        uint32_t rudp_len = 0;
+                        uint8_t rudp_buf[MAX_QUEUED_FRAME];
+                        int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
+                        if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+                            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+                            uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
+                            memcpy(entry->data, rudp_buf, copy_len);
+                            entry->len = copy_len;
+                            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                            conn->recv_queue_count++;
+                            LOGD("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
+                            return 1;
+                        }
+                    } else {
+                        // TCP socket has data
+                        have_tcp_data = 1;
+                    }
+                } else {
+                    have_tcp_data = 1;
+                }
+            }
         }
-        if ((pfd.revents & (POLLERR | POLLHUP)) && !(pfd.revents & POLLIN)) {
-            LOGE("fill_recv_queue: socket error without data (revents=0x%x)", pfd.revents);
-            return -1;
+
+        // If RUDP is not active, we reach here when TCP has data (or error handled above).
+        // If RUDP is active but UDP socket had no data and TCP has data, read from TCP.
+        if (!have_tcp_data) {
+            return 0;  // No usable data
         }
     }
 
