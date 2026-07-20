@@ -1230,6 +1230,7 @@ static int perform_authentication_http(softether_connection_t* conn,
     pack_get_int((const uint8_t*)body, body_len, "session_key_32", &conn->session_key_32);
     pack_get_int((const uint8_t*)body, body_len, "max_connection", &conn->server_max_connection);
     pack_get_int((const uint8_t*)body, body_len, "use_encrypt", &conn->server_use_encrypt);
+    pack_get_int((const uint8_t*)body, body_len, "use_compress", &conn->server_use_compress);
     pack_get_int((const uint8_t*)body, body_len, "use_fast_rc4", &conn->server_use_fast_rc4);
     pack_get_int((const uint8_t*)body, body_len, "timeout", &conn->server_timeout);
     
@@ -1242,6 +1243,7 @@ static int perform_authentication_http(softether_connection_t* conn,
         LOGD("Data channel: raw TCP (use_encrypt=%u, use_fast_rc4=%u)",
              conn->server_use_encrypt, conn->server_use_fast_rc4);
     }
+    LOGD("Server use_compress=%u", conn->server_use_compress);
     // Parse RUDP (UDP acceleration) server response from Welcome PACK
     {
         uint32_t use_udp = 0;
@@ -1803,6 +1805,12 @@ int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t m
 
     // Dequeue one raw frame
     queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
+    LOGD("softether_receive_raw: dequeuing frame head=%u count=%u len=%u first8: %02X %02X %02X %02X %02X %02X %02X %02X",
+         conn->recv_queue_head, conn->recv_queue_count, entry->len,
+         entry->len > 0 ? entry->data[0] : 0, entry->len > 1 ? entry->data[1] : 0,
+         entry->len > 2 ? entry->data[2] : 0, entry->len > 3 ? entry->data[3] : 0,
+         entry->len > 4 ? entry->data[4] : 0, entry->len > 5 ? entry->data[5] : 0,
+         entry->len > 6 ? entry->data[6] : 0, entry->len > 7 ? entry->data[7] : 0);
     if (entry->len > (uint32_t)max_len) {
         if (frame_len) *frame_len = 0;
         conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;

@@ -164,30 +164,21 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
 
     pthread_mutex_lock(&conn->write_mutex);
 
-    // Try compression on the payload
+    // TCP path: session-level compression (no per-block magic signature)
+    // The server knows to decompress because use_compress was negotiated.
     const uint8_t* send_payload = payload;
     uint32_t send_len = payload_len;
     uint8_t* comp_buf = NULL;
 
-    if (payload_len > 1) {
+    if (conn->server_use_compress && payload_len > 1) {
         uint32_t comp_bound = calc_compress_bound(payload_len);
-        comp_buf = (uint8_t*)malloc(8 + comp_bound);
+        comp_buf = (uint8_t*)malloc(comp_bound);
         if (comp_buf != NULL) {
             uint32_t comp_len = comp_bound;
-            if (compress_data(payload, payload_len, comp_buf + 8, &comp_len) == 0 &&
+            if (compress_data(payload, payload_len, comp_buf, &comp_len) == 0 &&
                 comp_len < payload_len) {
-                // Compression helped — prepend 8-byte magic
-                uint64_t magic = COMPRESS_MAGIC;
-                comp_buf[0] = (magic >> 56) & 0xFF;
-                comp_buf[1] = (magic >> 48) & 0xFF;
-                comp_buf[2] = (magic >> 40) & 0xFF;
-                comp_buf[3] = (magic >> 32) & 0xFF;
-                comp_buf[4] = (magic >> 24) & 0xFF;
-                comp_buf[5] = (magic >> 16) & 0xFF;
-                comp_buf[6] = (magic >> 8) & 0xFF;
-                comp_buf[7] = magic & 0xFF;
                 send_payload = comp_buf;
-                send_len = 8 + comp_len;
+                send_len = comp_len;
             }
         }
     }
@@ -316,27 +307,24 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                     return -1;
                 }
 
-                // Check for compression magic signature
-                if (block_size > 8) {
-                    uint64_t sig = 0;
-                    for (int b = 0; b < 8; b++) {
-                        sig = (sig << 8) | tmp_block[b];
-                    }
-                    if (sig == COMPRESS_MAGIC) {
-                        // Decompress
-                        uint32_t raw_len = max_payload;
-                        if (uncompress_data(tmp_block + 8, block_size - 8,
-                                            payload, &raw_len) != 0) {
-                            LOGE("Failed to decompress block %u", i);
-                            free(tmp_block);
-                            return -1;
-                        }
-                        *payload_len = raw_len;
+                // TCP path: session-level compression (no per-block magic)
+                // If server accepted compression, ALL blocks are compressed.
+                if (conn->server_use_compress) {
+                    // Decompress entire block
+                    uint32_t raw_len = max_payload;
+                    if (uncompress_data(tmp_block, block_size,
+                                        payload, &raw_len) != 0) {
+                        LOGE("Failed to decompress block %u (session compress)", i);
                         free(tmp_block);
-                        first_block_stored = 1;
-                        total_read += (int)block_size;
-                        continue;  // skip the general block_size assignment below
+                        return -1;
                     }
+                    LOGD("receive_packet: decompressed block %u: %u -> %u bytes",
+                         i, block_size, raw_len);
+                    *payload_len = raw_len;
+                    free(tmp_block);
+                    first_block_stored = 1;
+                    total_read += (int)block_size;
+                    continue;  // skip the general block_size assignment below
                 }
 
                 // Uncompressed — copy as-is
@@ -575,7 +563,30 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
 
             queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
 
-            // Check for compression magic signature
+            // TCP path: session-level compression (no per-block magic)
+            // If server accepted compression, ALL blocks are compressed.
+            if (conn->server_use_compress) {
+                uint32_t raw_len = MAX_QUEUED_FRAME;
+                if (uncompress_data(tmp_block, block_size,
+                                    entry->data, &raw_len) != 0) {
+                    LOGE("fill_recv_queue: decompression failed for block %u (session compress)", i);
+                    free(tmp_block);
+                    return -1;
+                }
+                entry->len = raw_len;
+                LOGD("fill_recv_queue: decompressed block %u: %u -> %u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     i, block_size, raw_len,
+                     raw_len > 0 ? entry->data[0] : 0, raw_len > 1 ? entry->data[1] : 0,
+                     raw_len > 2 ? entry->data[2] : 0, raw_len > 3 ? entry->data[3] : 0,
+                     raw_len > 4 ? entry->data[4] : 0, raw_len > 5 ? entry->data[5] : 0,
+                     raw_len > 6 ? entry->data[6] : 0, raw_len > 7 ? entry->data[7] : 0);
+                free(tmp_block);
+                conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                conn->recv_queue_count++;
+                continue;
+            }
+
+            // Fallback: check for RUDP-style compression magic
             if (block_size > 8) {
                 uint64_t sig = 0;
                 for (int b = 0; b < 8; b++) {
@@ -591,6 +602,8 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                         return -1;
                     }
                     entry->len = raw_len;
+                    LOGD("fill_recv_queue: decompressed block %u (magic): %u -> %u bytes",
+                         i, block_size - 8, raw_len);
                     free(tmp_block);
                     conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
                     conn->recv_queue_count++;

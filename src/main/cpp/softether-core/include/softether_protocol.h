@@ -81,6 +81,7 @@ typedef struct softether_connection {
     uint32_t session_key_32;
     uint32_t server_max_connection;
     uint32_t server_use_encrypt;
+    uint32_t server_use_compress;  // 1 if server accepted compression
     uint32_t server_use_fast_rc4;
     uint32_t server_timeout;
     int use_ssl_data;  // 1 = SSL for data, 0 = raw TCP
