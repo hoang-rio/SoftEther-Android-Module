@@ -175,8 +175,7 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         comp_buf = (uint8_t*)malloc(comp_bound);
         if (comp_buf != NULL) {
             uint32_t comp_len = comp_bound;
-            if (compress_data(payload, payload_len, comp_buf, &comp_len) == 0 &&
-                comp_len < payload_len) {
+            if (compress_data(payload, payload_len, comp_buf, &comp_len) == 0) {
                 send_payload = comp_buf;
                 send_len = comp_len;
             } else {
@@ -674,12 +673,6 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             }
 
             if (!compressed_ok) {
-                LOGD("fill_recv_queue: uncompressed block %u: %u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X",
-                     i, block_size,
-                     block_size > 0 ? tmp_block[0] : 0, block_size > 1 ? tmp_block[1] : 0,
-                     block_size > 2 ? tmp_block[2] : 0, block_size > 3 ? tmp_block[3] : 0,
-                     block_size > 4 ? tmp_block[4] : 0, block_size > 5 ? tmp_block[5] : 0,
-                     block_size > 6 ? tmp_block[6] : 0, block_size > 7 ? tmp_block[7] : 0);
                 // Uncompressed — copy as-is
                 memcpy(entry->data, tmp_block, block_size);
                 free(tmp_block);
