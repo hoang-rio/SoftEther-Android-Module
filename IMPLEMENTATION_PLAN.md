@@ -25,7 +25,7 @@ This document outlines the plan for implementing SoftEther VPN protocol in C lan
 
 ---
 
-## Current Status (2026-07-20)
+## Current Status (2026-07-21)
 
 ### Implementation Complete ✅
 
@@ -40,6 +40,8 @@ All core implementation phases are complete and stable:
 - ✅ Enhanced SSL error logging with errno and OpenSSL error details
 - ✅ RUDP V1 with `protect(rudpFd)` to prevent TUN routing loop
 - ✅ zlib compression on RUDP and TCP data paths
+- ✅ Always-compress policy to prevent server inflate stream corruption
+- ✅ Simultaneous RUDP+TCP polling with 100ms timeout
 
 ### Key Improvements (2026-02-27 → 2026-03-09)
 
@@ -66,6 +68,27 @@ All core implementation phases are complete and stable:
 - Protocol order: SoftEther TCP → SoftEther UDP → OpenVPN TCP → OpenVPN UDP → MS-SSTP
 - Full button state lifecycle for SSTP (Cancel while connecting, Disconnect while connected)
 - Wired SSTP connect/disconnect through protocol dialog callback
+
+### Key Improvements (2026-07-20 → 2026-07-21)
+
+**6. RUDP V1 Fix (ConnectionController.kt):**
+- Restored `protect(rudpFd)` call accidentally removed in commit `58a2c74`
+- Without it, RUDP UDP packets route back through TUN (VPN tunnel) causing infinite send loop
+- Root cause of "RUDP fires continuously while receive path stalls"
+
+**7. Always-Compress Policy (softether_rudp.c, packet_handler.c):**
+- RUDP: Removed `comp_len < data_size` guard — always compress when `data_size > 1`
+- TCP: Removed `comp_len < payload_len` size check — always compress when `server_use_compress=1`
+- Rationale: SoftEther server's `DeflateDecompress` has persistent fallback; uncompressed block corrupts inflate stream
+
+**8. Simultaneous RUDP+TCP Polling (packet_handler.c):**
+- `fill_recv_queue` now uses `poll()` with both UDP and TCP sockets
+- 100ms timeout when RUDP active (vs previous 0ms/5ms which caused receive loop to spin)
+- Prevents missing data arriving on either channel
+
+**9. Diagnostic Logging (packet_handler.c):**
+- Added log in `fill_recv_queue` fallback path for decompression failures
+- Aids debugging when RUDP data doesn't reach Java layer
 
 ### Protocol Support
 
@@ -196,5 +219,5 @@ Client                              Server
 
 ---
 
-*Last Updated: 2026-07-20*
+*Last Updated: 2026-07-21*
 *Status: ✅ TCP + RUDP V1 working, compression implemented, V2/multi-connection/NAT-T planned*

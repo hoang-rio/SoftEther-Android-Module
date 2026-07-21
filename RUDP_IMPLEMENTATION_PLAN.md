@@ -79,16 +79,18 @@ Key V2 differences:
 - 10-second continuous reception requirement (`RUDP_REQUIRE_CONTINUOUS`) before sending VPN data
 - `VpnService.protect()` for UDP socket to prevent TUN routing loop
 - DHCP over RUDP: poll UDP socket during DHCP wait loop
-- TCP poll timeout reduction (5ms) when RUDP active
+- Simultaneous RUDP+TCP polling with 100ms timeout (prevents receive loop spinning)
+- Diagnostic logging for decompression failures in fallback path
 
 ### Phase 5: Compression Support (✅ Complete)
 - ✅ Link zlib in CMakeLists.txt (Android NDK built-in)
 - ✅ Implement zlib wrapper functions: `compress_data()`, `uncompress_data()`, `calc_compress_bound()`
 - ✅ Enable `use_compress=1` in login PACK (`softether_protocol.c:636`)
-- ✅ RUDP: auto-compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` when smaller (`softether_rudp.c:447-455`)
+- ✅ RUDP: always compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` (`softether_rudp.c:447-453`)
 - ✅ RUDP: decompress on receive if flag set (`softether_rudp.c:409-418`)
-- ✅ TCP: compress when `server_use_compress` set (`packet_handler.c:173-183`)
+- ✅ TCP: always compress when `server_use_compress=1` (`packet_handler.c:173-186`)
 - ✅ Skip compression for small packets (≤1 byte)
+- ✅ Always-compress policy to prevent server inflate stream corruption
 
 ### Phase 6: NAT-T / NAT Traversal (📋 Planned)
 - NAT-T server integration for clients behind symmetric NAT
@@ -122,11 +124,11 @@ Key V2 differences:
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| `RUDP_FLAG_COMPRESSED` (0x01) | ✅ Used | Set automatically in `rudp_send()` when compressed payload is smaller |
+| `RUDP_FLAG_COMPRESSED` (0x01) | ✅ Used | Set automatically in `rudp_send()` when compression succeeds |
 | `use_compress` login PACK | ✅ Enabled | Set to 1 in `softether_protocol.c:636` |
-| RUDP send | ✅ Compresses | `rudp_send()` auto-compresses, sets `RUDP_FLAG_COMPRESSED` flag |
+| RUDP send | ✅ Compresses | Always compresses when `data_size > 1`; sets `RUDP_FLAG_COMPRESSED` |
 | RUDP receive | ✅ Decompresses | `rudp_poll()` checks flag, calls `uncompress_data()` |
-| TCP send | ✅ Compresses | `packet_handler.c` compresses when `server_use_compress` is set |
+| TCP send | ✅ Compresses | Always compresses when `server_use_compress=1` (no size check) |
 | zlib linkage | ✅ Linked | `find_library(z-lib z)` in CMakeLists.txt |
 | Wrapper functions | ✅ Implemented | `compress_data()`, `uncompress_data()`, `calc_compress_bound()` in `compress.c` |
 
