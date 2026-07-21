@@ -446,8 +446,7 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
 
     if (data_size > 1) {
         uint32_t comp_len = sizeof(compress_buf);
-        if (compress_data(data, data_size, compress_buf, &comp_len) == 0 &&
-            comp_len < data_size) {
+        if (compress_data(data, data_size, compress_buf, &comp_len) == 0) {
             send_data = compress_buf;
             send_size = comp_len;
             send_flag |= RUDP_FLAG_COMPRESSED;
