@@ -105,6 +105,7 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Add send-side socket selection (lowest latency)
 - [x] Add receive-side multi-socket polling
 - [x] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
+- [x] Run additional connections in background pthread (non-blocking receive loop)
 - [ ] Support `half_connection` mode (unidirectional sockets, optional)
 
 ### Phase 7: V2 Support (📋 Planned)
@@ -450,6 +451,8 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | V2 cipher context lifecycle | V2 | Create once in init, free in destroy — no per-packet allocation |
 | Server rejects additional connections | Multi-Connection | Check `server_max_connection` from Welcome PACK; don't exceed it |
 | Thread safety for concurrent send/recv | Multi-Connection | Use `write_mutex` per connection or per-socket locks |
+| Background thread blocking disconnect | Multi-Connection | `pthread_join()` in `softether_close_additional()` and `softether_disconnect()` waits for thread; thread uses socket-level I/O timeouts to bound duration |
+| Race between cleanup loop and background thread | Multi-Connection | Cleanup loop skips slot being connected (`additional_connect_slot`); background thread sets `active=1` only after full handshake |
 | Memory overhead (multiple SSL contexts) | Multi-Connection | Limit to 4 connections initially; make configurable |
 | TLS certificate reuse for additional connections | Multi-Connection | Cache `ServerX` from primary connection; validate on each new socket |
 
@@ -486,6 +489,8 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | Multi-socket receive polling | Multi-Connection | Verify data arrives from multiple sockets in fill_recv_queue |
 | Socket selection | Multi-Connection | Verify send uses lowest late_count socket |
 | Socket protection | Multi-Connection | Verify additional sockets are protected via VpnService.protect() |
+| Background connect non-blocking | Multi-Connection | Verify receive loop continues while additional connections are being established in background thread |
+| Background connect cleanup | Multi-Connection | Disconnect during background connect, verify no crash/hang (pthread_join) |
 | Wireshark capture | All | Capture traffic to verify correct packet formats |
 
 ---

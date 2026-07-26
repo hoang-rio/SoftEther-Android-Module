@@ -928,6 +928,9 @@ softether_connection_t* softether_create(void) {
     conn->next_connect_time = 0;
     conn->additional_failed_count = 0;
     memset(conn->additional, 0, sizeof(conn->additional));
+    conn->additional_connecting = 0;
+    conn->additional_connect_slot = -1;
+    conn->additional_connect_result = -1;
 
     LOGD("Connection created");
     return conn;
@@ -937,6 +940,13 @@ softether_connection_t* softether_create(void) {
 void softether_destroy(softether_connection_t* conn) {
     if (conn == NULL) {
         return;
+    }
+
+    // Wait for any background additional connect thread to finish
+    if (conn->additional_connecting) {
+        LOGD("Waiting for background additional connect thread to finish");
+        pthread_join(conn->additional_thread, NULL);
+        conn->additional_connecting = 0;
     }
 
     // Disconnect if still connected (not disconnected)
@@ -1612,6 +1622,13 @@ void softether_disconnect(softether_connection_t* conn) {
     LOGD("Disconnecting (previous state: %s)", softether_state_string(prev_state));
     conn->state = STATE_DISCONNECTING;
 
+    // Wait for any background additional connect thread to finish
+    if (conn->additional_connecting) {
+        LOGD("Waiting for background additional connect thread before disconnect");
+        pthread_join(conn->additional_thread, NULL);
+        conn->additional_connecting = 0;
+    }
+
     // Close all additional connections first
     softether_close_additional(conn);
 
@@ -1724,22 +1741,34 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
         return -1;
     }
 
-    // Multi-connection: attempt additional connections if needed
+    // Multi-connection: launch additional connections in background thread (non-blocking)
     if (conn->num_additional < conn->max_connection - 1 &&
-        conn->additional_failed_count < 16) {
+        conn->additional_failed_count < 16 &&
+        !conn->additional_connecting) {
         uint64_t now = softether_tick_ms();
         if (conn->next_connect_time == 0 || now >= conn->next_connect_time) {
-            int prev_additional = conn->num_additional;
-            int ret = softether_additional_connect(conn);
-            if (ret == 0) {
-                LOGD("Additional connection established (%d/%d)",
-                     conn->num_additional, conn->max_connection);
-            } else {
-                LOGD("Additional connection attempt failed (count=%d)",
-                     conn->additional_failed_count);
+            // Find a free slot for the background thread
+            int slot = -1;
+            for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+                if (!conn->additional[i].active) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot >= 0) {
+                conn->additional_connect_slot = slot;
+                conn->additional_connecting = 1;
+                conn->additional_connect_result = -1;
+                if (pthread_create(&conn->additional_thread, NULL,
+                                   additional_connect_thread_routine, conn) == 0) {
+                    LOGD("Launched background additional connect (slot=%d)", slot);
+                } else {
+                    LOGE("Failed to create background additional connect thread");
+                    conn->additional_connecting = 0;
+                    conn->additional_connect_slot = -1;
+                }
             }
             conn->next_connect_time = now + ADDITIONAL_CONNECT_INTERVAL_MS;
-            (void)prev_additional;
         }
     }
 
@@ -1747,6 +1776,9 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
+
+        // Skip the slot being connected by background thread
+        if (conn->additional_connecting && i == conn->additional_connect_slot) continue;
 
         // Check if socket is still connected
         struct pollfd pfd;
@@ -2106,6 +2138,13 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 void softether_close_additional(softether_connection_t* conn) {
     if (conn == NULL) return;
 
+    // Wait for any background additional connect thread to finish
+    if (conn->additional_connecting) {
+        LOGD("Waiting for background additional connect thread before closing");
+        pthread_join(conn->additional_thread, NULL);
+        conn->additional_connecting = 0;
+    }
+
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
@@ -2131,6 +2170,25 @@ void softether_close_additional(softether_connection_t* conn) {
     conn->num_additional = 0;
     conn->additional_failed_count = 0;
     LOGD("All additional connections closed");
+}
+
+// Background thread routine for non-blocking additional connection
+static void* additional_connect_thread_routine(void* arg) {
+    softether_connection_t* conn = (softether_connection_t*)arg;
+    int slot = conn->additional_connect_slot;
+    int result = softether_additional_connect(conn);
+    conn->additional_connect_result = result;
+    conn->additional_connecting = 0;
+    LOGD("Background additional connect thread finished (slot=%d result=%d)", slot, result);
+    return NULL;
+}
+
+// Wait for any in-progress background additional connect thread to finish.
+// This is a non-blocking check: returns immediately if no thread is running.
+void softether_additional_thread_wait(softether_connection_t* conn) {
+    if (conn == NULL || !conn->additional_connecting) return;
+    pthread_join(conn->additional_thread, NULL);
+    conn->additional_connecting = 0;
 }
 
 // Open an additional TCP connection to the server (ClientAdditionalConnect).

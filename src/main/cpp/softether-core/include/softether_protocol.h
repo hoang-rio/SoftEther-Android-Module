@@ -159,6 +159,11 @@ typedef struct softether_connection {
     int half_connection;         // 0 = bidirectional, 1 = unidirectional per socket
     uint64_t next_connect_time;  // monotonic timestamp for next additional connect attempt (ms)
     int additional_failed_count; // serial failure counter for additional connects
+    // Background additional connection thread
+    pthread_t additional_thread; // background thread for non-blocking additional connect
+    int additional_connecting;   // 1 if background thread is running
+    int additional_connect_slot; // which slot the background thread is targeting
+    int additional_connect_result; // result from background thread (0=success, -1=fail)
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
     void (*on_disconnect)(struct softether_connection* conn);
@@ -222,6 +227,7 @@ void softether_close_additional(softether_connection_t* conn);
 int softether_select_send_socket(softether_connection_t* conn);
 int softether_get_num_connections(softether_connection_t* conn);
 int softether_get_active_socket_fds(softether_connection_t* conn, int* fds, int max_fds);
+void softether_additional_thread_wait(softether_connection_t* conn);
 
 // Reconnection support
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);
