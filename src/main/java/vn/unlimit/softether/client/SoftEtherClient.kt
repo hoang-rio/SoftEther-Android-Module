@@ -135,6 +135,33 @@ class SoftEtherClient {
     }
 
     /**
+     * Set the maximum number of TCP connections for multi-connection support
+     * @param maxConnections Target number of connections (1-8, default 4)
+     */
+    fun setMaxConnection(maxConnections: Int) {
+        if (nativeHandle == 0L) return
+        nativeSetMaxConnection(nativeHandle, maxConnections.coerceIn(1, 8))
+    }
+
+    /**
+     * Get the current number of active TCP connections (primary + additional)
+     * @return Number of active connections
+     */
+    fun getNumConnections(): Int {
+        if (nativeHandle == 0L) return 0
+        return nativeGetNumConnections(nativeHandle)
+    }
+
+    /**
+     * Get all active TCP socket FDs (primary + additional) for VpnService.protect()
+     * @return Array of socket FDs, or null if none
+     */
+    fun getAllSocketFds(): IntArray? {
+        if (nativeHandle == 0L) return null
+        return nativeGetAllSocketFds(nativeHandle)
+    }
+
+    /**
      * Disconnect from VPN server
      */
     fun disconnect() {
@@ -258,6 +285,9 @@ class SoftEtherClient {
     external fun nativeGetRudpSocketFd(handle: Long): Int
     external fun nativeDoDhcp(handle: Long): IntArray?
     external fun nativeSetAuthType(handle: Long, authType: Int)
+    external fun nativeSetMaxConnection(handle: Long, maxConnections: Int)
+    external fun nativeGetNumConnections(handle: Long): Int
+    external fun nativeGetAllSocketFds(handle: Long): IntArray?
 
     /**
      * Perform DHCP over SoftEther tunnel to get IP configuration

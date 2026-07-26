@@ -97,14 +97,14 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 
 **What works instead:** TCP connection + UDP Acceleration (`seUdpPort`) after TCP is established (`Protocol.c:5702-5724`, `Connection.c:3024-3029`).
 
-### Phase 6: Multi-Connection Support (📋 Planned)
-- [ ] Extend `softether_connection_t` to manage multiple socket+SSL pairs (array/list)
-- [ ] Send `max_connection=4` (or configurable) instead of hardcoded `1` in login PACK
-- [ ] Implement `ClientAdditionalConnect`: open additional TCP sockets after initial connection
-- [ ] Implement session key-based authentication for additional connections
-- [ ] Add send-side socket selection (lowest latency)
-- [ ] Add receive-side multi-socket polling
-- [ ] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
+### Phase 6: Multi-Connection Support (✅ Complete)
+- [x] Extend `softether_connection_t` to manage multiple socket+SSL pairs (array/list)
+- [x] Send `max_connection=4` (or configurable) instead of hardcoded `1` in login PACK
+- [x] Implement `ClientAdditionalConnect`: open additional TCP sockets after initial connection
+- [x] Implement session key-based authentication for additional connections
+- [x] Add send-side socket selection (lowest latency)
+- [x] Add receive-side multi-socket polling
+- [x] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
 - [ ] Support `half_connection` mode (unidirectional sockets, optional)
 
 ### Phase 7: V2 Support (📋 Planned)
@@ -230,12 +230,15 @@ The TCP path uses a different framing format (`CONNECTION_BULK_COMPRESS_SIGNATUR
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| `max_connection` in login PACK | Hardcoded to 1 | `softether_protocol.c:634` |
-| `half_connection` in login PACK | Hardcoded to 0 | `softether_protocol.c:637` |
-| Socket management | Single `socket_fd` / `ssl` / `ssl_ctx` | `softether_connection_t` has no array |
-| `server_max_connection` | Parsed but never used | `softether_protocol.h:82` |
-| Additional connections | Not implemented | No equivalent of `ClientAdditionalConnect()` |
-| Traffic distribution | N/A | Single connection |
+| `max_connection` in login PACK | ✅ Set to 4 | `softether_protocol.c:641` |
+| `half_connection` in login PACK | Hardcoded to 0 | `softether_protocol.c:644` |
+| Socket management | ✅ Primary + additional array | `softether_connection_t` has `additional[MAX_SE_CONNECTIONS]` |
+| `server_max_connection` | ✅ Parsed and enforced | Clamped to `min(server_max, client_max)` |
+| Additional connections | ✅ Implemented | `softether_additional_connect()` with full handshake |
+| Traffic distribution | ✅ Lowest late_count | `softether_select_send_socket()` |
+| Multi-socket receive | ✅ Implemented | `softether_fill_recv_queue()` polls all sockets |
+| Socket protection | ✅ Implemented | `protectAdditionalSockets()` in receive loop |
+| JNI bridge | ✅ Implemented | `nativeSetMaxConnection`, `nativeGetNumConnections`, `nativeGetAllSocketFds` |
 
 ### How Upstream SoftEther Multi-Connection Works
 
@@ -479,6 +482,10 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | Multi-connection handshake | Multi-Connection | Request `max_connection=4`, verify server accepts |
 | Multi-connection throughput | Multi-Connection | Measure throughput improvement with 2+ connections |
 | Multi-connection resilience | Multi-Connection | Kill one socket, verify VPN continues on remaining connections |
+| Additional connect method | Multi-Connection | Verify `"additional_connect"` method sent with session_key in logs |
+| Multi-socket receive polling | Multi-Connection | Verify data arrives from multiple sockets in fill_recv_queue |
+| Socket selection | Multi-Connection | Verify send uses lowest late_count socket |
+| Socket protection | Multi-Connection | Verify additional sockets are protected via VpnService.protect() |
 | Wireshark capture | All | Capture traffic to verify correct packet formats |
 
 ---

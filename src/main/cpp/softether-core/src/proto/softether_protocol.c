@@ -13,6 +13,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <errno.h>
+#include <sys/time.h>
 
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
@@ -631,7 +632,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "client_build", client_build);
     pack_add_int(&p, "client_id", 0);
     pack_add_int(&p, "protocol", rudp ? 1 : 0);   // 0 = TCP, 1 = UDP
-    pack_add_int(&p, "max_connection", 1);
+    pack_add_int(&p, "max_connection", 4);  // Request 4 connections for multi-connection throughput
     pack_add_int(&p, "use_encrypt", 1);
     pack_add_int(&p, "use_compress", 1);
     pack_add_int(&p, "half_connection", 0);
@@ -919,6 +920,14 @@ softether_connection_t* softether_create(void) {
 
     // Initialize write mutex for thread-safe SSL writes
     pthread_mutex_init(&conn->write_mutex, NULL);
+
+    // Initialize multi-connection fields
+    conn->num_additional = 0;
+    conn->max_connection = 4;  // Target: request 4 connections in login PACK
+    conn->half_connection = 0;
+    conn->next_connect_time = 0;
+    conn->additional_failed_count = 0;
+    memset(conn->additional, 0, sizeof(conn->additional));
 
     LOGD("Connection created");
     return conn;
@@ -1523,6 +1532,18 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // Connection established
     conn->state = STATE_CONNECTED;
     LOGD("Connection established successfully");
+
+    // Schedule additional connections (multi-connection support)
+    // Clamp max_connection to what the server accepted
+    if (conn->server_max_connection > 0 && conn->server_max_connection < (uint32_t)conn->max_connection) {
+        conn->max_connection = (int)conn->server_max_connection;
+    }
+    if (conn->max_connection > MAX_SE_CONNECTIONS) {
+        conn->max_connection = MAX_SE_CONNECTIONS;
+    }
+    conn->next_connect_time = softether_tick_ms() + ADDITIONAL_CONNECT_INTERVAL_MS;
+    LOGD("Multi-connection: max_connection=%d, server_max=%u, additional connections will open gradually",
+         conn->max_connection, conn->server_max_connection);
     
     // Check for any leftover SSL data from the HTTP exchange
     {
@@ -1590,6 +1611,9 @@ void softether_disconnect(softether_connection_t* conn) {
 
     LOGD("Disconnecting (previous state: %s)", softether_state_string(prev_state));
     conn->state = STATE_DISCONNECTING;
+
+    // Close all additional connections first
+    softether_close_additional(conn);
 
     // In real SoftEther, disconnect is simply closing the connection.
     // No special disconnect packet exists in the block protocol.
@@ -1689,6 +1713,7 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
 
 // Receive data — uses queue to handle multi-block messages; strips Ethernet header
 // Also handles ARP requests automatically
+// Also triggers additional connection establishment (multi-connection)
 int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len) {
     if (conn == NULL || buffer == NULL || max_len == 0) {
         return -1;
@@ -1697,6 +1722,56 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
     if (conn->state != STATE_CONNECTED) {
         LOGE("Not connected");
         return -1;
+    }
+
+    // Multi-connection: attempt additional connections if needed
+    if (conn->num_additional < conn->max_connection - 1 &&
+        conn->additional_failed_count < 16) {
+        uint64_t now = softether_tick_ms();
+        if (conn->next_connect_time == 0 || now >= conn->next_connect_time) {
+            int prev_additional = conn->num_additional;
+            int ret = softether_additional_connect(conn);
+            if (ret == 0) {
+                LOGD("Additional connection established (%d/%d)",
+                     conn->num_additional, conn->max_connection);
+            } else {
+                LOGD("Additional connection attempt failed (count=%d)",
+                     conn->additional_failed_count);
+            }
+            conn->next_connect_time = now + ADDITIONAL_CONNECT_INTERVAL_MS;
+            (void)prev_additional;
+        }
+    }
+
+    // Multi-connection: clean up failed additional sockets
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (!ts->active) continue;
+
+        // Check if socket is still connected
+        struct pollfd pfd;
+        pfd.fd = ts->socket_fd;
+        pfd.events = 0;
+        pfd.revents = 0;
+        int poll_ret = poll(&pfd, 1, 0);
+        if (poll_ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            LOGW("Additional socket [%d] fd=%d disconnected (revents=0x%x), closing",
+                 i, ts->socket_fd, pfd.revents);
+            if (ts->ssl != NULL) {
+                ssl_shutdown((ssl_context_t*)ts->ssl);
+            }
+            if (ts->ssl_ctx != NULL) {
+                ssl_destroy((ssl_context_t*)ts->ssl_ctx);
+                ts->ssl_ctx = NULL;
+                ts->ssl = NULL;
+            }
+            if (ts->socket_fd >= 0) {
+                close(ts->socket_fd);
+                ts->socket_fd = -1;
+            }
+            ts->active = 0;
+            conn->num_additional--;
+        }
     }
 
     // If queue is empty, read one protocol message and fill queue
@@ -2023,6 +2098,432 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
     }
 
     return 0;
+}
+
+// ---- Multi-Connection Support ----
+
+// Close all additional (non-primary) TCP connections
+void softether_close_additional(softether_connection_t* conn) {
+    if (conn == NULL) return;
+
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (!ts->active) continue;
+
+        LOGD("Closing additional connection [%d] fd=%d", i, ts->socket_fd);
+
+        if (ts->ssl != NULL) {
+            ssl_shutdown((ssl_context_t*)ts->ssl);
+        }
+        if (ts->ssl_ctx != NULL) {
+            ssl_destroy((ssl_context_t*)ts->ssl_ctx);
+            ts->ssl_ctx = NULL;
+            ts->ssl = NULL;
+        }
+        if (ts->socket_fd >= 0) {
+            close(ts->socket_fd);
+            ts->socket_fd = -1;
+        }
+        ts->active = 0;
+        ts->late_count = 0;
+        ts->last_recv = 0;
+    }
+    conn->num_additional = 0;
+    conn->additional_failed_count = 0;
+    LOGD("All additional connections closed");
+}
+
+// Open an additional TCP connection to the server (ClientAdditionalConnect).
+// Follows the upstream SoftEther flow:
+//   1. Open TCP socket + TLS handshake
+//   2. Send SoftEther signature (VPNCONNECT watermark via /vpnsvc/connect.cgi)
+//   3. Download Hello
+//   4. Send "additional_connect" method with session_key for authentication
+//   5. Parse response, add socket to additional[] array
+// Returns 0 on success, -1 on failure.
+int softether_additional_connect(softether_connection_t* conn) {
+    if (conn == NULL) return -1;
+    if (conn->state != STATE_CONNECTED) return -1;
+
+    // Find a free slot
+    int slot = -1;
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        if (!conn->additional[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        LOGD("additional_connect: no free slot (num_additional=%d)", conn->num_additional);
+        return -1;
+    }
+
+    LOGD("additional_connect: opening connection to %s:%d (slot %d)",
+         conn->server_ip, conn->server_port, slot);
+
+    // Step 1: Open TCP socket
+    softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
+    if (sock == NULL) {
+        LOGE("additional_connect: failed to create socket");
+        conn->additional_failed_count++;
+        return -1;
+    }
+
+    if (socket_connect_timeout(sock, conn->server_ip, conn->server_port, conn->timeout_ms) != 0) {
+        LOGE("additional_connect: TCP connect failed");
+        socket_destroy(sock);
+        conn->additional_failed_count++;
+        return -1;
+    }
+
+    int fd = sock->fd;
+    sock->fd = -1;
+    socket_destroy(sock);
+
+    // Step 2: TLS handshake
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL) {
+        LOGE("additional_connect: failed to create SSL context");
+        close(fd);
+        conn->additional_failed_count++;
+        return -1;
+    }
+
+    if (ssl_connect(ssl_ctx, fd, conn->server_ip) != 0) {
+        LOGE("additional_connect: TLS handshake failed");
+        ssl_destroy(ssl_ctx);
+        close(fd);
+        conn->additional_failed_count++;
+        return -1;
+    }
+
+    // Set TCP_NODELAY
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    // Set data timeout
+    int data_timeout_ms = 5000;
+    struct timeval tv;
+    tv.tv_sec = data_timeout_ms / 1000;
+    tv.tv_usec = (data_timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Step 3: Send SoftEther signature (VPNCONNECT watermark)
+    {
+        const char* watermark = "VPNCONNECT";
+        size_t watermark_len = strlen(watermark);
+
+        char http_post[1024];
+        int post_len = snprintf(http_post, sizeof(http_post),
+            "POST /vpnsvc/connect.cgi HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Connection: Keep-Alive\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n",
+            conn->server_ip, watermark_len);
+
+        size_t combined_len = (size_t)post_len + watermark_len;
+        uint8_t* combined = (uint8_t*)malloc(combined_len);
+        if (combined == NULL) {
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+        memcpy(combined, http_post, post_len);
+        memcpy(combined + post_len, watermark, watermark_len);
+
+        int write_ret = ssl_write(ssl_ctx, combined, (int)combined_len);
+        free(combined);
+
+        if (write_ret <= 0) {
+            LOGE("additional_connect: failed to send VPNCONNECT watermark");
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+    }
+
+    // Read HTTP response from connect.cgi
+    {
+        uint8_t resp[4096];
+        int hdr_len = 0;
+        int found_end = 0;
+        while (hdr_len < (int)sizeof(resp) - 1 && !found_end) {
+            int r = ssl_read(ssl_ctx, resp + hdr_len, 1);
+            if (r <= 0) {
+                LOGE("additional_connect: failed reading connect.cgi response");
+                ssl_shutdown(ssl_ctx);
+                ssl_destroy(ssl_ctx);
+                close(fd);
+                conn->additional_failed_count++;
+                return -1;
+            }
+            hdr_len++;
+            if (hdr_len >= 4 &&
+                resp[hdr_len-4] == '\r' && resp[hdr_len-3] == '\n' &&
+                resp[hdr_len-2] == '\r' && resp[hdr_len-1] == '\n') {
+                found_end = 1;
+            }
+        }
+        if (!found_end) {
+            LOGE("additional_connect: connect.cgi response headers too large");
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+
+        uint32_t content_length = 0;
+        const char* cl_str = strstr((char*)resp, "Content-Length: ");
+        if (!cl_str) cl_str = strstr((char*)resp, "content-length: ");
+        if (cl_str) {
+            content_length = (uint32_t)atoi(cl_str + 16);
+        }
+
+        if (content_length > 0 && hdr_len + (int)content_length < (int)sizeof(resp)) {
+            uint32_t body_read = 0;
+            while (body_read < content_length) {
+                int r = ssl_read(ssl_ctx, resp + hdr_len + body_read,
+                                 (int)(content_length - body_read));
+                if (r <= 0) {
+                    LOGE("additional_connect: failed reading connect.cgi body");
+                    ssl_shutdown(ssl_ctx);
+                    ssl_destroy(ssl_ctx);
+                    close(fd);
+                    conn->additional_failed_count++;
+                    return -1;
+                }
+                body_read += (uint32_t)r;
+            }
+        }
+
+        LOGD("additional_connect: connect.cgi response received");
+    }
+
+    // Step 4: Send "additional_connect" method with session_key
+    {
+        uint32_t pack_size = 4;  // num_elements (uint32)
+        pack_size += PACK_STR_SZ("method", "additional_connect");
+        pack_size += PACK_DATA_SZ("session_key", SHA1_SIZE);
+
+        uint8_t* pack_buf = (uint8_t*)calloc(1, pack_size + 64);
+        if (pack_buf == NULL) {
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+
+        uint8_t* pp = pack_buf;
+        pack_write_uint32(&pp, 2);  // num_elements = 2
+        pack_add_str(&pp, "method", "additional_connect");
+        pack_add_data(&pp, "session_key", conn->session_key, SHA1_SIZE);
+
+        uint32_t actual_len = (uint32_t)(pp - pack_buf);
+
+        char date_str[64];
+        {
+            time_t now = time(NULL);
+            struct tm* gmt = gmtime(&now);
+            strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", gmt);
+        }
+
+        char auth_hdr[512];
+        int auth_hdr_len = snprintf(auth_hdr, sizeof(auth_hdr),
+            "POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"
+            "Date: %s\r\n"
+            "Host: %s\r\n"
+            "Keep-Alive: timeout=15; max=19\r\n"
+            "Connection: Keep-Alive\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %u\r\n"
+            "\r\n",
+            date_str, conn->server_ip, actual_len);
+
+        size_t auth_combined_len = (size_t)auth_hdr_len + actual_len;
+        uint8_t* auth_combined = (uint8_t*)malloc(auth_combined_len);
+        if (auth_combined == NULL) {
+            free(pack_buf);
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+        memcpy(auth_combined, auth_hdr, auth_hdr_len);
+        memcpy(auth_combined + auth_hdr_len, pack_buf, actual_len);
+        free(pack_buf);
+
+        int write_ret = ssl_write(ssl_ctx, auth_combined, (int)auth_combined_len);
+        free(auth_combined);
+
+        if (write_ret <= 0) {
+            LOGE("additional_connect: failed to send additional_connect PACK");
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+    }
+
+    // Read the additional_connect response
+    {
+        uint8_t auth_resp[4096];
+        int hdr_len = 0;
+        int found_end = 0;
+        while (hdr_len < (int)sizeof(auth_resp) - 1 && !found_end) {
+            int r = ssl_read(ssl_ctx, auth_resp + hdr_len, 1);
+            if (r <= 0) {
+                LOGE("additional_connect: failed reading auth response");
+                ssl_shutdown(ssl_ctx);
+                ssl_destroy(ssl_ctx);
+                close(fd);
+                conn->additional_failed_count++;
+                return -1;
+            }
+            hdr_len++;
+            if (hdr_len >= 4 &&
+                auth_resp[hdr_len-4] == '\r' && auth_resp[hdr_len-3] == '\n' &&
+                auth_resp[hdr_len-2] == '\r' && auth_resp[hdr_len-1] == '\n') {
+                found_end = 1;
+            }
+        }
+        if (!found_end) {
+            LOGE("additional_connect: auth response headers too large");
+            ssl_shutdown(ssl_ctx);
+            ssl_destroy(ssl_ctx);
+            close(fd);
+            conn->additional_failed_count++;
+            return -1;
+        }
+        auth_resp[hdr_len] = '\0';
+
+        uint32_t content_length = 0;
+        const char* cl_str = strstr((char*)auth_resp, "Content-Length: ");
+        if (!cl_str) cl_str = strstr((char*)auth_resp, "content-length: ");
+        if (cl_str) {
+            content_length = (uint32_t)atoi(cl_str + 16);
+        }
+
+        int body_off = hdr_len;
+        int body_ln = 0;
+        if (content_length > 0 && hdr_len + (int)content_length < (int)sizeof(auth_resp)) {
+            uint32_t body_read = 0;
+            while (body_read < content_length) {
+                int r = ssl_read(ssl_ctx, auth_resp + hdr_len + body_read,
+                                 (int)(content_length - body_read));
+                if (r <= 0) {
+                    LOGE("additional_connect: failed reading auth body");
+                    ssl_shutdown(ssl_ctx);
+                    ssl_destroy(ssl_ctx);
+                    close(fd);
+                    conn->additional_failed_count++;
+                    return -1;
+                }
+                body_read += (uint32_t)r;
+            }
+            body_ln = (int)content_length;
+        }
+
+        uint32_t err_val = 0;
+        if (body_ln >= 4) {
+            if (pack_get_int(auth_resp + body_off, (uint32_t)body_ln, "error", &err_val) == 0) {
+                if (err_val != 0) {
+                    LOGE("additional_connect: server returned error %u", err_val);
+                    ssl_shutdown(ssl_ctx);
+                    ssl_destroy(ssl_ctx);
+                    close(fd);
+                    conn->additional_failed_count++;
+                    return -1;
+                }
+            }
+        }
+
+        LOGD("additional_connect: auth response parsed (error=%u)", err_val);
+    }
+
+    // Step 5: Add socket to additional[] array
+    {
+        softether_tcp_sock_t* ts = &conn->additional[slot];
+        ts->socket_fd = fd;
+        ts->ssl_ctx = ssl_ctx;
+        ts->ssl = ssl_ctx;
+        ts->direction = TCP_DIRECTION_BOTH;
+        ts->last_recv = softether_tick_ms();
+        ts->late_count = 0;
+        ts->active = 1;
+        conn->num_additional++;
+    }
+
+    LOGD("additional_connect: SUCCESS slot=%d fd=%d num_additional=%d",
+         slot, fd, conn->num_additional);
+
+    conn->additional_failed_count = 0;
+    return 0;
+}
+
+// Select the best TCP socket for sending (lowest late_count).
+// Returns the socket index: 0 = primary, 1..N = additional.
+int softether_select_send_socket(softether_connection_t* conn) {
+    if (conn == NULL) return 0;
+
+    int best_idx = 0;
+    uint32_t min_late = UINT32_MAX;
+
+    // Check primary socket
+    if (conn->socket_fd >= 0 && conn->ssl != NULL) {
+        min_late = 0;
+        best_idx = 0;
+    }
+
+    // Check additional sockets
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (!ts->active) continue;
+
+        if (ts->late_count <= min_late) {
+            min_late = ts->late_count;
+            best_idx = i + 1;  // +1 because index 0 = primary
+        }
+    }
+
+    return best_idx;
+}
+
+// Get the total number of active connections (primary + additional)
+int softether_get_num_connections(softether_connection_t* conn) {
+    if (conn == NULL) return 0;
+    int count = (conn->socket_fd >= 0) ? 1 : 0;
+    count += conn->num_additional;
+    return count;
+}
+
+// Fill an array with the file descriptors of all active TCP sockets.
+// Returns the number of FDs written.
+int softether_get_active_socket_fds(softether_connection_t* conn, int* fds, int max_fds) {
+    if (conn == NULL || fds == NULL || max_fds <= 0) return 0;
+
+    int count = 0;
+
+    if (conn->socket_fd >= 0 && count < max_fds) {
+        fds[count++] = conn->socket_fd;
+    }
+
+    for (int i = 0; i < MAX_SE_CONNECTIONS && count < max_fds; i++) {
+        if (conn->additional[i].active && conn->additional[i].socket_fd >= 0) {
+            fds[count++] = conn->additional[i].socket_fd;
+        }
+    }
+
+    return count;
 }
 
 // Reconnection support - Enable/disable automatic reconnection

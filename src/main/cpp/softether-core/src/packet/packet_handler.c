@@ -28,6 +28,7 @@
 
 #define TAG "SoftEtherPacket"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 #define KEEP_ALIVE_MAGIC 0xFFFFFFFF
@@ -113,6 +114,85 @@ static int raw_write_all(softether_connection_t* conn, const uint8_t* buf, int l
         total += ret;
     }
     return 0;
+}
+
+// ---- Socket-specific read helpers (for multi-connection) ----
+
+// Read exactly `len` bytes from a specific SSL context (not conn->ssl).
+static int ssl_read_all_ctx(ssl_context_t* ssl, uint8_t* buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int ret = ssl_read(ssl, buf + total, len - total);
+        if (ret <= 0) {
+            return -1;
+        }
+        total += ret;
+    }
+    return 0;
+}
+
+// Read exactly `len` bytes from a specific raw TCP fd (not conn->socket_fd).
+static int raw_read_all_fd(int fd, uint8_t* buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int ret = (int)recv(fd, buf + total, len - total, 0);
+        if (ret <= 0) {
+            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return -1;
+        }
+        total += ret;
+    }
+    return 0;
+}
+
+// Read `len` bytes from a specific socket (SSL or raw).
+static int data_read_all_sock(softether_connection_t* conn,
+                              void* ssl, int socket_fd,
+                              uint8_t* buf, int len) {
+    if (conn->use_ssl_data) {
+        return ssl_read_all_ctx((ssl_context_t*)ssl, buf, len);
+    } else {
+        return raw_read_all_fd(socket_fd, buf, len);
+    }
+}
+
+// Read a big-endian uint32 from a specific socket.
+static int read_uint32_sock(softether_connection_t* conn,
+                            void* ssl, int socket_fd,
+                            uint32_t* out) {
+    uint8_t buf[4];
+    if (data_read_all_sock(conn, ssl, socket_fd, buf, 4) != 0) return -1;
+    *out = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+    return 0;
+}
+
+// Write exactly `len` bytes to a specific socket (SSL or raw).
+static int data_write_all_sock(softether_connection_t* conn,
+                               void* ssl, int socket_fd,
+                               const uint8_t* buf, int len) {
+    if (conn->use_ssl_data) {
+        int total = 0;
+        while (total < len) {
+            int ret = ssl_write((ssl_context_t*)ssl, buf + total, len - total);
+            if (ret <= 0) return -1;
+            total += ret;
+        }
+        return 0;
+    } else {
+        int total = 0;
+        while (total < len) {
+            int ret = (int)send(socket_fd, buf + total, len - total, 0);
+            if (ret <= 0) {
+                if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                return -1;
+            }
+            total += ret;
+        }
+        return 0;
+    }
 }
 
 // Read `len` bytes using the appropriate channel (SSL or raw TCP)
@@ -208,7 +288,20 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         memcpy(buf + 8, send_payload, send_len);
     }
 
-    int ret = data_write_all(conn, buf, (int)total_size);
+    // Select best socket for multi-connection send
+    int send_idx = softether_select_send_socket(conn);
+    void* send_ssl = (send_idx == 0) ? conn->ssl : conn->additional[send_idx - 1].ssl;
+    int send_fd = (send_idx == 0) ? conn->socket_fd : conn->additional[send_idx - 1].socket_fd;
+
+    int ret;
+    if (send_idx > 0 && send_ssl != NULL) {
+        // Send via additional connection
+        ret = data_write_all_sock(conn, send_ssl, send_fd, buf, (int)total_size);
+    } else {
+        // Send via primary connection
+        ret = data_write_all(conn, buf, (int)total_size);
+    }
+
     free(buf);
     free(comp_buf);
 
@@ -459,6 +552,7 @@ int softether_process_keepalive(softether_connection_t* conn) {
 // ---- Receive queue helpers ----
 
 // Read one protocol message and queue ALL blocks into the receive queue.
+// Supports multi-connection: polls all active TCP sockets + optional UDP socket.
 // Returns: 1 = data queued, 0 = keepalive/no data/timeout, -1 = error
 int softether_fill_recv_queue(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) return -1;
@@ -483,213 +577,283 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         }
     }
 
-    // Check if SSL has buffered data first (may not show up in poll)
-    int ssl_pending = conn->use_ssl_data ? ssl_has_pending((ssl_context_t*)conn->ssl) : 0;
+    // Build pollfd array: [UDP (optional)] + [primary TCP] + [additional TCP 0..N-1]
+    // Max: 1 (UDP) + 1 (primary) + MAX_SE_CONNECTIONS (additional) = 10
+    struct pollfd fds[1 + 1 + MAX_SE_CONNECTIONS];
+    nfds_t nfds = 0;
 
-    if (ssl_pending <= 0) {
-        // No SSL-buffered data — poll socket(s) for new data.
-        // When RUDP is active, poll BOTH UDP and TCP simultaneously so we
-        // don't miss data arriving on either channel.  Use a reasonable
-        // timeout (100 ms) instead of the previous 0 ms / 5 ms which was
-        // too short and caused the receive loop to spin without ever
-        // seeing data on the RUDP channel.
-        struct pollfd fds[2];
-        nfds_t nfds = 0;
+    // Track which pollfd index maps to which TCP socket
+    // TCP_SOCK_INFO: maps a pollfd index to ssl/fd pair
+    typedef struct { void* ssl; int fd; int is_additional; int additional_idx; } tcp_sock_info_t;
+    tcp_sock_info_t tcp_info[1 + MAX_SE_CONNECTIONS];
+    int tcp_count = 0;
 
-        if (conn->rudp && conn->rudp_enabled) {
-            int udp_fd = rudp_get_udp_fd(conn->rudp);
-            if (udp_fd >= 0) {
-                fds[nfds].fd = udp_fd;
-                fds[nfds].events = POLLIN;
-                fds[nfds].revents = 0;
-                nfds++;
-            }
+    int udp_fd = -1;
+
+    // UDP socket (RUDP)
+    if (conn->rudp && conn->rudp_enabled) {
+        udp_fd = rudp_get_udp_fd(conn->rudp);
+        if (udp_fd >= 0) {
+            fds[nfds].fd = udp_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            nfds++;
         }
+    }
 
+    // Primary TCP socket
+    if (conn->socket_fd >= 0) {
         fds[nfds].fd = conn->socket_fd;
         fds[nfds].events = POLLIN;
         fds[nfds].revents = 0;
+        tcp_info[tcp_count].ssl = conn->ssl;
+        tcp_info[tcp_count].fd = conn->socket_fd;
+        tcp_info[tcp_count].is_additional = 0;
+        tcp_info[tcp_count].additional_idx = -1;
+        tcp_count++;
         nfds++;
+    }
 
+    // Additional TCP sockets
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (!ts->active || ts->socket_fd < 0) continue;
+
+        fds[nfds].fd = ts->socket_fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        tcp_info[tcp_count].ssl = ts->ssl;
+        tcp_info[tcp_count].fd = ts->socket_fd;
+        tcp_info[tcp_count].is_additional = 1;
+        tcp_info[tcp_count].additional_idx = i;
+        tcp_count++;
+        nfds++;
+    }
+
+    if (nfds == 0) return -1;
+
+    // Check for SSL-buffered data on any TCP socket before polling
+    int ssl_pending_idx = -1;
+    for (int t = 0; t < tcp_count; t++) {
+        if (conn->use_ssl_data && ssl_has_pending((ssl_context_t*)tcp_info[t].ssl)) {
+            ssl_pending_idx = t;
+            break;
+        }
+    }
+
+    if (ssl_pending_idx < 0) {
+        // No SSL-buffered data — poll all sockets
         int poll_timeout_ms = (conn->rudp && conn->rudp_enabled) ? 100 : 50;
         int poll_ret = poll(fds, nfds, poll_timeout_ms);
 
         if (poll_ret == 0) {
-            return 0;  // No data available — normal timeout
+            return 0;  // No data available
         }
         if (poll_ret < 0) {
-            LOGE("fill_recv_queue: poll error: %d", poll_ret);
+            LOGE("fill_recv_queue: poll error: %d", errno);
             return -1;
         }
 
-        // Check which socket(s) have data
-        int have_tcp_data = 0;
+        // Check for UDP data first
         for (nfds_t i = 0; i < nfds; i++) {
             if (fds[i].revents & POLLNVAL) {
-                LOGE("fill_recv_queue: socket fd=%d invalid (revents=0x%x)", fds[i].fd, fds[i].revents);
+                LOGE("fill_recv_queue: socket fd=%d invalid", fds[i].fd);
                 return -1;
             }
             if ((fds[i].revents & (POLLERR | POLLHUP)) && !(fds[i].revents & POLLIN)) {
                 LOGE("fill_recv_queue: socket fd=%d error (revents=0x%x)", fds[i].fd, fds[i].revents);
+                // If this is an additional socket, mark it as failed but don't kill the connection
+                int is_additional = 0;
+                for (int t = 0; t < tcp_count; t++) {
+                    if (tcp_info[t].fd == fds[i].fd && tcp_info[t].is_additional) {
+                        is_additional = 1;
+                        break;
+                    }
+                }
+                if (is_additional) {
+                    LOGW("Additional socket fd=%d failed, will be cleaned up", fds[i].fd);
+                    continue;  // Don't return error for additional socket failures
+                }
                 return -1;
             }
-            if (fds[i].revents & POLLIN) {
-                // Is this the UDP (RUDP) socket?
-                if (conn->rudp && conn->rudp_enabled) {
-                    int udp_fd = rudp_get_udp_fd(conn->rudp);
-                    if (udp_fd >= 0 && fds[i].fd == udp_fd) {
-                        // UDP socket has data — process via RUDP
-                        rudp_poll(conn->rudp);
-                        uint32_t rudp_len = 0;
-                        uint8_t rudp_buf[MAX_QUEUED_FRAME];
-                        int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
-                        if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-                            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-                            uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
-                            memcpy(entry->data, rudp_buf, copy_len);
-                            entry->len = copy_len;
-                            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                            conn->recv_queue_count++;
-                            LOGD("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
-                            return 1;
-                        }
-                    } else {
-                        // TCP socket has data
-                        have_tcp_data = 1;
+        }
+
+        // Process UDP data if available
+        if (conn->rudp && conn->rudp_enabled && udp_fd >= 0) {
+            for (nfds_t i = 0; i < nfds; i++) {
+                if (fds[i].fd == udp_fd && (fds[i].revents & POLLIN)) {
+                    rudp_poll(conn->rudp);
+                    uint32_t rudp_len = 0;
+                    uint8_t rudp_buf[MAX_QUEUED_FRAME];
+                    int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
+                    if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+                        queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+                        uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
+                        memcpy(entry->data, rudp_buf, copy_len);
+                        entry->len = copy_len;
+                        conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                        conn->recv_queue_count++;
+                        LOGD("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
+                        return 1;
                     }
-                } else {
-                    have_tcp_data = 1;
                 }
             }
         }
 
-        // If RUDP is not active, we reach here when TCP has data (or error handled above).
-        // If RUDP is active but UDP socket had no data and TCP has data, read from TCP.
-        if (!have_tcp_data) {
-            return 0;  // No usable data
+        // Find which TCP socket has data
+        ssl_pending_idx = -1;
+        for (int t = 0; t < tcp_count; t++) {
+            // Map tcp_info[t] back to the pollfd index
+            int pfd_idx = -1;
+            for (nfds_t i = 0; i < nfds; i++) {
+                if (fds[i].fd == tcp_info[t].fd) {
+                    pfd_idx = (int)i;
+                    break;
+                }
+            }
+            if (pfd_idx >= 0 && (fds[pfd_idx].revents & POLLIN)) {
+                ssl_pending_idx = t;
+                break;
+            }
+        }
+
+        if (ssl_pending_idx < 0) {
+            return 0;  // No TCP data
         }
     }
 
-    // Read block count (or keepalive magic)
-    uint32_t block_count = 0;
-    if (read_uint32(conn, &block_count) != 0) {
-        LOGE("fill_recv_queue: failed to read block count");
-        return -1;
-    }
+    // Read from the selected TCP socket
+    {
+        void* sel_ssl = tcp_info[ssl_pending_idx].ssl;
+        int sel_fd = tcp_info[ssl_pending_idx].fd;
+        int sel_is_additional = tcp_info[ssl_pending_idx].is_additional;
+        int sel_add_idx = tcp_info[ssl_pending_idx].additional_idx;
 
-    if (block_count == KEEP_ALIVE_MAGIC) {
-        // Keepalive: read size + data, respond
-        uint32_t ka_size = 0;
-        if (read_uint32(conn, &ka_size) != 0) return -1;
-        if (ka_size > 512) ka_size = 512;
-        if (ka_size > 0) {
-            uint8_t ka_buf[512];
-            if (data_read_all(conn, ka_buf, (int)ka_size) != 0) return -1;
+        // Update last_recv timestamp for additional sockets
+        if (sel_is_additional && sel_add_idx >= 0) {
+            conn->additional[sel_add_idx].last_recv = softether_tick_ms();
         }
-        LOGD("fill_recv_queue: keepalive (%u bytes)", ka_size);
-        softether_send_keepalive(conn);
-        return 0;
-    }
 
-    if (block_count == 0) {
-        return 0; // Empty message
-    }
+        LOGD("fill_recv_queue: reading from %s socket fd=%d",
+             sel_is_additional ? "additional" : "primary", sel_fd);
 
-    LOGD("fill_recv_queue: reading %u block(s)", block_count);
-
-    for (uint32_t i = 0; i < block_count; i++) {
-        uint32_t block_size = 0;
-        if (read_uint32(conn, &block_size) != 0) {
-            LOGE("fill_recv_queue: failed to read block %u size", i);
+        // Read block count (or keepalive magic)
+        uint32_t block_count = 0;
+        if (read_uint32_sock(conn, sel_ssl, sel_fd, &block_count) != 0) {
+            LOGE("fill_recv_queue: failed to read block count from fd=%d", sel_fd);
+            // If this is an additional socket, mark as failed
+            if (sel_is_additional && sel_add_idx >= 0) {
+                LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd);
+                // Don't return error — let the connection continue on remaining sockets
+            }
             return -1;
         }
 
-        if (block_size > MAX_BLOCK_SIZE) {
-            LOGE("fill_recv_queue: block %u too large: %u", i, block_size);
-            return -1;
+        if (block_count == KEEP_ALIVE_MAGIC) {
+            // Keepalive: read size + data, respond
+            uint32_t ka_size = 0;
+            if (read_uint32_sock(conn, sel_ssl, sel_fd, &ka_size) != 0) return -1;
+            if (ka_size > 512) ka_size = 512;
+            if (ka_size > 0) {
+                uint8_t ka_buf[512];
+                if (data_read_all_sock(conn, sel_ssl, sel_fd, ka_buf, (int)ka_size) != 0) return -1;
+            }
+            LOGD("fill_recv_queue: keepalive (%u bytes) from fd=%d", ka_size, sel_fd);
+            softether_send_keepalive(conn);
+            return 0;
         }
 
-        if (block_size == 0) continue;
+        if (block_count == 0) {
+            return 0; // Empty message
+        }
 
-        if (block_size <= MAX_QUEUED_FRAME && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-            // Read into temp buffer to check for compression magic
-            uint8_t* tmp_block = (uint8_t*)malloc(block_size);
-            if (tmp_block == NULL) {
-                LOGE("fill_recv_queue: allocation failed for block %u", i);
+        LOGD("fill_recv_queue: reading %u block(s) from fd=%d", block_count, sel_fd);
+
+        for (uint32_t i = 0; i < block_count; i++) {
+            uint32_t block_size = 0;
+            if (read_uint32_sock(conn, sel_ssl, sel_fd, &block_size) != 0) {
+                LOGE("fill_recv_queue: failed to read block %u size from fd=%d", i, sel_fd);
                 return -1;
             }
-            if (data_read_all(conn, tmp_block, (int)block_size) != 0) {
-                LOGE("fill_recv_queue: failed to read block %u", i);
-                free(tmp_block);
+
+            if (block_size > MAX_BLOCK_SIZE) {
+                LOGE("fill_recv_queue: block %u too large: %u", i, block_size);
                 return -1;
             }
 
-            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+            if (block_size == 0) continue;
 
-            int compressed_ok = 0;
-            if (conn->server_use_compress) {
-                // Session-level compression: VPN Gate server sends raw zlib
-                uint32_t raw_len = MAX_QUEUED_FRAME;
-                if (uncompress_data(tmp_block, block_size,
-                                    entry->data, &raw_len) == 0) {
-                    entry->len = raw_len;
-                    LOGD("fill_recv_queue: session-decompressed block %u: %u -> %u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X",
-                         i, block_size, raw_len,
-                         raw_len > 0 ? entry->data[0] : 0, raw_len > 1 ? entry->data[1] : 0,
-                         raw_len > 2 ? entry->data[2] : 0, raw_len > 3 ? entry->data[3] : 0,
-                         raw_len > 4 ? entry->data[4] : 0, raw_len > 5 ? entry->data[5] : 0,
-                         raw_len > 6 ? entry->data[6] : 0, raw_len > 7 ? entry->data[7] : 0);
+            if (block_size <= MAX_QUEUED_FRAME && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+                // Read into temp buffer to check for compression magic
+                uint8_t* tmp_block = (uint8_t*)malloc(block_size);
+                if (tmp_block == NULL) {
+                    LOGE("fill_recv_queue: allocation failed for block %u", i);
+                    return -1;
+                }
+                if (data_read_all_sock(conn, sel_ssl, sel_fd, tmp_block, (int)block_size) != 0) {
+                    LOGE("fill_recv_queue: failed to read block %u from fd=%d", i, sel_fd);
                     free(tmp_block);
+                    return -1;
+                }
+
+                queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+
+                int compressed_ok = 0;
+                if (conn->server_use_compress) {
+                    // Session-level compression: VPN Gate server sends raw zlib
+                    uint32_t raw_len = MAX_QUEUED_FRAME;
+                    if (uncompress_data(tmp_block, block_size,
+                                        entry->data, &raw_len) == 0) {
+                        entry->len = raw_len;
+                        LOGD("fill_recv_queue: session-decompressed block %u: %u -> %u bytes", i, block_size, raw_len);
+                        free(tmp_block);
+                        conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                        conn->recv_queue_count++;
+                        compressed_ok = 1;
+                        continue;
+                    }
+                    // Fallback: check for CONNECTION_BULK_COMPRESS_SIGNATURE
+                    if (block_size > 8) {
+                        uint64_t sig = 0;
+                        for (int b = 0; b < 8; b++) {
+                            sig = (sig << 8) | tmp_block[b];
+                        }
+                        if (sig == COMPRESS_MAGIC) {
+                            raw_len = MAX_QUEUED_FRAME;
+                            if (uncompress_data(tmp_block + 8, block_size - 8,
+                                                entry->data, &raw_len) == 0) {
+                                entry->len = raw_len;
+                                LOGD("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes",
+                                     i, block_size - 8, raw_len);
+                                free(tmp_block);
+                                conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                                conn->recv_queue_count++;
+                                compressed_ok = 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if (!compressed_ok) {
+                    // Uncompressed — copy as-is
+                    memcpy(entry->data, tmp_block, block_size);
+                    free(tmp_block);
+                    entry->len = block_size;
                     conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
                     conn->recv_queue_count++;
-                    compressed_ok = 1;
-                    continue;
                 }
-                // Fallback: check for CONNECTION_BULK_COMPRESS_SIGNATURE
-                if (block_size > 8) {
-                    uint64_t sig = 0;
-                    for (int b = 0; b < 8; b++) {
-                        sig = (sig << 8) | tmp_block[b];
-                    }
-                    if (sig == COMPRESS_MAGIC) {
-                        raw_len = MAX_QUEUED_FRAME;
-                        if (uncompress_data(tmp_block + 8, block_size - 8,
-                                            entry->data, &raw_len) == 0) {
-                            entry->len = raw_len;
-                            LOGD("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X",
-                                 i, block_size - 8, raw_len,
-                                 raw_len > 0 ? entry->data[0] : 0, raw_len > 1 ? entry->data[1] : 0,
-                                 raw_len > 2 ? entry->data[2] : 0, raw_len > 3 ? entry->data[3] : 0,
-                                 raw_len > 4 ? entry->data[4] : 0, raw_len > 5 ? entry->data[5] : 0,
-                                 raw_len > 6 ? entry->data[6] : 0, raw_len > 7 ? entry->data[7] : 0);
-                            free(tmp_block);
-                            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                            conn->recv_queue_count++;
-                            compressed_ok = 1;
-                            continue;
-                        }
-                    }
+            } else {
+                // Queue full or frame too large — skip this block
+                uint8_t skip_buf[2048];
+                uint32_t remaining = block_size;
+                while (remaining > 0) {
+                    uint32_t chunk = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
+                    if (data_read_all_sock(conn, sel_ssl, sel_fd, skip_buf, (int)chunk) != 0) return -1;
+                    remaining -= chunk;
                 }
+                LOGD("fill_recv_queue: skipped block %u (%u bytes)", i, block_size);
             }
-
-            if (!compressed_ok) {
-                // Uncompressed — copy as-is
-                memcpy(entry->data, tmp_block, block_size);
-                free(tmp_block);
-                entry->len = block_size;
-                conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                conn->recv_queue_count++;
-            }
-        } else {
-            // Queue full or frame too large — skip this block
-            uint8_t skip_buf[2048];
-            uint32_t remaining = block_size;
-            while (remaining > 0) {
-                uint32_t chunk = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
-                if (data_read_all(conn, skip_buf, (int)chunk) != 0) return -1;
-                remaining -= chunk;
-            }
-            LOGD("fill_recv_queue: skipped block %u (%u bytes, queue_count=%d)", i, block_size, conn->recv_queue_count);
         }
     }
 

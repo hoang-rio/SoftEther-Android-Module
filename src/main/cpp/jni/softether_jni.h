@@ -40,6 +40,16 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetSocketFd(
     JNIEnv *env, jobject thiz, jlong handle);
 
+// Multi-connection support
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetMaxConnection(
+    JNIEnv *env, jobject thiz, jlong handle, jint maxConnections);
+
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetNumConnections(
+    JNIEnv *env, jobject thiz, jlong handle);
+
+JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetAllSocketFds(
+    JNIEnv *env, jobject thiz, jlong handle);
+
 // DHCP over SoftEther tunnel
 JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeDoDhcp(
     JNIEnv *env, jobject thiz, jlong handle);

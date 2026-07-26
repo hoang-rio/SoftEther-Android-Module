@@ -579,6 +579,7 @@ class ConnectionController(
         // Receive loop: VPN -> TUN
         scope.launch {
             val receiveBuffer = ByteArray(65535)
+            var receiveCount = 0
             while (isConnected() && !isCancelled.get()) {
                 try {
                     val result = client.receive(receiveBuffer)
@@ -591,6 +592,11 @@ class ConnectionController(
                                 bytesReceived.addAndGet(result.toLong())
                                 packetsReceived.incrementAndGet()
                                 maybePublishTrafficSnapshot()
+                            }
+                            // Periodically protect additional sockets (multi-connection)
+                            receiveCount++
+                            if (receiveCount % 50 == 0) {
+                                protectAdditionalSockets()
                             }
                         }
                         result == 0 -> {
@@ -960,6 +966,27 @@ class ConnectionController(
             6 -> ConnectionState.CONNECTED
             7 -> ConnectionState.DISCONNECTING
             else -> null
+        }
+    }
+
+    // Track FDs we've already protected to avoid redundant protect() calls
+    private val protectedFds = mutableSetOf<Int>()
+
+    /**
+     * Protect any new additional TCP sockets from routing through TUN.
+     * Called periodically from the receive loop after additional connections are established.
+     */
+    private fun protectAdditionalSockets() {
+        val allFds = client.getAllSocketFds() ?: return
+        for (fd in allFds) {
+            if (fd >= 0 && fd !in protectedFds) {
+                if (service.protect(fd)) {
+                    protectedFds.add(fd)
+                    Log.d(TAG, "Additional socket fd=$fd protected from TUN routing")
+                } else {
+                    Log.e(TAG, "Failed to protect additional socket fd=$fd")
+                }
+            }
         }
     }
 }

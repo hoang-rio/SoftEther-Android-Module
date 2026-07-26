@@ -248,6 +248,51 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGe
     return conn->socket_fd;
 }
 
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetMaxConnection(
+    JNIEnv *env, jobject thiz, jlong handle, jint maxConnections) {
+    if (handle == 0) {
+        LOGE("Invalid handle for setMaxConnection");
+        return;
+    }
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    if (maxConnections < 1) maxConnections = 1;
+    if (maxConnections > MAX_SE_CONNECTIONS) maxConnections = MAX_SE_CONNECTIONS;
+    conn->max_connection = maxConnections;
+    LOGD("Set max_connection to %d", conn->max_connection);
+}
+
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetNumConnections(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return 0;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    return (jint)softether_get_num_connections(conn);
+}
+
+JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetAllSocketFds(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return NULL;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+
+    int fds[MAX_SE_CONNECTIONS + 1];
+    int count = softether_get_active_socket_fds(conn, fds, MAX_SE_CONNECTIONS + 1);
+
+    if (count == 0) return NULL;
+
+    jintArray arr = (*env)->NewIntArray(env, count);
+    if (arr == NULL) return NULL;
+
+    jint* jfds = (jint*)malloc(sizeof(jint) * count);
+    if (jfds == NULL) return NULL;
+    for (int i = 0; i < count; i++) {
+        jfds[i] = (jint)fds[i];
+    }
+    (*env)->SetIntArrayRegion(env, arr, 0, count, jfds);
+    free(jfds);
+
+    LOGD("nativeGetAllSocketFds: returned %d FDs", count);
+    return arr;
+}
+
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetRudpSocketFd(
     JNIEnv *env, jobject thiz, jlong handle) {
     if (handle == 0) return -1;
