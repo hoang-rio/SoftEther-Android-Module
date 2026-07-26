@@ -1728,6 +1728,9 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
     return (int)len;
 }
 
+// Forward declaration for background thread routine
+static void* additional_connect_thread_routine(void* arg);
+
 // Receive data — uses queue to handle multi-block messages; strips Ethernet header
 // Also handles ARP requests automatically
 // Also triggers additional connection establishment (multi-connection)
