@@ -92,12 +92,12 @@ Key V2 differences:
 - ✅ Skip compression for small packets (≤1 byte)
 - ✅ Always-compress policy to prevent server inflate stream corruption
 
-### Phase 6: NAT-T / NAT Traversal (📋 Planned)
-- NAT-T server integration for clients behind symmetric NAT
-- Port mapping discovery via NAT-T server
-- Fallback to NAT-T when direct UDP fails
+### ~~Phase 6: NAT-T / Direct R-UDP~~ — Removed (Not Viable for VPN Gate)
+NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails DNS), VPN Gate servers have no R-UDP listener, and ICMP/DNS R-UDP is disabled by default. Direct R-UDP is impossible — the server's R-UDP socket binds to a random port via `RAND_PORT_ID_SERVER_LISTEN=1` (`Server.c:11109`), not the TCP port.
 
-### Phase 7: Multi-Connection Support (📋 Planned)
+**What works instead:** TCP connection + UDP Acceleration (`seUdpPort`) after TCP is established (`Protocol.c:5702-5724`, `Connection.c:3024-3029`).
+
+### Phase 6: Multi-Connection Support (📋 Planned)
 - [ ] Extend `softether_connection_t` to manage multiple socket+SSL pairs (array/list)
 - [ ] Send `max_connection=4` (or configurable) instead of hardcoded `1` in login PACK
 - [ ] Implement `ClientAdditionalConnect`: open additional TCP sockets after initial connection
@@ -107,7 +107,7 @@ Key V2 differences:
 - [ ] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
 - [ ] Support `half_connection` mode (unidirectional sockets, optional)
 
-### Phase 8: V2 Support (📋 Planned)
+### Phase 7: V2 Support (📋 Planned)
 - [ ] Add V2 AEAD cipher context fields to `rudp_context_t`
 - [ ] Init ChaCha20-Poly1305 cipher contexts in `rudp_init_client` / `rudp_init_server`
 - [ ] Implement V2 send: AEAD encrypt inner fields, append 16-byte Poly1305 MAC

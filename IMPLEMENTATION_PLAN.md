@@ -191,33 +191,27 @@ Client                              Server
 
 ## Remaining Tasks
 
-1. **NAT Traversal (NAT-T)**
-   - NAT-T server integration for clients behind symmetric NAT
-   - Port mapping discovery via NAT-T server
-   - Fallback to NAT-T when direct UDP fails
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 3 (Phase 6)
-
-2. **Multi-Connection Support**
+1. **Multi-Connection Support**
    - Extend connection struct for multiple socket+SSL pairs
    - Open additional TCP connections with session key auth
    - Implement send-side socket selection and receive-side multi-socket polling
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 4
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 6
 
-3. **V2 (ChaCha20-Poly1305 AEAD)**
+2. **V2 (ChaCha20-Poly1305 AEAD)**
    - Replace RC4+zero-verify with AEAD encryption
    - Persistent EVP_CIPHER_CTX for ChaCha20-Poly1305
    - Version negotiation (`udp_acceleration_max_version=2`)
-   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Section 5
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 7
 
-4. **Additional Stability & Testing**
+3. **Additional Stability & Testing**
    - Run full instrumentation suite periodically
    - Validate behavior across diverse VPNGate server profiles
    - Monitor for any edge cases in domain resolution or SSL handshakes
 
-5. **Optional Cleanup (Non-blocking)**
+4. **Optional Cleanup (Non-blocking)**
    - Address compiler warnings (unused helpers, deprecated connectivity broadcast)
 
 ---
 
-*Last Updated: 2026-07-21*
-*Status: ✅ TCP + RUDP V1 working, compression implemented, V2/multi-connection/NAT-T planned*
+*Last Updated: 2026-07-25*
+*Status: ✅ TCP + RUDP V1 working, compression implemented, multi-connection and V2 planned*
