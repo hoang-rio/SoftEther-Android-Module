@@ -294,13 +294,29 @@ static int wait_dhcp_response(softether_connection_t* conn,
         int has_queued = (conn->recv_queue_count > 0);
 
         if (!has_queued && conn->socket_fd >= 0) {
-            struct pollfd pfds[2];
+            struct pollfd pfds[2 + MAX_SE_CONNECTIONS];
             nfds_t nfds = 0;
 
-            pfds[nfds].fd = conn->socket_fd;
-            pfds[nfds].events = POLLIN;
-            pfds[nfds].revents = 0;
-            nfds++;
+            // Primary socket — only poll if it can receive (BOTH or S2C)
+            if (conn->primary_direction == TCP_DIRECTION_BOTH ||
+                conn->primary_direction == TCP_DIRECTION_SERVER_TO_CLIENT) {
+                pfds[nfds].fd = conn->socket_fd;
+                pfds[nfds].events = POLLIN;
+                pfds[nfds].revents = 0;
+                nfds++;
+            }
+
+            // Additional sockets — poll if they can receive
+            for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+                softether_tcp_sock_t* ts = &conn->additional[i];
+                if (!ts->active || ts->socket_fd < 0) continue;
+                int d = ts->direction;
+                if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_SERVER_TO_CLIENT) continue;
+                pfds[nfds].fd = ts->socket_fd;
+                pfds[nfds].events = POLLIN;
+                pfds[nfds].revents = 0;
+                nfds++;
+            }
 
             // Also poll UDP socket when RUDP is active
             int udp_fd = -1;
@@ -312,6 +328,13 @@ static int wait_dhcp_response(softether_connection_t* conn,
                     pfds[nfds].revents = 0;
                     nfds++;
                 }
+            }
+
+            if (nfds == 0) {
+                // No receive-capable socket available, just wait
+                usleep(poll_interval * 1000);
+                elapsed += poll_interval;
+                continue;
             }
 
             int poll_result = poll(pfds, nfds, poll_interval);

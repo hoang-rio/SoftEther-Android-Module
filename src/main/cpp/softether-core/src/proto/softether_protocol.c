@@ -635,10 +635,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "max_connection", 4);  // Request 4 connections for multi-connection throughput
     pack_add_int(&p, "use_encrypt", 1);
     pack_add_int(&p, "use_compress", 1);
-    // half_connection is disabled: server sets primary to C2S which blocks
-    // DHCP responses until additional S2C connections are established.
-    // Keep bidirectional primary for reliable initial data exchange.
-    pack_add_int(&p, "half_connection", 0);
+    pack_add_int(&p, "half_connection", 1);  // Half-connection: primary becomes C2S, additional sockets get S2C/C2S
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
     pack_add_int(&p, "qos", 1);
@@ -1350,6 +1347,35 @@ static int perform_authentication_http(softether_connection_t* conn,
     return ERR_NONE;
 }
 
+// Establish the first additional connection synchronously (before DHCP).
+// This ensures at least one S2C socket exists for receiving data when
+// half_connection mode is enabled (server sets primary to C2S).
+// Returns 0 on success, -1 on failure. Also sets primary_direction = C2S on success.
+static int softether_establish_first_additional(softether_connection_t* conn) {
+    if (conn == NULL) return -1;
+
+    LOGD("Establishing first additional connection for half-connection...");
+
+    int result = softether_additional_connect(conn);
+    if (result == 0) {
+        // Check if we got an S2C socket — if so, switch primary to C2S
+        for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+            if (conn->additional[i].active &&
+                conn->additional[i].direction == TCP_DIRECTION_SERVER_TO_CLIENT) {
+                conn->primary_direction = TCP_DIRECTION_CLIENT_TO_SERVER;
+                LOGD("Half-connection: first additional is S2C (fd=%d), primary switched to C2S",
+                     conn->additional[i].socket_fd);
+                return 0;
+            }
+        }
+        // Additional connected but no S2C — keep primary BOTH (shouldn't happen)
+        LOGW("Half-connection: first additional has no S2C direction, primary stays BOTH");
+    } else {
+        LOGW("Half-connection: first additional connect failed (%d), primary stays BOTH", result);
+    }
+    return result;
+}
+
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
@@ -1579,6 +1605,15 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     tv.tv_usec = (data_timeout_ms % 1000) * 1000;
     setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     LOGD("Socket timeout set to %d ms for data operations", data_timeout_ms);
+
+    // Half-connection: establish first additional connection synchronously before returning.
+    // Server sets primary to C2S on its side after login, so we need at least one S2C
+    // additional socket to receive data (DHCP etc.) before the caller starts receiving.
+    if (conn->half_connection) {
+        softether_establish_first_additional(conn);
+        // Even if this failed, we proceed — primary stays BOTH as fallback.
+        // The caller (DHCP, receive loop) will handle missing S2C gracefully.
+    }
 
     // Call connect callback if set
     if (conn->on_connect != NULL) {
