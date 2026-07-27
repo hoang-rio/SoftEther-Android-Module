@@ -926,6 +926,7 @@ class ConnectionController(
                     val mapped = mapNativeState(client.nativeGetState(nativeHandle))
                     if (mapped != null &&
                         mapped != ConnectionState.DISCONNECTED &&
+                        mapped != ConnectionState.CONNECTED &&
                         mapped != currentState
                     ) {
                         val now = System.currentTimeMillis()
