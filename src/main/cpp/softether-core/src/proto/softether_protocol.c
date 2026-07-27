@@ -635,7 +635,10 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "max_connection", 4);  // Request 4 connections for multi-connection throughput
     pack_add_int(&p, "use_encrypt", 1);
     pack_add_int(&p, "use_compress", 1);
-    pack_add_int(&p, "half_connection", 1);  // Enable half-connection for better throughput with multi-TCP
+    // half_connection is disabled: server sets primary to C2S which blocks
+    // DHCP responses until additional S2C connections are established.
+    // Keep bidirectional primary for reliable initial data exchange.
+    pack_add_int(&p, "half_connection", 0);
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
     pack_add_int(&p, "qos", 1);
@@ -1343,12 +1346,6 @@ static int perform_authentication_http(softether_connection_t* conn,
     }
 
     conn->session_established = 1;
-
-    // In half-connection mode, primary direction stays BOTH until we have at least one
-    // additional SERVER_TO_CLIENT socket to receive data (needed for DHCP etc.)
-    if (conn->half_connection) {
-        LOGD("Half-connection enabled: primary stays BOTH until S2C socket is ready");
-    }
 
     return ERR_NONE;
 }
@@ -2543,24 +2540,6 @@ int softether_additional_connect(softether_connection_t* conn) {
 
     LOGD("additional_connect: SUCCESS slot=%d fd=%d direction=%u num_additional=%d",
          slot, fd, server_direction, conn->num_additional);
-
-    // Half-connection: once we have at least one SERVER_TO_CLIENT additional socket,
-    // switch primary to CLIENT_TO_SERVER (send-only). DHCP and initial data exchange
-    // rely on the primary staying BOTH until an S2C path exists.
-    if (conn->half_connection && conn->primary_direction == TCP_DIRECTION_BOTH) {
-        int has_s2c = 0;
-        for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
-            if (conn->additional[i].active &&
-                conn->additional[i].direction == TCP_DIRECTION_SERVER_TO_CLIENT) {
-                has_s2c = 1;
-                break;
-            }
-        }
-        if (has_s2c) {
-            conn->primary_direction = TCP_DIRECTION_CLIENT_TO_SERVER;
-            LOGD("Half-connection: S2C socket ready, primary switched to C2S");
-        }
-    }
 
     conn->additional_failed_count = 0;
     return 0;
