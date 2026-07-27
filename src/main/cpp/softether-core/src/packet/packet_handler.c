@@ -729,6 +729,22 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         int sel_is_additional = tcp_info[ssl_pending_idx].is_additional;
         int sel_add_idx = tcp_info[ssl_pending_idx].additional_idx;
 
+        // Helper macro to close and deactivate a failed additional socket
+        // Returns 0 to keep connection alive, or propagates -1 for primary socket failures
+        #define CLOSE_FAILED_ADDITIONAL_SOCKET() do { \
+            if (sel_is_additional && sel_add_idx >= 0) { \
+                LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd); \
+                softether_tcp_sock_t* _ts = &conn->additional[sel_add_idx]; \
+                if (_ts->ssl != NULL) ssl_shutdown((ssl_context_t*)_ts->ssl); \
+                if (_ts->ssl_ctx != NULL) { ssl_destroy((ssl_context_t*)_ts->ssl_ctx); _ts->ssl_ctx = NULL; _ts->ssl = NULL; } \
+                if (_ts->socket_fd >= 0) { close(_ts->socket_fd); _ts->socket_fd = -1; } \
+                _ts->active = 0; \
+                conn->num_additional--; \
+                return 0; \
+            } \
+            return -1; \
+        } while(0)
+
         // Update last_recv timestamp for additional sockets
         if (sel_is_additional && sel_add_idx >= 0) {
             conn->additional[sel_add_idx].last_recv = softether_tick_ms();
@@ -741,22 +757,21 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         uint32_t block_count = 0;
         if (read_uint32_sock(conn, sel_ssl, sel_fd, &block_count) != 0) {
             LOGE("fill_recv_queue: failed to read block count from fd=%d", sel_fd);
-            // If this is an additional socket, mark as failed
-            if (sel_is_additional && sel_add_idx >= 0) {
-                LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd);
-                // Don't return error — let the connection continue on remaining sockets
-            }
-            return -1;
+            CLOSE_FAILED_ADDITIONAL_SOCKET();
         }
 
         if (block_count == KEEP_ALIVE_MAGIC) {
             // Keepalive: read size + data, respond
             uint32_t ka_size = 0;
-            if (read_uint32_sock(conn, sel_ssl, sel_fd, &ka_size) != 0) return -1;
+            if (read_uint32_sock(conn, sel_ssl, sel_fd, &ka_size) != 0) {
+                CLOSE_FAILED_ADDITIONAL_SOCKET();
+            }
             if (ka_size > 512) ka_size = 512;
             if (ka_size > 0) {
                 uint8_t ka_buf[512];
-                if (data_read_all_sock(conn, sel_ssl, sel_fd, ka_buf, (int)ka_size) != 0) return -1;
+                if (data_read_all_sock(conn, sel_ssl, sel_fd, ka_buf, (int)ka_size) != 0) {
+                    CLOSE_FAILED_ADDITIONAL_SOCKET();
+                }
             }
             LOGD("fill_recv_queue: keepalive (%u bytes) from fd=%d", ka_size, sel_fd);
             softether_send_keepalive(conn);
@@ -773,7 +788,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             uint32_t block_size = 0;
             if (read_uint32_sock(conn, sel_ssl, sel_fd, &block_size) != 0) {
                 LOGE("fill_recv_queue: failed to read block %u size from fd=%d", i, sel_fd);
-                return -1;
+                CLOSE_FAILED_ADDITIONAL_SOCKET();
             }
 
             if (block_size > MAX_BLOCK_SIZE) {
@@ -793,7 +808,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                 if (data_read_all_sock(conn, sel_ssl, sel_fd, tmp_block, (int)block_size) != 0) {
                     LOGE("fill_recv_queue: failed to read block %u from fd=%d", i, sel_fd);
                     free(tmp_block);
-                    return -1;
+                    CLOSE_FAILED_ADDITIONAL_SOCKET();
                 }
 
                 queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
@@ -849,13 +864,17 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                 uint32_t remaining = block_size;
                 while (remaining > 0) {
                     uint32_t chunk = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
-                    if (data_read_all_sock(conn, sel_ssl, sel_fd, skip_buf, (int)chunk) != 0) return -1;
+                    if (data_read_all_sock(conn, sel_ssl, sel_fd, skip_buf, (int)chunk) != 0) {
+                        CLOSE_FAILED_ADDITIONAL_SOCKET();
+                    }
                     remaining -= chunk;
                 }
                 LOGD("fill_recv_queue: skipped block %u (%u bytes)", i, block_size);
             }
         }
     }
+
+    #undef CLOSE_FAILED_ADDITIONAL_SOCKET
 
     LOGD("fill_recv_queue: queued %d frames total", conn->recv_queue_count);
     return (conn->recv_queue_count > 0) ? 1 : 0;

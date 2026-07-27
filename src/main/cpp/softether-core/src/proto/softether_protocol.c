@@ -2545,12 +2545,12 @@ int softether_select_send_socket(softether_connection_t* conn) {
         best_idx = 0;
     }
 
-    // Check additional sockets
+    // Check additional sockets - only prefer over primary if strictly less late
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
 
-        if (ts->late_count <= min_late) {
+        if (ts->late_count < min_late) {
             min_late = ts->late_count;
             best_idx = i + 1;  // +1 because index 0 = primary
         }
