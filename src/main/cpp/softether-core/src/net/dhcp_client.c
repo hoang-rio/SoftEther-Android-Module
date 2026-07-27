@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <unistd.h>
 #include <android/log.h>
 
 #define TAG "SoftEtherDHCP"
