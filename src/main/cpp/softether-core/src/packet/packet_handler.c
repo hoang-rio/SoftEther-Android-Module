@@ -601,23 +601,30 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         }
     }
 
-    // Primary TCP socket
+    // Primary TCP socket — only add if direction allows receiving (client: BOTH or S2C)
     if (conn->socket_fd >= 0) {
-        fds[nfds].fd = conn->socket_fd;
-        fds[nfds].events = POLLIN;
-        fds[nfds].revents = 0;
-        tcp_info[tcp_count].ssl = conn->ssl;
-        tcp_info[tcp_count].fd = conn->socket_fd;
-        tcp_info[tcp_count].is_additional = 0;
-        tcp_info[tcp_count].additional_idx = -1;
-        tcp_count++;
-        nfds++;
+        int pd = conn->primary_direction;
+        if (pd == TCP_DIRECTION_BOTH || pd == TCP_DIRECTION_SERVER_TO_CLIENT) {
+            fds[nfds].fd = conn->socket_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            tcp_info[tcp_count].ssl = conn->ssl;
+            tcp_info[tcp_count].fd = conn->socket_fd;
+            tcp_info[tcp_count].is_additional = 0;
+            tcp_info[tcp_count].additional_idx = -1;
+            tcp_count++;
+            nfds++;
+        }
     }
 
-    // Additional TCP sockets
+    // Additional TCP sockets — only add if direction allows receiving (client: BOTH or S2C)
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active || ts->socket_fd < 0) continue;
+
+        // Client mode: can receive on TCP_BOTH or TCP_SERVER_TO_CLIENT
+        int d = ts->direction;
+        if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_SERVER_TO_CLIENT) continue;
 
         fds[nfds].fd = ts->socket_fd;
         fds[nfds].events = POLLIN;

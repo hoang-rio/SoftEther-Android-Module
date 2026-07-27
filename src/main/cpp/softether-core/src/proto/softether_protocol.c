@@ -635,7 +635,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "max_connection", 4);  // Request 4 connections for multi-connection throughput
     pack_add_int(&p, "use_encrypt", 1);
     pack_add_int(&p, "use_compress", 1);
-    pack_add_int(&p, "half_connection", 0);
+    pack_add_int(&p, "half_connection", 1);  // Enable half-connection for better throughput with multi-TCP
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
     pack_add_int(&p, "qos", 1);
@@ -925,6 +925,7 @@ softether_connection_t* softether_create(void) {
     conn->num_additional = 0;
     conn->max_connection = 4;  // Target: request 4 connections in login PACK
     conn->half_connection = 0;
+    conn->primary_direction = TCP_DIRECTION_BOTH;
     conn->next_connect_time = 0;
     conn->additional_failed_count = 0;
     memset(conn->additional, 0, sizeof(conn->additional));
@@ -1252,6 +1253,13 @@ static int perform_authentication_http(softether_connection_t* conn,
     pack_get_int((const uint8_t*)body, body_len, "use_compress", &conn->server_use_compress);
     pack_get_int((const uint8_t*)body, body_len, "use_fast_rc4", &conn->server_use_fast_rc4);
     pack_get_int((const uint8_t*)body, body_len, "timeout", &conn->server_timeout);
+
+    // Parse half_connection from server response
+    uint32_t half_conn = 0;
+    if (pack_get_int((const uint8_t*)body, body_len, "half_connection", &half_conn) == 0) {
+        conn->half_connection = (int)half_conn;
+        LOGD("Server half_connection=%u", half_conn);
+    }
     
     // Determine data channel mode (same logic as reference SoftEther)
     if (conn->server_use_encrypt && !conn->server_use_fast_rc4) {
@@ -1335,6 +1343,13 @@ static int perform_authentication_http(softether_connection_t* conn,
     }
 
     conn->session_established = 1;
+
+    // In half-connection mode, the primary socket direction is client-to-server (send only).
+    // Server will assign directions to additional connections (alternating S2C / C2S).
+    if (conn->half_connection) {
+        conn->primary_direction = TCP_DIRECTION_CLIENT_TO_SERVER;
+        LOGD("Half-connection enabled: primary socket set to TCP_DIRECTION_CLIENT_TO_SERVER");
+    }
 
     return ERR_NONE;
 }
@@ -2208,6 +2223,7 @@ int softether_additional_connect(softether_connection_t* conn) {
 
     // Find a free slot
     int slot = -1;
+    uint32_t server_direction = TCP_DIRECTION_BOTH;
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         if (!conn->additional[i].active) {
             slot = i;
@@ -2506,9 +2522,11 @@ int softether_additional_connect(softether_connection_t* conn) {
                     return -1;
                 }
             }
+            // Parse direction from server response (used in half-connection mode)
+            pack_get_int(auth_resp + body_off, (uint32_t)body_ln, "direction", &server_direction);
         }
 
-        LOGD("additional_connect: auth response parsed (error=%u)", err_val);
+        LOGD("additional_connect: auth response parsed (error=%u, direction=%u)", err_val, server_direction);
     }
 
     // Step 5: Add socket to additional[] array
@@ -2517,15 +2535,15 @@ int softether_additional_connect(softether_connection_t* conn) {
         ts->socket_fd = fd;
         ts->ssl_ctx = ssl_ctx;
         ts->ssl = ssl_ctx;
-        ts->direction = TCP_DIRECTION_BOTH;
+        ts->direction = (int)server_direction;
         ts->last_recv = softether_tick_ms();
         ts->late_count = 0;
         ts->active = 1;
         conn->num_additional++;
     }
 
-    LOGD("additional_connect: SUCCESS slot=%d fd=%d num_additional=%d",
-         slot, fd, conn->num_additional);
+    LOGD("additional_connect: SUCCESS slot=%d fd=%d direction=%u num_additional=%d",
+         slot, fd, server_direction, conn->num_additional);
 
     conn->additional_failed_count = 0;
     return 0;
@@ -2533,16 +2551,21 @@ int softether_additional_connect(softether_connection_t* conn) {
 
 // Select the best TCP socket for sending (lowest late_count).
 // Returns the socket index: 0 = primary, 1..N = additional.
+// In half-connection mode, only selects sockets whose direction allows sending
+// (client mode: TCP_DIRECTION_BOTH or TCP_DIRECTION_CLIENT_TO_SERVER).
 int softether_select_send_socket(softether_connection_t* conn) {
     if (conn == NULL) return 0;
 
-    int best_idx = 0;
+    int best_idx = -1;
     uint32_t min_late = UINT32_MAX;
 
-    // Check primary socket
+    // Check primary socket (client mode: send if direction is BOTH or C2S)
     if (conn->socket_fd >= 0 && conn->ssl != NULL) {
-        min_late = 0;
-        best_idx = 0;
+        int pd = conn->primary_direction;
+        if (pd == TCP_DIRECTION_BOTH || pd == TCP_DIRECTION_CLIENT_TO_SERVER) {
+            min_late = 0;
+            best_idx = 0;
+        }
     }
 
     // Check additional sockets - only prefer over primary if strictly less late
@@ -2550,10 +2573,19 @@ int softether_select_send_socket(softether_connection_t* conn) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
 
+        // Client mode: can send on TCP_BOTH or TCP_CLIENT_TO_SERVER
+        int d = ts->direction;
+        if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_CLIENT_TO_SERVER) continue;
+
         if (ts->late_count < min_late) {
             min_late = ts->late_count;
             best_idx = i + 1;  // +1 because index 0 = primary
         }
+    }
+
+    // Fallback to primary if no send-capable socket found
+    if (best_idx < 0) {
+        best_idx = 0;
     }
 
     return best_idx;

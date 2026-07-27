@@ -157,6 +157,7 @@ typedef struct softether_connection {
     int num_additional;          // number of active additional connections
     int max_connection;          // target max connections (sent in login PACK)
     int half_connection;         // 0 = bidirectional, 1 = unidirectional per socket
+    int primary_direction;       // TCP_DIRECTION_* for primary socket (default BOTH)
     uint64_t next_connect_time;  // monotonic timestamp for next additional connect attempt (ms)
     int additional_failed_count; // serial failure counter for additional connects
     // Background additional connection thread
