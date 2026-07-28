@@ -165,6 +165,7 @@ typedef struct softether_connection {
     int additional_connecting;   // 1 if background thread is running
     int additional_connect_slot; // which slot the background thread is targeting
     int additional_connect_result; // result from background thread (0=success, -1=fail)
+    int send_rr_idx;              // round-robin index for send socket selection
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
     void (*on_disconnect)(struct softether_connection* conn);

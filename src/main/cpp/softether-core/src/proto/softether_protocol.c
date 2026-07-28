@@ -2580,46 +2580,39 @@ int softether_additional_connect(softether_connection_t* conn) {
     return 0;
 }
 
-// Select the best TCP socket for sending (lowest late_count).
+// Select the next TCP socket for sending using round-robin.
 // Returns the socket index: 0 = primary, 1..N = additional.
 // In half-connection mode, only selects sockets whose direction allows sending
 // (client mode: TCP_DIRECTION_BOTH or TCP_DIRECTION_CLIENT_TO_SERVER).
 int softether_select_send_socket(softether_connection_t* conn) {
     if (conn == NULL) return 0;
 
-    int best_idx = -1;
-    uint32_t min_late = UINT32_MAX;
+    // Collect all send-capable socket indices
+    int candidates[MAX_SE_CONNECTIONS + 1];
+    int count = 0;
 
-    // Check primary socket (client mode: send if direction is BOTH or C2S)
+    // Primary socket: send-capable if direction is BOTH or C2S
     if (conn->socket_fd >= 0 && conn->ssl != NULL) {
         int pd = conn->primary_direction;
         if (pd == TCP_DIRECTION_BOTH || pd == TCP_DIRECTION_CLIENT_TO_SERVER) {
-            min_late = 0;
-            best_idx = 0;
+            candidates[count++] = 0;
         }
     }
 
-    // Check additional sockets - only prefer over primary if strictly less late
+    // Additional sockets: send-capable if direction is BOTH or C2S
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
-
-        // Client mode: can send on TCP_BOTH or TCP_CLIENT_TO_SERVER
         int d = ts->direction;
         if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_CLIENT_TO_SERVER) continue;
-
-        if (ts->late_count < min_late) {
-            min_late = ts->late_count;
-            best_idx = i + 1;  // +1 because index 0 = primary
-        }
+        candidates[count++] = i + 1;  // +1 because index 0 = primary
     }
 
-    // Fallback to primary if no send-capable socket found
-    if (best_idx < 0) {
-        best_idx = 0;
-    }
+    if (count == 0) return 0;  // fallback to primary
 
-    return best_idx;
+    int idx = conn->send_rr_idx % count;
+    conn->send_rr_idx = (conn->send_rr_idx + 1) % count;
+    return candidates[idx];
 }
 
 // Get the total number of active connections (primary + additional)
