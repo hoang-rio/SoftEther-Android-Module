@@ -25,7 +25,7 @@ This document outlines the plan for implementing SoftEther VPN protocol in C lan
 
 ---
 
-## Current Status (2026-03-09)
+## Current Status (2026-07-21)
 
 ### Implementation Complete ✅
 
@@ -38,6 +38,10 @@ All core implementation phases are complete and stable:
 - ✅ Domain-to-IP resolution before TLS handshake (matching SoftEther client behavior)
 - ✅ Redundant DNS lookup elimination in TCP socket layer
 - ✅ Enhanced SSL error logging with errno and OpenSSL error details
+- ✅ RUDP V1 with `protect(rudpFd)` to prevent TUN routing loop
+- ✅ zlib compression on RUDP and TCP data paths
+- ✅ Always-compress policy to prevent server inflate stream corruption
+- ✅ Simultaneous RUDP+TCP polling with 100ms timeout
 
 ### Key Improvements (2026-02-27 → 2026-03-09)
 
@@ -65,14 +69,37 @@ All core implementation phases are complete and stable:
 - Full button state lifecycle for SSTP (Cancel while connecting, Disconnect while connected)
 - Wired SSTP connect/disconnect through protocol dialog callback
 
+### Key Improvements (2026-07-20 → 2026-07-21)
+
+**6. RUDP V1 Fix (ConnectionController.kt):**
+- Restored `protect(rudpFd)` call accidentally removed in commit `58a2c74`
+- Without it, RUDP UDP packets route back through TUN (VPN tunnel) causing infinite send loop
+- Root cause of "RUDP fires continuously while receive path stalls"
+
+**7. Always-Compress Policy (softether_rudp.c, packet_handler.c):**
+- RUDP: Removed `comp_len < data_size` guard — always compress when `data_size > 1`
+- TCP: Removed `comp_len < payload_len` size check — always compress when `server_use_compress=1`
+- Rationale: SoftEther server's `DeflateDecompress` has persistent fallback; uncompressed block corrupts inflate stream
+
+**8. Simultaneous RUDP+TCP Polling (packet_handler.c):**
+- `fill_recv_queue` now uses `poll()` with both UDP and TCP sockets
+- 100ms timeout when RUDP active (vs previous 0ms/5ms which caused receive loop to spin)
+- Prevents missing data arriving on either channel
+
+**9. Diagnostic Logging (packet_handler.c):**
+- Added log in `fill_recv_queue` fallback path for decompression failures
+- Aids debugging when RUDP data doesn't reach Java layer
+
 ### Protocol Support
 
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | 🚧 Planned |
+| UDP (SoftEther RUDP) | ✅ V1 Working (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
 
-**TCP** is the only currently supported transport. UDP (RUDP) support is planned and requires implementing ~5000+ lines of reliable-UDP layer with NAT traversal, sequence numbers, ACKs, retransmission, and HMAC signatures.
+**TCP** connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
+
+**UDP (RUDP) V1** is implemented and working. Data is transported via UDP with RC4 encryption, keepalive polling, zlib compression, and TCP fallback. V2 (ChaCha20-Poly1305 AEAD) is planned.
 
 ---
 
@@ -164,20 +191,27 @@ Client                              Server
 
 ## Remaining Tasks
 
-1. **UDP (RUDP) Support**
-   - Implement reliable UDP transport layer with sequence numbers, ACKs, retransmission
-   - Add NAT traversal support
-   - Integrate with existing native layer
+1. **Multi-Connection Support**
+   - Extend connection struct for multiple socket+SSL pairs
+   - Open additional TCP connections with session key auth
+   - Implement send-side socket selection and receive-side multi-socket polling
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 6
 
-2. **Additional Stability & Testing**
+2. **V2 (ChaCha20-Poly1305 AEAD)**
+   - Replace RC4+zero-verify with AEAD encryption
+   - Persistent EVP_CIPHER_CTX for ChaCha20-Poly1305
+   - Version negotiation (`udp_acceleration_max_version=2`)
+   - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 7
+
+3. **Additional Stability & Testing**
    - Run full instrumentation suite periodically
    - Validate behavior across diverse VPNGate server profiles
    - Monitor for any edge cases in domain resolution or SSL handshakes
 
-3. **Optional Cleanup (Non-blocking)**
+4. **Optional Cleanup (Non-blocking)**
    - Address compiler warnings (unused helpers, deprecated connectivity broadcast)
 
 ---
 
-*Last Updated: 2026-03-09*
-*Status: ✅ TCP protocol fully working, dialog merged, domain→IP resolution implemented, button states consistent with OpenVPN/SoftEther*
+*Last Updated: 2026-07-25*
+*Status: ✅ TCP + RUDP V1 working, compression implemented, multi-connection and V2 planned*

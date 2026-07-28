@@ -38,7 +38,10 @@ data class ConnectionConfig(
     val country: String = "",
     val isL2TPSupport: Boolean = false,
     val isSSTPSupport: Boolean = false,
-    val authMethod: AuthMethod = AuthMethod.AUTO
+    val authMethod: AuthMethod = AuthMethod.AUTO,
+    val clientProductName: String = "VPN Gate Connector",
+    val clientVersion: String = "1.0.0",
+    val clientBuild: Int = 1
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -63,7 +66,10 @@ data class ConnectionConfig(
         country = parcel.readString() ?: "",
         isL2TPSupport = parcel.readByte() != 0.toByte(),
         isSSTPSupport = parcel.readByte() != 0.toByte(),
-        authMethod = AuthMethod.valueOf(parcel.readString() ?: AuthMethod.AUTO.name)
+        authMethod = AuthMethod.valueOf(parcel.readString() ?: AuthMethod.AUTO.name),
+        clientProductName = parcel.readString() ?: "VPN Gate Connector",
+        clientVersion = parcel.readString() ?: "1.0.0",
+        clientBuild = parcel.readInt()
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -89,6 +95,9 @@ data class ConnectionConfig(
         parcel.writeByte(if (isL2TPSupport) 1 else 0)
         parcel.writeByte(if (isSSTPSupport) 1 else 0)
         parcel.writeString(authMethod.name)
+        parcel.writeString(clientProductName)
+        parcel.writeString(clientVersion)
+        parcel.writeInt(clientBuild)
     }
 
     override fun describeContents(): Int = 0

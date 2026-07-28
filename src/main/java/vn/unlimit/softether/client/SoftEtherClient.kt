@@ -87,8 +87,27 @@ class SoftEtherClient {
             nativeSetAuthType(nativeHandle, authTypeInt)
         }
 
+        // Build client info for server session list
+        val clientInfo = vn.unlimit.softether.model.ClientInfoFactory.build(
+            productName = "SoftEther VPN Client for Android",
+            productVersion = "2.3.2",
+            productBuild = 132,
+            config = vn.unlimit.softether.model.ConnectionConfig(
+                serverHost = host,
+                serverPort = port,
+                username = username,
+                password = password,
+                virtualHub = hubName
+            )
+        )
+
         // Connect to server with hub name
-        val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName)
+        val result = nativeConnectWithHub(nativeHandle, host, port, username, password, hubName,
+            false,
+            clientInfo.productName, clientInfo.productVersion, clientInfo.productBuild,
+            clientInfo.osName, clientInfo.osVersion, clientInfo.osProductId,
+            clientInfo.hostName, clientInfo.clientIpAddress, clientInfo.clientPort,
+            clientInfo.serverHostName, clientInfo.serverIpAddress, clientInfo.serverPort)
 
         if (result != SoftEtherError.ERR_NONE) {
             nativeDestroy(nativeHandle)
@@ -113,6 +132,33 @@ class SoftEtherClient {
             vn.unlimit.softether.model.AuthMethod.AUTO -> 0
         }
         nativeSetAuthType(nativeHandle, authTypeInt)
+    }
+
+    /**
+     * Set the maximum number of TCP connections for multi-connection support
+     * @param maxConnections Target number of connections (1-8, default 4)
+     */
+    fun setMaxConnection(maxConnections: Int) {
+        if (nativeHandle == 0L) return
+        nativeSetMaxConnection(nativeHandle, maxConnections.coerceIn(1, 8))
+    }
+
+    /**
+     * Get the current number of active TCP connections (primary + additional)
+     * @return Number of active connections
+     */
+    fun getNumConnections(): Int {
+        if (nativeHandle == 0L) return 0
+        return nativeGetNumConnections(nativeHandle)
+    }
+
+    /**
+     * Get all active TCP socket FDs (primary + additional) for VpnService.protect()
+     * @return Array of socket FDs, or null if none
+     */
+    fun getAllSocketFds(): IntArray? {
+        if (nativeHandle == 0L) return null
+        return nativeGetAllSocketFds(nativeHandle)
     }
 
     /**
@@ -215,7 +261,20 @@ class SoftEtherClient {
         port: Int,
         username: String,
         password: String,
-        hubName: String
+        hubName: String,
+        useTcp: Boolean,
+        clientProductName: String,
+        clientVersion: String,
+        clientBuild: Int,
+        clientOsName: String,
+        clientOsVersion: String,
+        clientOsProductId: String,
+        clientHostName: String,
+        clientIpAddress: String,
+        clientPort: Int,
+        serverHostName: String,
+        serverIpAddress: String,
+        serverPort: Int
     ): Int
     external fun nativeDisconnect(handle: Long)
     external fun nativeGetState(handle: Long): Int
@@ -223,8 +282,12 @@ class SoftEtherClient {
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
     external fun nativeGetSocketFd(handle: Long): Int
+    external fun nativeGetRudpSocketFd(handle: Long): Int
     external fun nativeDoDhcp(handle: Long): IntArray?
     external fun nativeSetAuthType(handle: Long, authType: Int)
+    external fun nativeSetMaxConnection(handle: Long, maxConnections: Int)
+    external fun nativeGetNumConnections(handle: Long): Int
+    external fun nativeGetAllSocketFds(handle: Long): IntArray?
 
     /**
      * Perform DHCP over SoftEther tunnel to get IP configuration

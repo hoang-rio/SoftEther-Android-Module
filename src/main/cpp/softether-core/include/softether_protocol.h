@@ -3,7 +3,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #include <pthread.h>
+#include "softether_rudp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +19,22 @@ extern "C" {
 // Real SoftEther data channel constants
 #define KEEP_ALIVE_MAGIC        0xFFFFFFFF
 #define SOFTETHER_MAX_BLOCK     (1600 * 1600)
+
+// Multi-connection constants (matching Cedar.h)
+#define MAX_SE_CONNECTIONS                  8
+#define MAX_SEND_SOCKET_QUEUE_SIZE          (1600 * 1600)
+#define MIN_SEND_SOCKET_QUEUE_SIZE          (1600 * 200)
+#define ADDITIONAL_CONNECT_INTERVAL_MS      1000
+#define TCP_DIRECTION_BOTH                  0
+#define TCP_DIRECTION_SERVER_TO_CLIENT      1
+#define TCP_DIRECTION_CLIENT_TO_SERVER      2
+
+// Monotonic time in milliseconds (for multi-connection timing)
+static inline uint64_t softether_tick_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 // Legacy command types (used internally for dispatch, not on wire)
 #define CMD_DATA                0x000C
@@ -56,6 +74,17 @@ typedef struct {
     uint32_t len;
 } queued_frame_t;
 
+// Additional TCP socket for multi-connection support
+typedef struct {
+    int socket_fd;
+    void* ssl_ctx;       // ssl_context_t*
+    void* ssl;           // ssl_context_t* (same pointer, used for I/O)
+    int direction;       // TCP_DIRECTION_*
+    uint64_t last_recv;  // monotonic timestamp of last recv (ms)
+    uint32_t late_count; // number of times this socket had no data when polled
+    int active;          // 1 if slot is in use, 0 if free
+} softether_tcp_sock_t;
+
 // Connection context
 typedef struct softether_connection {
     int socket_fd;
@@ -80,6 +109,7 @@ typedef struct softether_connection {
     uint32_t session_key_32;
     uint32_t server_max_connection;
     uint32_t server_use_encrypt;
+    uint32_t server_use_compress;  // 1 if server accepted compression
     uint32_t server_use_fast_rc4;
     uint32_t server_timeout;
     int use_ssl_data;  // 1 = SSL for data, 0 = raw TCP
@@ -97,8 +127,45 @@ typedef struct softether_connection {
     int recv_queue_head;       // read position
     int recv_queue_tail;       // write position
     int recv_queue_count;      // number of queued frames
+    // RUDP (UDP acceleration)
+    rudp_context_t* rudp;
+    int rudp_enabled;
+    uint32_t rudp_server_cookie;
+    uint32_t rudp_client_cookie;
+    uint8_t rudp_server_key[128];
+    int rudp_server_key_size;
+    char rudp_server_ip[64];
+    uint16_t rudp_server_port;
+    int rudp_version;
+    // Client info for server session list
+    char client_product_name[128];
+    char client_product_version[32];
+    int client_product_build;
+    char client_os_name[128];
+    char client_os_version[64];
+    char client_os_product_id[128];
+    char client_host_name[128];
+    char client_ip_address[64];
+    int client_port;
+    char server_host_name[128];
+    char server_ip_address[64];
+    int server_port_reported;
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
+    // Multi-connection support
+    softether_tcp_sock_t additional[MAX_SE_CONNECTIONS];  // additional TCP sockets (index 0 unused; primary is in socket_fd/ssl)
+    int num_additional;          // number of active additional connections
+    int max_connection;          // target max connections (sent in login PACK)
+    int half_connection;         // 0 = bidirectional, 1 = unidirectional per socket
+    int primary_direction;       // TCP_DIRECTION_* for primary socket (default BOTH)
+    uint64_t next_connect_time;  // monotonic timestamp for next additional connect attempt (ms)
+    int additional_failed_count; // serial failure counter for additional connects
+    // Background additional connection thread
+    pthread_t additional_thread; // background thread for non-blocking additional connect
+    int additional_connecting;   // 1 if background thread is running
+    int additional_connect_slot; // which slot the background thread is targeting
+    int additional_connect_result; // result from background thread (0=success, -1=fail)
+    int send_rr_idx;              // round-robin index for send socket selection
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
     void (*on_disconnect)(struct softether_connection* conn);
@@ -114,7 +181,12 @@ void softether_destroy(softether_connection_t* conn);
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password);
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
-                               const char* username, const char* password, const char* hub_name);
+                               const char* username, const char* password, const char* hub_name,
+                               int use_tcp,
+                               const char* client_product_name, const char* client_product_version, int client_product_build,
+                               const char* client_os_name, const char* client_os_version, const char* client_os_product_id,
+                               const char* client_host_name, const char* client_ip_address, int client_port,
+                               const char* server_host_name, const char* server_ip_address, int server_port);
 void softether_disconnect(softether_connection_t* conn);
 
 // State management
@@ -150,6 +222,14 @@ int softether_process_keepalive(softether_connection_t* conn);
 
 // Multi-block receive queue (fills queue from one protocol message)
 int softether_fill_recv_queue(softether_connection_t* conn);
+
+// Multi-connection support
+int softether_additional_connect(softether_connection_t* conn);
+void softether_close_additional(softether_connection_t* conn);
+int softether_select_send_socket(softether_connection_t* conn);
+int softether_get_num_connections(softether_connection_t* conn);
+int softether_get_active_socket_fds(softether_connection_t* conn, int* fds, int max_fds);
+void softether_additional_thread_wait(softether_connection_t* conn);
 
 // Reconnection support
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);

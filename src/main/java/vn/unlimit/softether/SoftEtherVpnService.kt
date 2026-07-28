@@ -612,15 +612,28 @@ class SoftEtherVpnService : VpnService() {
         return String.format(java.util.Locale.getDefault(), "%.1f %s", scaled, units[exp])
     }
 
+    private var pendingStateRunnable: Runnable? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
-        // If we are in ERROR state or DISCONNECTED (and not user disconnect), 
-        // we suppress the standard status notification because we will show the error notification instead.
+        // Cancel any previously pending delayed state update to prevent stale state
+        // from overwriting a newer state (e.g., old AUTH firing after CONNECTED)
+        pendingStateRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingStateRunnable = null
+
+        // If we are in ERROR state or DISCONNECTED (and not user disconnect),
+        // show error notification but ALWAYS broadcast to activity so it doesn't get stuck
         if ((state == ConnectionState.ERROR || state == ConnectionState.DISCONNECTED) && !mIsUserDisconnect) {
-            // Only handle the error trigger, do NOT update the status notification
             if (mWasConnected) {
                 triggerDisconnectNotification()
                 mWasConnected = false
             }
+            // Still broadcast so the activity learns the connection is gone
+            val stateValue = when (state) {
+                ConnectionState.ERROR -> STATE_ERROR
+                else -> STATE_DISCONNECTED
+            }
+            sendConnectionStateBroadcast(stateValue, "")
             return
         }
 
@@ -643,50 +656,45 @@ class SoftEtherVpnService : VpnService() {
             mWasConnected = true
             mIsUserDisconnect = false
         }
-        
-        // Removed redundant triggerDisconnectNotification logic here because it's handled at the start of the function
-        // else if ((state == ConnectionState.DISCONNECTED || state == ConnectionState.ERROR) && mWasConnected && !mIsUserDisconnect) {
-        //    triggerDisconnectNotification()
-        //    mWasConnected = false
-        // }
 
-        // Terminal states (CONNECTED, DISCONNECTED, ERROR) always pass through immediately
+        // Terminal states always pass through immediately
         val isTerminalState = state == ConnectionState.CONNECTED ||
                 state == ConnectionState.DISCONNECTED ||
                 state == ConnectionState.ERROR
-        
-        // Add minimum delay between state updates to ensure UI can process them
+
+        // Rate-limit non-terminal states to avoid flooding the UI
         val now = System.currentTimeMillis()
         if (!isTerminalState && now - lastStateUpdateTime < 200) {
-            // Queue state update if too soon
-            pendingStateUpdate = { 
-                updateNotification(message)
-                val stateValue = when (state) {
-                    ConnectionState.CONNECTING -> STATE_CONNECTING
-                    ConnectionState.TLS_HANDSHAKE -> STATE_TLS_HANDSHAKE
-                    ConnectionState.PROTOCOL_HANDSHAKE -> STATE_PROTOCOL_HANDSHAKE
-                    ConnectionState.AUTHENTICATING -> STATE_AUTHENTICATING
-                    ConnectionState.SESSION_SETUP -> STATE_SESSION_SETUP
-                    ConnectionState.CONNECTED -> STATE_CONNECTED
-                    ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
-                    ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
-                    ConnectionState.ERROR -> STATE_ERROR
-                }
-                sendConnectionStateBroadcast(
-                    stateValue,
-                    if (state == ConnectionState.CONNECTED) (controller?.assignedLocalIp ?: hostname) else ""
-                )
+            // Cancel any previously queued pending update first
+            pendingStateRunnable?.let { mainHandler.removeCallbacks(it) }
+            val stateValue = when (state) {
+                ConnectionState.CONNECTING -> STATE_CONNECTING
+                ConnectionState.TLS_HANDSHAKE -> STATE_TLS_HANDSHAKE
+                ConnectionState.PROTOCOL_HANDSHAKE -> STATE_PROTOCOL_HANDSHAKE
+                ConnectionState.AUTHENTICATING -> STATE_AUTHENTICATING
+                ConnectionState.SESSION_SETUP -> STATE_SESSION_SETUP
+                ConnectionState.CONNECTED -> STATE_CONNECTED
+                ConnectionState.DISCONNECTING -> STATE_DISCONNECTING
+                ConnectionState.DISCONNECTED -> STATE_DISCONNECTED
+                ConnectionState.ERROR -> STATE_ERROR
             }
+            pendingStateRunnable = Runnable {
+                pendingStateRunnable = null
+                updateNotification(message)
+                sendConnectionStateBroadcast(stateValue, "")
+            }
+            mainHandler.postDelayed(pendingStateRunnable!!, 200)
             return
         }
-        
+
         lastStateUpdateTime = now
-        
-        // Terminal states clear any pending update to prevent stale state overwriting
+
+        // Terminal states clear any pending update
         if (isTerminalState) {
-            pendingStateUpdate = null
+            pendingStateRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingStateRunnable = null
         }
-        
+
         updateNotification(message)
 
         val stateValue = when (state) {
@@ -704,12 +712,6 @@ class SoftEtherVpnService : VpnService() {
             stateValue,
             if (state == ConnectionState.CONNECTED) (controller?.assignedLocalIp ?: hostname) else ""
         )
-        
-        // Process any pending state update
-        pendingStateUpdate?.let {
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(it, 200)
-            pendingStateUpdate = null
-        }
     }
 
     private fun registerNetworkReceiver() {

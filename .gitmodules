@@ -4,3 +4,4 @@
 [submodule "SoftEtherVPN_Stable"]
 	path = SoftEtherVPN_Stable
 	url = https://github.com/SoftEtherVPN/SoftEtherVPN_Stable
+	shallow = true

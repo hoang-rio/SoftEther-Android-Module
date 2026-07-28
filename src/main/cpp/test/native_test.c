@@ -161,8 +161,12 @@ test_helper_connect(const native_test_config_t *config,
   const char *username = (config->username && config->username[0]) ? config->username : "vpn";
   const char *password = (config->password) ? config->password : "";
 
-  int ret = softether_connect_with_hub(conn, config->host, config->port,
-                                       username, password, "vpngate");
+int ret = softether_connect_with_hub(conn, config->host, config->port,
+                                        username, password, "vpngate", 1,  // use_tcp=1
+                                        "", "", 0,
+                                        "", "", "",
+                                        "", "", 0,
+                                        "", "", 0);
   if (ret != ERR_NONE) {
     long d = get_test_timestamp_ms() - start_time;
     char msg[256];
