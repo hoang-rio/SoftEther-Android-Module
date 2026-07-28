@@ -235,6 +235,12 @@ class SoftEtherVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand: action=${intent?.action}")
 
+        // Android requires startForeground() to be called within 5 seconds of
+        // startForegroundService(). Call it unconditionally here so that every
+        // code-path (null config, unknown action, disconnect, already-running)
+        // satisfies the requirement.
+        startForeground(NOTIFICATION_ID, createNotification(getString(R.string.softether_connecting)))
+
         when (intent?.action) {
             ACTION_CONNECT -> {
                 mIsUserDisconnect = false
@@ -258,6 +264,7 @@ class SoftEtherVpnService : VpnService() {
             }
             else -> {
                 Log.w(TAG, "Unknown action: ${intent?.action}")
+                stopSelf()
             }
         }
 
@@ -311,9 +318,6 @@ class SoftEtherVpnService : VpnService() {
 
         // Store session name for use in notifications
         currentSessionName = config.sessionName
-        
-        // Start as foreground service
-        startForeground(NOTIFICATION_ID, createNotification(getString(R.string.softether_connecting)))
 
         connectionJob = serviceScope.launch {
             try {
