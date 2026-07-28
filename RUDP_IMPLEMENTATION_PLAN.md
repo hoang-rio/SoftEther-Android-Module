@@ -117,6 +117,22 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [ ] Free cipher contexts in `rudp_destroy`
 - [ ] V2 MSS calculation (8 bytes less overhead than V1)
 
+### Phase 8: IPv6 Tunnel Support (📋 Planned)
+- [ ] Add IPv6 fields to `ConnectionConfig.kt` (`localAddressV6`, `dnsServerV6`, `routesV6`)
+- [ ] Configure VPN interface with IPv6 address (`fd00::2/128`), route (`::/0`), DNS (`2001:4860:4860::8888`)
+- [ ] Accept `Inet6Address` in `ConnectionController.kt` `buildClientInfo()`
+- [ ] Support IPv6 in `ClientInfo.kt` (`getLocalIPv6Address()`, `isIPv6` flag)
+
+### Phase 9: Dual-Stack Socket Support (📋 Planned)
+- [ ] Replace `sockaddr_in` with `sockaddr_storage` in `softether_socket.h`, `softether_rudp.h`
+- [ ] Replace `gethostbyname()` with `getaddrinfo(AF_UNSPEC)` in `tcp_socket.c`
+- [ ] Implement IPv4-first, IPv6-fallback in `socket_connect_timeout()`
+- [ ] Support `AF_INET6` UDP socket creation in `rudp_create()` for IPv6 peers
+- [ ] Adjust R-UDP MTU calculation for IPv6 header (40 bytes vs 20)
+- [ ] Add `client_ip_v6`, `server_ip_v6`, `is_ipv6` fields to `softether_connection_t`
+- [ ] Add `ClientIpv6Address` PACK field in `build_login_pack()`
+- [ ] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
+
 ---
 
 ## 3. Compression Implementation Details
@@ -438,7 +454,185 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 
 ---
 
-## 6. Risks & Mitigations
+## 6. IPv6 Implementation Details
+
+### Current State
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Ethernet framing | ✅ Auto-detects IPv6 | EtherType `0x86DD` handled in `packet_handler.c` |
+| TCP socket creation | ❌ IPv4 only | `AF_INET` hardcoded in `tcp_socket.c:27` |
+| DNS resolution | ❌ IPv4 only | `gethostbyname()` in `tcp_socket.c:60` |
+| RUDP socket | ❌ IPv4 only | `AF_INET` in `softether_rudp.c:46` |
+| VPN interface | ❌ IPv4 only | No IPv6 address/route/DNS in `SoftEtherVpnService.kt` |
+| Protocol handshake | ❌ IPv4 only | `ClientIpAddress` as 32-bit int (`softether_protocol.c:659`) |
+| Connection struct | ❌ IPv4 only | No `*_ip_v6` or `is_ipv6` fields |
+
+### How Upstream SoftEther Handles IPv6
+
+SoftEther's tunnel is a **Layer 2 Ethernet bridge** — IPv6 packets flow through once connected. The upstream Windows client:
+
+1. **Dual-stack DNS resolution**: `ConnectEx4()` calls `GetIP46Ex()` to resolve both A and AAAA records (`Network.c:16394`)
+2. **IPv4-first connection**: Tries IPv4 TCP first; falls back to IPv6 TCP if all IPv4 methods fail (`Network.c:16705-16741`)
+3. **UdpAccel over IPv6**: `NewUdpAccel()` detects IPv6, adjusts MTU (-40 bytes for IPv6 header), disables NAT-T (`UdpAccel.c:1145-1181`)
+4. **R-UDP (NAT-T) is IPv4-only**: Disabled when server is IPv6 (`UdpAccel.c:1147-1150`)
+5. **Server-side Hub**: Full IPv6 packet parsing, ICMPv6 RS/RA, DHCPv6 detection (`Hub.c:4492-4579`)
+
+Key upstream IPv6 functions:
+- `IsIPv6Supported()` — checks OS IPv6 capability (`Network.c:11293`)
+- `GetIP6Ex()` / `GetIP6Inner()` — AAAA resolution via `getaddrinfo()` (`Network.c:18370`)
+- `NewUDP6()` — creates IPv6 UDP socket (`Network.c:12921`)
+- `IPToInAddr6()` — converts `IP` struct to `in6_addr` (`Network.c`)
+
+### Phase A: IPv6 Tunnel (Simpler)
+
+Route IPv6 traffic through the VPN tunnel once connected over IPv4.
+
+**Step 1: Add IPv6 fields to `ConnectionConfig.kt`**
+
+```kotlin
+data class ConnectionConfig(
+    // ... existing IPv4 fields ...
+    val localAddressV6: String = "fd00::2",
+    val prefixLengthV6: Int = 128,
+    val dnsServerV6: String = "2001:4860:4860::8888",
+    val routesV6: List<Route> = listOf(Route("::", 0)),
+)
+```
+
+**Step 2: Configure VPN interface in `SoftEtherVpnService.kt`**
+
+In `establishVpnInterface()` (~line 449):
+```kotlin
+builder.addAddress(config.localAddressV6, config.prefixLengthV6)
+builder.addRoute("::", 0)  // IPv6 default route
+builder.addDnsServer(config.dnsServerV6)
+```
+
+**Step 3: Accept IPv6 in `ConnectionController.kt`**
+
+In `buildClientInfo()` (~line 190):
+```kotlin
+// Before: if (addr is Inet4Address)
+// After:  if (addr is Inet4Address || addr is Inet6Address)
+```
+
+**Step 4: IPv6 address detection in `ClientInfo.kt`**
+
+Add `getLocalIPv6Address()` method and `isIPv6` flag.
+
+### Phase B: Dual-Stack Sockets (Harder)
+
+Connect to VPN server over IPv6 when IPv4 is unavailable.
+
+**Step 1: Widen socket structs**
+
+`softether_socket.h:24`:
+```c
+// Before: struct sockaddr_in addr;
+struct sockaddr_storage addr;  // holds sockaddr_in or sockaddr_in6
+```
+
+`softether_rudp.h:78`:
+```c
+// Before: struct sockaddr_in peer_addr;
+struct sockaddr_storage peer_addr;
+```
+
+**Step 2: Dual-stack DNS resolution**
+
+`tcp_socket.c` — replace `gethostbyname()` with `getaddrinfo(AF_UNSPEC)`:
+```c
+struct addrinfo hints = {0}, *res;
+hints.ai_family = AF_UNSPEC;
+hints.ai_socktype = SOCK_STREAM;
+getaddrinfo(hostname, NULL, &hints, &res);
+```
+
+**Step 3: IPv4-first, IPv6-fallback**
+
+`tcp_socket.c` `socket_connect_timeout()` — follow upstream `ConnectEx4()` pattern:
+```c
+// Try IPv4 first
+s = connect_timeout_ipv4(ip4, port, timeout);
+// Fallback to IPv6
+if (s < 0 && !is_zero(ip6)) {
+    s = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 addr6 = {0};
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(port);
+    inet_pton(AF_INET6, ip6_str, &addr6.sin6_addr);
+    connect_timeout(s, (struct sockaddr*)&addr6, sizeof(addr6), timeout);
+}
+```
+
+**Step 4: IPv6 RUDP socket**
+
+`softether_rudp.c` `rudp_create()`:
+```c
+if (is_ipv6_peer) {
+    ctx->udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    // bind sockaddr_in6
+    ctx->max_udp_packet_size = 1500 - 40 - 8;  // IPv6 header = 40 bytes
+} else {
+    ctx->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ctx->max_udp_packet_size = 1500 - 20 - 8;  // IPv4 header = 20 bytes
+}
+```
+
+**Step 5: Protocol layer IPv6 fields**
+
+`softether_protocol.h` — add to `softether_connection_t`:
+```c
+char client_ip_v6[64];
+char server_ip_v6[64];
+char rudp_server_ip_v6[64];
+int is_ipv6;
+```
+
+`softether_protocol.c` `build_login_pack()` — add IPv6 PACK field:
+```c
+if (conn->is_ipv6) {
+    struct in6_addr addr6;
+    inet_pton(AF_INET6, conn->client_ip_v6, &addr6);
+    pack_add_data(&p, "ClientIpv6Address", (uint8_t*)&addr6, 16);
+}
+```
+
+**Step 6: Dual-stack connect in `softether_connect_with_hub()`**
+
+Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallback to IPv6. Set `conn->is_ipv6` based on which succeeded.
+
+### Files to Modify
+
+| File | Phase A Changes | Phase B Changes |
+|------|-----------------|-----------------|
+| `ConnectionConfig.kt` | Add IPv6 address/route/DNS fields | — |
+| `SoftEtherVpnService.kt` | Add IPv6 to VPN interface builder | — |
+| `ConnectionController.kt` | Accept `Inet6Address` | Pass IPv6 info to native |
+| `ClientInfo.kt` | Add `getLocalIPv6Address()` | — |
+| `softether_socket.h` | — | `sockaddr_storage` |
+| `tcp_socket.c` | — | `getaddrinfo()`, IPv4/v6 connect |
+| `softether_rudp.h` | — | `sockaddr_storage` peer |
+| `softether_rudp.c` | — | IPv6 UDP socket, MTU adjust |
+| `softether_protocol.h` | — | Add `*_ip_v6`, `is_ipv6` fields |
+| `softether_protocol.c` | — | IPv6 PACK fields, dual-stack resolution |
+
+### Success Criteria
+
+- [ ] VPN interface has IPv6 address (`fd00::2/128`) and default route (`::/0`)
+- [ ] IPv6 DNS server configured (`2001:4860:4860::8888`)
+- [ ] Connected devices can reach IPv6 endpoints through tunnel
+- [ ] `resolve_hostname()` returns both IPv4 and IPv6 addresses
+- [ ] TCP connection tries IPv4 first, falls back to IPv6
+- [ ] R-UDP creates IPv6 UDP socket when peer is IPv6
+- [ ] Login PACK includes `ClientIpv6Address` (16-byte DATA) when IPv6
+- [ ] MTU adjusted for IPv6 header (40 bytes vs 20)
+- [ ] Can connect to server over IPv6 when IPv4 is unavailable
+
+---
+
+## 7. Risks & Mitigations
 
 | Risk | Feature | Mitigation |
 |------|---------|------------|
@@ -455,10 +649,14 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | Race between cleanup loop and background thread | Multi-Connection | Cleanup loop skips slot being connected (`additional_connect_slot`); background thread sets `active=1` only after full handshake |
 | Memory overhead (multiple SSL contexts) | Multi-Connection | Limit to 4 connections initially; make configurable |
 | TLS certificate reuse for additional connections | Multi-Connection | Cache `ServerX` from primary connection; validate on each new socket |
+| VPN Gate servers lack AAAA records | Dual-Stack | IPv4 always tried first; IPv6 is fallback-only |
+| IPv6 MTU smaller (1280 min) | Dual-Stack | Adjust `RUDP_MAX_PAYLOAD_SIZE` dynamically based on `is_ipv6` |
+| VpnService.protect() needs IPv6 socket | Both | Already supports any FD; pass IPv6 socket FD |
+| No DHCPv6/SLAAC | IPv6 Tunnel | Not needed — server pushes IPv6 config via tunnel |
 
 ---
 
-## 7. Dependencies
+## 8. Dependencies
 
 | Dependency | Required By | Notes |
 |------------|-------------|-------|
@@ -469,7 +667,7 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 
 ---
 
-## 8. Testing Plan
+## 9. Testing Plan
 
 | Test | Feature | Steps |
 |------|---------|-------|
@@ -491,11 +689,19 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | Socket protection | Multi-Connection | Verify additional sockets are protected via VpnService.protect() |
 | Background connect non-blocking | Multi-Connection | Verify receive loop continues while additional connections are being established in background thread |
 | Background connect cleanup | Multi-Connection | Disconnect during background connect, verify no crash/hang (pthread_join) |
+| IPv6 tunnel address | IPv6 Tunnel | Verify VPN interface has `fd00::2/128` address |
+| IPv6 default route | IPv6 Tunnel | Verify `::/0` route added to VPN interface |
+| IPv6 DNS | IPv6 Tunnel | Verify `2001:4860:4860::8888` DNS server configured |
+| IPv6 traffic through tunnel | IPv6 Tunnel | Ping IPv6 endpoint through VPN tunnel |
+| Dual-stack DNS resolution | Dual-Stack | Verify `getaddrinfo` returns both A and AAAA |
+| IPv6 TCP fallback | Dual-Stack | Block IPv4, verify connection succeeds over IPv6 |
+| IPv6 RUDP socket | Dual-Stack | Verify `AF_INET6` UDP socket created for IPv6 peer |
+| IPv6 PACK field | Dual-Stack | Verify `ClientIpv6Address` in login PACK when IPv6 |
 | Wireshark capture | All | Capture traffic to verify correct packet formats |
 
 ---
 
-## 9. References
+## 10. References
 
 | Topic | Source |
 |-------|--------|
@@ -506,3 +712,7 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | Compression | zlib `compress2()` / `uncompress()` (RFC 1951 deflate) |
 | Multi-connection | `ClientAdditionalConnect()` in `Protocol.c`, `TcpSockList` in `Connection.c` |
 | Multi-connection constants | `MAX_TCP_CONNECTION=32`, `NUM_TCP_CONNECTION_FOR_UDP_RECOVERY=2`, `ADDITIONAL_CONNECTION_INTERVAL=1s` |
+| IPv6 dual-stack connection | `ConnectEx4()` in `Network.c:16287-16759`, `GetIP46Ex()` |
+| IPv6 UDP socket | `NewUDP6()` in `Network.c:12921`, `NewUdpAccel()` IPv6 handling in `UdpAccel.c:1145-1181` |
+| IPv6 protocol info | `ClientIpAddress6`/`ServerIpAddress6` in `Protocol.c:4780-4825` |
+| IPv6 hub filtering | `FilterIPv6`, `CheckIPv6`, `NoIPv6DefaultRouterInRA` in `Hub.c`, `Account.c` |
