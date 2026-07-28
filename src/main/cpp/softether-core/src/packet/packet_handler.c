@@ -228,8 +228,8 @@ static int read_uint32(softether_connection_t* conn, uint32_t* out) {
 // Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
 int softether_send_packet(softether_connection_t* conn, uint16_t command,
                           const uint8_t* payload, uint32_t payload_len) {
-    if (conn == NULL || conn->ssl == NULL) {
-        LOGE("Connection or SSL is NULL");
+    if (conn == NULL) {
+        LOGE("Connection is NULL");
         return -1;
     }
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) {
@@ -243,6 +243,12 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     }
 
     pthread_mutex_lock(&conn->write_mutex);
+
+    // Recheck state and SSL inside mutex (disconnect may have freed them)
+    if (conn->state == STATE_DISCONNECTING || conn->ssl == NULL) {
+        pthread_mutex_unlock(&conn->write_mutex);
+        return -1;
+    }
 
     // TCP path: session-level compression (raw zlib, no magic prefix)
     // VPN Gate server fork sends/receives raw zlib when use_compress is set.
@@ -292,6 +298,18 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     int send_idx = softether_select_send_socket(conn);
     void* send_ssl = (send_idx == 0) ? conn->ssl : conn->additional[send_idx - 1].ssl;
     int send_fd = (send_idx == 0) ? conn->socket_fd : conn->additional[send_idx - 1].socket_fd;
+    __sync_synchronize();  // load-acquire: ensure ssl/fd reads are ordered
+
+    // Revalidate: if using additional, verify it's still active
+    if (send_idx > 0) {
+        softether_tcp_sock_t* ts = &conn->additional[send_idx - 1];
+        if (!ts->active || send_ssl == NULL) {
+            free(buf);
+            free(comp_buf);
+            pthread_mutex_unlock(&conn->write_mutex);
+            return -1;
+        }
+    }
 
     int ret;
     if (send_idx > 0 && send_ssl != NULL) {
@@ -626,11 +644,17 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         int d = ts->direction;
         if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_SERVER_TO_CLIENT) continue;
 
-        fds[nfds].fd = ts->socket_fd;
+        // Capture SSL and fd atomically — recheck active after capture
+        void* cap_ssl = ts->ssl;
+        int cap_fd = ts->socket_fd;
+        __sync_synchronize();  // load-acquire: ensure ssl/fd stores are visible
+        if (!ts->active || cap_ssl == NULL || cap_fd < 0) continue;
+
+        fds[nfds].fd = cap_fd;
         fds[nfds].events = POLLIN;
         fds[nfds].revents = 0;
-        tcp_info[tcp_count].ssl = ts->ssl;
-        tcp_info[tcp_count].fd = ts->socket_fd;
+        tcp_info[tcp_count].ssl = cap_ssl;
+        tcp_info[tcp_count].fd = cap_fd;
         tcp_info[tcp_count].is_additional = 1;
         tcp_info[tcp_count].additional_idx = i;
         tcp_count++;
@@ -638,6 +662,10 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     }
 
     if (nfds == 0) return -1;
+
+    // Memory barrier + state check before using any captured SSL pointers
+    __sync_synchronize();
+    if (conn->state == STATE_DISCONNECTING) return -1;
 
     // Check for SSL-buffered data on any TCP socket before polling
     int ssl_pending_idx = -1;
@@ -660,6 +688,10 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             LOGE("fill_recv_queue: poll error: %d", errno);
             return -1;
         }
+
+        // After blocking poll, recheck state — disconnect may have freed SSL pointers
+        __sync_synchronize();
+        if (conn->state == STATE_DISCONNECTING) return -1;
 
         // Check for UDP data first
         for (nfds_t i = 0; i < nfds; i++) {
@@ -736,16 +768,36 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         int sel_is_additional = tcp_info[ssl_pending_idx].is_additional;
         int sel_add_idx = tcp_info[ssl_pending_idx].additional_idx;
 
-        // Helper macro to close and deactivate a failed additional socket
+        // Revalidate: check that the SSL pointer is still valid (not freed by disconnect)
+        if (sel_ssl == NULL) {
+            LOGW("fill_recv_queue: SSL became NULL for fd=%d, skipping", sel_fd);
+            return 0;
+        }
+        if (sel_is_additional && sel_add_idx >= 0) {
+            softether_tcp_sock_t* check_ts = &conn->additional[sel_add_idx];
+            if (!check_ts->active || check_ts->ssl != sel_ssl) {
+                LOGW("fill_recv_queue: additional socket [%d] ssl mismatch, skipping", sel_add_idx);
+                return 0;
+            }
+        }
+        __sync_synchronize();  // load-acquire before using sel_ssl
+
+        // Helper macro to close and deactivate a failed additional socket.
+        // Mark inactive BEFORE destroying to prevent use-after-free by other threads.
         // Returns 0 to keep connection alive, or propagates -1 for primary socket failures
         #define CLOSE_FAILED_ADDITIONAL_SOCKET() do { \
             if (sel_is_additional && sel_add_idx >= 0) { \
                 LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd); \
                 softether_tcp_sock_t* _ts = &conn->additional[sel_add_idx]; \
-                if (_ts->ssl != NULL) ssl_shutdown((ssl_context_t*)_ts->ssl); \
-                if (_ts->ssl_ctx != NULL) { ssl_destroy((ssl_context_t*)_ts->ssl_ctx); _ts->ssl_ctx = NULL; _ts->ssl = NULL; } \
-                if (_ts->socket_fd >= 0) { close(_ts->socket_fd); _ts->socket_fd = -1; } \
                 _ts->active = 0; \
+                _ts->ssl = NULL; \
+                _ts->socket_fd = -1; \
+                __sync_synchronize(); \
+                if (_ts->ssl_ctx != NULL) { \
+                    ssl_shutdown((ssl_context_t*)_ts->ssl_ctx); \
+                    ssl_destroy((ssl_context_t*)_ts->ssl_ctx); \
+                    _ts->ssl_ctx = NULL; \
+                } \
                 conn->num_additional--; \
                 return 0; \
             } \

@@ -1667,6 +1667,7 @@ void softether_disconnect(softether_connection_t* conn) {
 
     LOGD("Disconnecting (previous state: %s)", softether_state_string(prev_state));
     conn->state = STATE_DISCONNECTING;
+    __sync_synchronize();  // store-release: ensure DISCONNECTING is visible to all threads
 
     // Wait for any background additional connect thread to finish
     if (conn->additional_connecting) {
@@ -1838,19 +1839,23 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
         if (poll_ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             LOGW("Additional socket [%d] fd=%d disconnected (revents=0x%x), closing",
                  i, ts->socket_fd, pfd.revents);
-            if (ts->ssl != NULL) {
-                ssl_shutdown((ssl_context_t*)ts->ssl);
-            }
-            if (ts->ssl_ctx != NULL) {
-                ssl_destroy((ssl_context_t*)ts->ssl_ctx);
-                ts->ssl_ctx = NULL;
-                ts->ssl = NULL;
-            }
-            if (ts->socket_fd >= 0) {
-                close(ts->socket_fd);
-                ts->socket_fd = -1;
-            }
+            // Mark inactive BEFORE destroying (prevent use-after-free by other threads)
+            int saved_fd = ts->socket_fd;
+            void* saved_ssl_ctx = ts->ssl_ctx;
             ts->active = 0;
+            ts->ssl = NULL;
+            ts->ssl_ctx = NULL;
+            ts->socket_fd = -1;
+            ts->late_count = 0;
+            ts->last_recv = 0;
+            __sync_synchronize();
+            if (saved_ssl_ctx != NULL) {
+                ssl_shutdown((ssl_context_t*)saved_ssl_ctx);
+                ssl_destroy((ssl_context_t*)saved_ssl_ctx);
+            }
+            if (saved_fd >= 0) {
+                close(saved_fd);
+            }
             conn->num_additional--;
         }
     }
@@ -2194,27 +2199,29 @@ void softether_close_additional(softether_connection_t* conn) {
         conn->additional_connecting = 0;
     }
 
+    // Phase 1: mark all slots inactive and NULL out pointers first.
+    // This ensures concurrent readers (fill_recv_queue, select_send_socket)
+    // see active=0 and ssl=NULL before we destroy anything.
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (!ts->active) continue;
-
-        LOGD("Closing additional connection [%d] fd=%d", i, ts->socket_fd);
-
-        if (ts->ssl != NULL) {
-            ssl_shutdown((ssl_context_t*)ts->ssl);
-        }
-        if (ts->ssl_ctx != NULL) {
-            ssl_destroy((ssl_context_t*)ts->ssl_ctx);
-            ts->ssl_ctx = NULL;
-            ts->ssl = NULL;
-        }
-        if (ts->socket_fd >= 0) {
-            close(ts->socket_fd);
-            ts->socket_fd = -1;
-        }
+        LOGD("Closing additional connection [%d] fd=%d (marking inactive)", i, ts->socket_fd);
         ts->active = 0;
+        ts->ssl = NULL;
+        ts->socket_fd = -1;
         ts->late_count = 0;
         ts->last_recv = 0;
+    }
+    __sync_synchronize();  // full memory barrier: ensure all threads see the above stores
+
+    // Phase 2: now safely destroy SSL and close fds (no other thread references them)
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (ts->ssl_ctx != NULL) {
+            ssl_shutdown((ssl_context_t*)ts->ssl_ctx);
+            ssl_destroy((ssl_context_t*)ts->ssl_ctx);
+            ts->ssl_ctx = NULL;
+        }
     }
     conn->num_additional = 0;
     conn->additional_failed_count = 0;
@@ -2569,6 +2576,7 @@ int softether_additional_connect(softether_connection_t* conn) {
         ts->direction = (int)server_direction;
         ts->last_recv = softether_tick_ms();
         ts->late_count = 0;
+        __sync_synchronize();  // store-release: ensure all field writes are visible before active=1
         ts->active = 1;
         conn->num_additional++;
     }
