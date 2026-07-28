@@ -106,7 +106,7 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Add receive-side multi-socket polling
 - [x] Implement send quota partitioning: `MAX_SEND_SOCKET_QUEUE_SIZE / MaxConnection`
 - [x] Run additional connections in background pthread (non-blocking receive loop)
-- [ ] Support `half_connection` mode (unidirectional sockets, optional)
+- [x] Support `half_connection` mode (unidirectional sockets, optional)
 
 ### Phase 7: V2 Support (📋 Planned)
 - [ ] Add V2 AEAD cipher context fields to `rudp_context_t`
