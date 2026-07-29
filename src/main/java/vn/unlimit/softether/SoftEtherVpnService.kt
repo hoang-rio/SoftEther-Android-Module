@@ -372,32 +372,39 @@ class SoftEtherVpnService : VpnService() {
         connectionJob?.cancel()
         connectionJob = null
 
-        // Run blocking operations (JNI calls, fd close) on a background thread
-        // to avoid ANR. Wrap in NonCancellable so the work completes even if
-        // the service scope is cancelled by onDestroy().
+        // Move UI-facing cleanup (notification, foreground) to happen
+        // immediately on the main thread so the user sees "disconnected"
+        // right away.
+        showDisconnectedNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+
+        // Snapshot references and clear them immediately so onDestroy()
+        // won't try to free the same resources concurrently.
+        val currentController = controller
+        val currentInterface = vpnInterface
+        controller = null
+        vpnInterface = null
+
+        // Run blocking operations (JNI calls, fd close) on a background
+        // thread to avoid ANR.  Wrap in NonCancellable so the work
+        // completes even if the service scope ends up cancelled.
         serviceScope.launch(NonCancellable) {
             withContext(Dispatchers.IO) {
                 try {
-                    controller?.disconnect()
+                    currentController?.disconnect()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error disconnecting controller", e)
                 }
-                controller = null
-
                 try {
-                    vpnInterface?.close()
+                    currentInterface?.close()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error closing VPN interface", e)
                 }
-                vpnInterface = null
-            }
-
-            showDisconnectedNotification()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
             }
             stopSelf()
         }
