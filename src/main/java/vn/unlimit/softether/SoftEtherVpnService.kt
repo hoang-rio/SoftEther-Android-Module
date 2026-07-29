@@ -237,11 +237,16 @@ class SoftEtherVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand: action=${intent?.action}")
 
-        // Android requires startForeground() to be called within 5 seconds of
-        // startForegroundService(). Call it unconditionally here so that every
-        // code-path (null config, unknown action, disconnect, already-running)
-        // satisfies the requirement.
-        startForeground(NOTIFICATION_ID, createNotification(getString(R.string.softether_connecting)))
+        // Android requires startForeground() within ~5s of startForegroundService().
+        // Use the correct text and omit the disconnect action when disconnecting.
+        val isDisconnectAction = intent?.action == ACTION_DISCONNECT
+        startForeground(
+            NOTIFICATION_ID,
+            createNotification(
+                if (isDisconnectAction) getString(R.string.softether_disconnecting) else getString(R.string.softether_connecting),
+                !isDisconnectAction
+            )
+        )
 
         when (intent?.action) {
             ACTION_CONNECT -> {
@@ -398,20 +403,16 @@ class SoftEtherVpnService : VpnService() {
         controller = null
         vpnInterface = null
 
-        // Run blocking operations (JNI calls, fd close) on a background
-        // thread to avoid ANR.  Wrap in NonCancellable so the work
-        // completes even if the service scope ends up cancelled.
+        // Clean up resources on a background thread WITHOUT calling the
+        // blocking graceful disconnect (nativeDisconnect waits for server
+        // ACK which can hang).  destroyResources() just frees native memory
+        // and closes fds — fast and non-blocking.
         serviceScope.launch(NonCancellable) {
             withContext(Dispatchers.IO) {
                 try {
-                    currentController?.disconnect()
+                    currentController?.destroyResources()
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error disconnecting controller", e)
-                }
-                try {
-                    currentInterface?.close()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error closing VPN interface", e)
+                    Log.e(TAG, "Error destroying controller resources", e)
                 }
             }
             stopSelf()
@@ -647,6 +648,15 @@ class SoftEtherVpnService : VpnService() {
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
+        // During user-initiated stopVpn() we already sent STATE_DISCONNECTED to listeners,
+        // removed the foreground notification, and launched IO cleanup.
+        // Do NOT touch the notification here — the controller's disconnect() fires
+        // onStateChange from the IO thread and would re-show a notification with a
+        // disconnect action button.
+        if (isStopping) {
+            return
+        }
+
         // Cancel any previously pending delayed state update to prevent stale state
         // from overwriting a newer state (e.g., old AUTH firing after CONNECTED)
         pendingStateRunnable?.let { mainHandler.removeCallbacks(it) }

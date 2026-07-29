@@ -487,6 +487,44 @@ class ConnectionController(
     }
 
     /**
+     * Quickly destroy native resources without graceful disconnect (non-blocking).
+     * Sets isCancelled, stops TunTerminal, closes fd, and frees the native handle.
+     * Does NOT send state change callbacks — caller is responsible for state updates.
+     */
+    fun destroyResources() {
+        Log.d(TAG, "Destroying resources (fast cleanup)")
+        isCancelled.set(true)
+        client.externalHandle = 0
+
+        // Stop TunTerminal first to avoid reading from closed interface
+        try {
+            tunTerminal?.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping TunTerminal", e)
+        }
+        tunTerminal = null
+
+        // Close VPN interface
+        try {
+            vpnInterface?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing VPN interface", e)
+        }
+        vpnInterface = null
+
+        // Free native handle without sending a graceful disconnect packet
+        val handle = nativeHandle
+        nativeHandle = 0
+        if (handle != 0L) {
+            try {
+                client.nativeDestroy(handle)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error destroying native handle", e)
+            }
+        }
+    }
+
+    /**
      * Get current connection state
      */
     fun getState(): ConnectionState = currentState
