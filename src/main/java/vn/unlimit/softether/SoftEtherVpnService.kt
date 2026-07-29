@@ -307,6 +307,8 @@ class SoftEtherVpnService : VpnService() {
 
     @Volatile
     private var connectionJob: kotlinx.coroutines.Job? = null
+    @Volatile
+    private var isStopping = false
 
     private fun startVpn(config: ConnectionConfig) {
         if (isRunning) {
@@ -361,6 +363,12 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun stopVpn() {
+        if (isStopping) {
+            Log.d(TAG, "Already stopping, skipping re-entrant call")
+            return
+        }
+        isStopping = true
+
         Log.d(TAG, "Stopping VPN")
         isRunning = false
 
@@ -520,7 +528,7 @@ class SoftEtherVpnService : VpnService() {
         }
     }
 
-    private fun createNotification(content: String): Notification {
+    private fun createNotification(content: String, showDisconnectAction: Boolean = true): Notification {
         // Intent to open DetailActivity when notification is tapped
         val contentIntent = Intent().apply {
             if (notificationTargetActivity != null) {
@@ -547,35 +555,40 @@ class SoftEtherVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Intent for disconnect action button
-        val disconnectIntent = Intent(this, SoftEtherVpnService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
-        val disconnectPendingIntent = PendingIntent.getService(
-            this, 1, disconnectIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        // Create notification title with server information from instance variable
         val notificationTitle = if (!currentSessionName.isNullOrEmpty()) {
             getString(R.string.softether_notification_title, currentSessionName)
         } else {
             getString(R.string.softether_notification_title_notconnect)
         }
 
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle(notificationTitle)
             .setContentText(content)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
             .setAutoCancel(false)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.softether_disconnect), disconnectPendingIntent)
-            .build()
+
+        if (showDisconnectAction) {
+            val disconnectIntent = Intent(this, SoftEtherVpnService::class.java).apply {
+                action = ACTION_DISCONNECT
+            }
+            val disconnectPendingIntent = PendingIntent.getService(
+                this, 1, disconnectIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                getString(R.string.softether_disconnect),
+                disconnectPendingIntent
+            )
+        }
+
+        return builder.build()
     }
 
-    private fun updateNotification(content: String) {
-        val notification = createNotification(content)
+    private fun updateNotification(content: String, showDisconnectAction: Boolean = true) {
+        val notification = createNotification(content, showDisconnectAction)
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
@@ -670,6 +683,9 @@ class SoftEtherVpnService : VpnService() {
             ConnectionState.ERROR -> getString(R.string.softether_disconnected_by_error)
         }
 
+        // Don't show the disconnect action button when we're already disconnecting
+        val showDisconnectAction = state != ConnectionState.DISCONNECTING
+
         if (state == ConnectionState.CONNECTED) {
             mWasConnected = true
             mIsUserDisconnect = false
@@ -698,7 +714,7 @@ class SoftEtherVpnService : VpnService() {
             }
             pendingStateRunnable = Runnable {
                 pendingStateRunnable = null
-                updateNotification(message)
+                updateNotification(message, showDisconnectAction)
                 sendConnectionStateBroadcast(stateValue, "")
             }
             mainHandler.postDelayed(pendingStateRunnable!!, 200)
@@ -713,7 +729,7 @@ class SoftEtherVpnService : VpnService() {
             pendingStateRunnable = null
         }
 
-        updateNotification(message)
+        updateNotification(message, showDisconnectAction)
 
         val stateValue = when (state) {
             ConnectionState.CONNECTING -> STATE_CONNECTING
