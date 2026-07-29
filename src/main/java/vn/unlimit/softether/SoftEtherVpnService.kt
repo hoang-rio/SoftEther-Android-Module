@@ -23,9 +23,11 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import vn.unlimit.softether.controller.ConnectionController
 import vn.unlimit.softether.model.ConnectionConfig
 import vn.unlimit.softether.model.ConnectionState
@@ -362,38 +364,43 @@ class SoftEtherVpnService : VpnService() {
         Log.d(TAG, "Stopping VPN")
         isRunning = false
 
-        // Send disconnect broadcast
+        // Send disconnect broadcast immediately so the UI reacts right away
         sendConnectionStateBroadcast(STATE_DISCONNECTED)
         notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
 
-        // Disconnect controller - this will interrupt any ongoing connection attempt
-        try {
-            controller?.disconnect()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error disconnecting controller", e)
+        // Cancel the connection coroutine so it won't interfere
+        connectionJob?.cancel()
+        connectionJob = null
+
+        // Run blocking operations (JNI calls, fd close) on a background thread
+        // to avoid ANR. Wrap in NonCancellable so the work completes even if
+        // the service scope is cancelled by onDestroy().
+        serviceScope.launch(NonCancellable) {
+            withContext(Dispatchers.IO) {
+                try {
+                    controller?.disconnect()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error disconnecting controller", e)
+                }
+                controller = null
+
+                try {
+                    vpnInterface?.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error closing VPN interface", e)
+                }
+                vpnInterface = null
+            }
+
+            showDisconnectedNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            stopSelf()
         }
-        controller = null
-
-        // Close VPN interface
-        try {
-            vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
-        }
-        vpnInterface = null
-
-        // Show disconnected notification (dismissable, no disconnect button)
-        showDisconnectedNotification()
-
-        // Stop foreground service
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
-
-        stopSelf()
     }
 
     /**
