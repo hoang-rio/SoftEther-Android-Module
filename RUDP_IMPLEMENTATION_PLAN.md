@@ -133,6 +133,15 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [ ] Add `ClientIpv6Address` PACK field in `build_login_pack()`
 - [ ] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
 
+### Phase 10: OpenSSL Upgrade to 3.5 LTS (📋 Planned)
+- [ ] Rebuild prebuilt OpenSSL 3.5.x libs for all 4 ABIs (armeabi-v7a, arm64-v8a, x86, x86_64)
+- [ ] Update `src/main/cpp/openssl` source tree to OpenSSL 3.5.7
+- [ ] Replace `jniLibs/{abi}/libssl.a` and `libcrypto.a` with 3.5.x builds
+- [ ] Address RC4 low-level deprecation in `softether_rudp.c` (`RC4()` calls)
+- [ ] Verify `EVP_chacha20_poly1305()` availability (Phase 7 V2 prerequisite check)
+- [ ] Verify TLS handshake, AES CBC/GCM, MD5/SHA1 against VPN Gate servers
+- [ ] Run full instrumentation suite for regression
+
 ---
 
 ## 3. Compression Implementation Details
@@ -632,7 +641,108 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 
 ---
 
-## 7. Risks & Mitigations
+## 7. OpenSSL Upgrade Details
+
+### Current State
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Prebuilt libs (`jniLibs/{abi}/libssl.a`, `libcrypto.a`) | ❌ 1.1.1w | Confirmed via `strings`; 11 Sep 2023 final 1.1.1 release |
+| Source tree (`src/main/cpp/openssl`) | ❌ 1.1.1w | HEAD detached at `OpenSSL_1_1_1w`; git-ignored (local build artifact) |
+| 1.1.1 series support | ❌ EOL | 1.1.1 EOL 11 Sep 2023; 1.1.1w is the last security-patched version |
+| `RC4()` low-level usage | ⚠️ Deprecated in 3.x | `softether_rudp.c:319,538` — direct calls, still compile in 3.x |
+| `EVP_chacha20_poly1305()` | ✅ Available | Needed for Phase 7 V2; present in 1.1.1 and 3.x |
+| Upstream SoftEther 3.x support | ✅ Present | `#if OPENSSL_VERSION_NUMBER >= 0x30000000L` + `OSSL_PROVIDER_load` (`Encrypt.c:139,158,5117,5156`) |
+
+### OpenSSL Version Matrix (as of 2026-08)
+
+| Series | Latest | EOL | Verdict |
+|--------|--------|-----|---------|
+| **3.5 [LTS]** | **3.5.7** (09 Jun 2026) | **08 Apr 2030** | ✅ **Best upgrade target** |
+| 3.6 | 3.6.3 | 01 Nov 2026 | Short-term, EOL too soon |
+| 3.0 [LTS] | 3.0.21 | 07 Sep 2026 | EOL imminent |
+| 4.0 | 4.0.1 | 14 May 2027 | Major version, breaking changes |
+
+### Why 1.1.1w Was Used
+
+1. **Final release of the 1.1.1 LTS series** — last security-patched version before EOL
+2. **Code targets 1.1.x API generation**: direct `RC4()` calls (`softether_rudp.c:319,538`), `EVP_aes_*_cbc()/gcm()`, `EVP_md5()`, `EVP_sha1()`
+3. **Android NDK ships no OpenSSL** — must build from source; source tree vendored and pinned
+
+### Upgrade Steps
+
+**Step 1: Update source tree to OpenSSL 3.5.7**
+
+```bash
+cd src/main/cpp/openssl
+# Checkout 3.5.7 (or fetch latest 3.5.x)
+git fetch origin openssl-3.5.7
+git checkout openssl-3.5.7
+```
+
+**Step 2: Rebuild for all 4 ABIs with Android NDK**
+
+Configure with Android NDK toolchain for each ABI:
+```bash
+export ANDROID_NDK_HOME=<path-to-ndk>
+export ANDROID_API=23
+perl Configure android-arm64 -D__ANDROID_API__=$ANDROID_API
+make depend && make -j$(nproc)
+# Repeat for android-arm, android-x86, android-x86_64
+```
+
+Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` + `libcrypto.a`.
+
+**Step 3: Address RC4 deprecation**
+
+`softether_rudp.c` uses direct `RC4()` calls. In OpenSSL 3.x these still compile but emit deprecation warnings. Options:
+- **Keep direct calls** (simplest) — works in 3.x, suppress warnings with `-Wno-deprecated-declarations` for the file
+- **Switch to EVP + legacy provider** (upstream approach) — load "legacy" provider, use `EVP_rc4()`/`EVP_CipherInit_ex`; requires provider init at startup
+
+**Step 4: Verify Phase 7 V2 prerequisite**
+
+`EVP_chacha20_poly1305()` must be confirmed available in the rebuilt 3.5.7 libs (it is, since OpenSSL 1.1.0).
+
+**Step 5: Regression test**
+
+- TLS handshake against VPN Gate servers (TCP path)
+- RUDP V1 RC4 data path
+- AES CBC/GCM, MD5/SHA1 usage in `aes_wrapper.c`
+- Full instrumentation suite
+
+### API Compatibility with Local Client Code
+
+| API | Location | 3.5 Compatible |
+|-----|----------|----------------|
+| `EVP_aes_*_cbc()/gcm()` | `aes_wrapper.c:70-80` | ✅ Default provider |
+| `EVP_md5()` / `EVP_sha1()` | `aes_wrapper.c:455,500` | ✅ Default provider |
+| `EVP_chacha20_poly1305()` | Phase 7 (planned) | ✅ Both 1.1.1 and 3.x |
+| `RC4()` low-level | `softether_rudp.c:319,538` | ⚠️ Deprecated, still compiles |
+| `SSL_CTX`, `SSL`, TLS | `aes_wrapper.c` | ✅ |
+| `RAND_*` | `aes_wrapper.c` | ✅ |
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/main/cpp/openssl/` | Checkout OpenSSL 3.5.7 source (git-ignored, local only) |
+| `src/main/jniLibs/{4 ABIs}/libssl.a` | Replace with 3.5.7 build |
+| `src/main/jniLibs/{4 ABIs}/libcrypto.a` | Replace with 3.5.7 build |
+| `softether_rudp.c` | Address RC4 deprecation (keep direct calls or switch to EVP+legacy) |
+| `CMakeLists.txt` | Unchanged — paths stay the same |
+
+### Success Criteria
+
+- [ ] Prebuilt libs report `OpenSSL 3.5.x` (verify with `strings` on libcrypto.a)
+- [ ] All 4 ABIs build and link
+- [ ] `EVP_chacha20_poly1305()` resolves (Phase 7 V2 readiness)
+- [ ] TCP/RUDP V1 connections work against VPN Gate servers
+- [ ] No runtime errors from deprecated API removal
+- [ ] Instrumentation suite passes
+
+---
+
+## 8. Risks & Mitigations
 
 | Risk | Feature | Mitigation |
 |------|---------|------------|
@@ -653,21 +763,25 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 | IPv6 MTU smaller (1280 min) | Dual-Stack | Adjust `RUDP_MAX_PAYLOAD_SIZE` dynamically based on `is_ipv6` |
 | VpnService.protect() needs IPv6 socket | Both | Already supports any FD; pass IPv6 socket FD |
 | No DHCPv6/SLAAC | IPv6 Tunnel | Not needed — server pushes IPv6 config via tunnel |
+| RC4 low-level API removed/deprecated | OpenSSL Upgrade | Deprecated in 3.x but still compiles; keep direct `RC4()` calls with `-Wno-deprecated-declarations` or switch to EVP + legacy provider |
+| OpenSSL 3.x cipher provider missing | OpenSSL Upgrade | AES/MD5/SHA1/ChaCha20 use default provider (auto-loaded); RC4/DES/Blowfish need legacy provider if switched to EVP |
+| Prebuilt lib rebuild breaks link | OpenSSL Upgrade | Rebuild all 4 ABIs from 3.5.7 source with NDK; verify `libssl.a`/`libcrypto.a` symbols with `strings` |
+| OpenSSL 4.0 breaking changes | OpenSSL Upgrade | Avoid 4.0 (major version); stay on 3.5 LTS until code is audited for 4.0 API changes |
 
 ---
 
-## 8. Dependencies
+## 9. Dependencies
 
 | Dependency | Required By | Notes |
 |------------|-------------|-------|
 | zlib | Compression | Android NDK built-in system library; `compress2()` / `uncompress()` (RFC 1951 deflate) |
-| OpenSSL 1.1.1+ | V2 AEAD | `EVP_chacha20_poly1305()`, `EVP_CTRL_AEAD_SET_IVLEN`, `EVP_CTRL_AEAD_GET_TAG`. Android NDK bundles compatible version |
+| OpenSSL 3.5 LTS | V2 AEAD, TLS, crypto | `EVP_chacha20_poly1305()`, `EVP_CTRL_AEAD_SET_IVLEN`, `EVP_CTRL_AEAD_GET_TAG`. Prebuilt for 4 ABIs in `jniLibs/` (currently 1.1.1w; upgrade to 3.5.7 in Phase 10) |
 | POSIX sockets | All | `<sys/socket.h>`, `<netinet/in.h>` — already in use |
 | Existing V1 infrastructure | All | Socket, polling, queue, keepalive — V2/compression/multi-connection build on top |
 
 ---
 
-## 9. Testing Plan
+## 10. Testing Plan
 
 | Test | Feature | Steps |
 |------|---------|-------|
@@ -697,11 +811,15 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 | IPv6 TCP fallback | Dual-Stack | Block IPv4, verify connection succeeds over IPv6 |
 | IPv6 RUDP socket | Dual-Stack | Verify `AF_INET6` UDP socket created for IPv6 peer |
 | IPv6 PACK field | Dual-Stack | Verify `ClientIpv6Address` in login PACK when IPv6 |
+| OpenSSL version check | OpenSSL Upgrade | Verify libcrypto.a reports 3.5.x via `strings` |
+| OpenSSL RC4 regression | OpenSSL Upgrade | RUDP V1 data path still works after upgrade |
+| OpenSSL TLS regression | OpenSSL Upgrade | TCP handshake against VPN Gate server succeeds |
+| OpenSSL chacha20 availability | OpenSSL Upgrade | Confirm `EVP_chacha20_poly1305()` resolves (V2 readiness) |
 | Wireshark capture | All | Capture traffic to verify correct packet formats |
 
 ---
 
-## 10. References
+## 11. References
 
 | Topic | Source |
 |-------|--------|
@@ -716,3 +834,5 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 | IPv6 UDP socket | `NewUDP6()` in `Network.c:12921`, `NewUdpAccel()` IPv6 handling in `UdpAccel.c:1145-1181` |
 | IPv6 protocol info | `ClientIpAddress6`/`ServerIpAddress6` in `Protocol.c:4780-4825` |
 | IPv6 hub filtering | `FilterIPv6`, `CheckIPv6`, `NoIPv6DefaultRouterInRA` in `Hub.c`, `Account.c` |
+| OpenSSL versions | OpenSSL 3.5.7 (LTS, EOL 08 Apr 2030); 1.1.1w was final 1.1.1 release. Release strategy: https://openssl-library.org/policies/releasestrat/ |
+| OpenSSL 3.x provider support | `OSSL_PROVIDER_load` default/legacy in `Encrypt.c:5156-5158`; RC4-MD5 3.0 bug note in `Encrypt.h:147` |
