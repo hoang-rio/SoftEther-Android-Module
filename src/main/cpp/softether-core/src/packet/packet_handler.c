@@ -497,10 +497,12 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
     return total_read;
 }
 
-// Send keepalive using the real SoftEther format: [0xFFFFFFFF][size][random_data]
-// Thread-safe: locks write_mutex since this may be called from the receive thread
-int softether_send_keepalive(softether_connection_t* conn) {
-    if (conn == NULL || conn->ssl == NULL) {
+// Send keepalive over a specific TCP socket using the real SoftEther format:
+// [0xFFFFFFFF][size][random_data]. Thread-safe: locks write_mutex since this may
+// be called from the receive thread.
+static int softether_send_keepalive_sock(softether_connection_t* conn,
+                                         void* ssl, int socket_fd) {
+    if (conn == NULL || ssl == NULL) {
         return -1;
     }
     if (conn->state != STATE_CONNECTED) {
@@ -534,7 +536,7 @@ int softether_send_keepalive(softether_connection_t* conn) {
     }
 
     // Send entire keepalive as one SSL_write (single TLS record)
-    int ret = data_write_all(conn, ka_buf, (int)total_size);
+    int ret = data_write_all_sock(conn, ssl, socket_fd, ka_buf, (int)total_size);
     pthread_mutex_unlock(&conn->write_mutex);
 
     if (ret != 0) {
@@ -543,6 +545,78 @@ int softether_send_keepalive(softether_connection_t* conn) {
     }
     LOGD("Sent keepalive (%u bytes payload)", ka_size);
     return (int)total_size;
+}
+
+// Send keepalive using the real SoftEther format: [0xFFFFFFFF][size][random_data]
+// Thread-safe: locks write_mutex since this may be called from the receive thread
+int softether_send_keepalive(softether_connection_t* conn) {
+    if (conn == NULL || conn->ssl == NULL) {
+        return -1;
+    }
+    return softether_send_keepalive_sock(conn, conn->ssl, conn->socket_fd);
+}
+
+// Periodically send keepalives over ALL send-capable TCP sockets (primary +
+// additional C2S/BOTH). Mirrors the reference client, which sends keepalives over
+// every IS_SEND_TCP_SOCK socket every GenNextKeepAliveSpan().
+//
+// Without this, when UDP acceleration (RUDP) carries all VPN data, the client
+// never sends anything over additional uplink (C2S) TCP sockets. The server
+// expects to receive on those sockets and times them out after s->Timeout
+// (default 30s), which is the "lost uplink connection" symptom. The server's
+// keepalives can't keep them alive because the server cannot send on C2S sockets.
+int softether_send_keepalive_all(softether_connection_t* conn) {
+    if (conn == NULL || conn->ssl == NULL) {
+        return -1;
+    }
+    if (conn->state != STATE_CONNECTED) {
+        return -1;
+    }
+
+    uint64_t now = softether_tick_ms();
+
+    if (conn->next_tcp_keepalive_time == 0) {
+        conn->next_tcp_keepalive_time = now;
+        return 0;
+    }
+    if (now < conn->next_tcp_keepalive_time) {
+        return 0;
+    }
+
+    // Keepalive must arrive more often than the server's per-socket timeout.
+    // The server advertises its session timeout ("timeout") in the Welcome PACK.
+    uint32_t timeout = conn->server_timeout != 0 ? conn->server_timeout : 30000;
+    uint32_t interval = timeout / 3;
+    if (interval < 2000) interval = 2000;
+    if (interval > 12000) interval = 12000;
+
+    conn->next_tcp_keepalive_time = now + interval;
+
+    // Primary socket: send-capable if direction is BOTH or C2S
+    if (conn->socket_fd >= 0 && conn->ssl != NULL) {
+        int pd = conn->primary_direction;
+        if (pd == TCP_DIRECTION_BOTH || pd == TCP_DIRECTION_CLIENT_TO_SERVER) {
+            softether_send_keepalive_sock(conn, conn->ssl, conn->socket_fd);
+        }
+    }
+
+    // Additional sockets: send-capable if direction is BOTH or C2S
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        softether_tcp_sock_t* ts = &conn->additional[i];
+        if (!ts->active) continue;
+        int d = ts->direction;
+        if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_CLIENT_TO_SERVER) continue;
+
+        // Capture SSL and fd atomically — recheck active after capture
+        void* cap_ssl = ts->ssl;
+        int cap_fd = ts->socket_fd;
+        __sync_synchronize();  // load-acquire: ensure ssl/fd stores are visible
+        if (!ts->active || cap_ssl == NULL || cap_fd < 0) continue;
+
+        softether_send_keepalive_sock(conn, cap_ssl, cap_fd);
+    }
+
+    return 0;
 }
 
 // Process keepalive — receive and handle if the next message is a keepalive.

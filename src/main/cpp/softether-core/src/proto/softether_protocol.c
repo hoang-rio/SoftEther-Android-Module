@@ -1791,6 +1791,11 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
         return -1;
     }
 
+    // Periodically send keepalives over all send-capable TCP sockets.
+    // Prevents the server from timing out idle additional uplink (C2S) sockets
+    // when UDP acceleration (RUDP) carries all VPN data.
+    softether_send_keepalive_all(conn);
+
     // Multi-connection: launch additional connections in background thread (non-blocking)
     if (conn->num_additional < conn->max_connection - 1 &&
         conn->additional_failed_count < 16 &&

@@ -166,6 +166,7 @@ typedef struct softether_connection {
     int additional_connect_slot; // which slot the background thread is targeting
     int additional_connect_result; // result from background thread (0=success, -1=fail)
     int send_rr_idx;              // round-robin index for send socket selection
+    uint64_t next_tcp_keepalive_time;  // monotonic timestamp for next periodic TCP keepalive sweep (ms)
     // Callbacks
     void (*on_connect)(struct softether_connection* conn);
     void (*on_disconnect)(struct softether_connection* conn);
@@ -217,6 +218,7 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 
 // Keepalive and connection monitoring
 int softether_send_keepalive(softether_connection_t* conn);
+int softether_send_keepalive_all(softether_connection_t* conn);
 int softether_check_connection(softether_connection_t* conn);
 int softether_process_keepalive(softether_connection_t* conn);
 
