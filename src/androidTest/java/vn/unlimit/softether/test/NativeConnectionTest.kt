@@ -304,6 +304,23 @@ class NativeConnectionTest {
         Log.d(TAG, "✓ Internet connectivity test passed: ${result.errorMessage}")
     }
 
+    /**
+     * Test 12: RUDP V2 (ChaCha20-Poly1305 AEAD) loopback
+     * Self-contained - runs a client+server rudp_context_t pair over 127.0.0.1,
+     * no VPN server required.
+     */
+    @Test
+    fun test12RudpV2Loopback() {
+        Log.d(TAG, "Running testRudpV2Loopback")
+
+        val result = nativeTestRudpV2Loopback()
+        assertTrue(
+            "RUDP V2 loopback failed: ${result.errorMessage} (code: ${result.errorCode})",
+            result.success
+        )
+        Log.d(TAG, "✓ RUDP V2 loopback test passed: ${result.errorMessage}")
+    }
+
     // Native method declarations
     private external fun nativeTestTcpConnection(host: String, port: Int, timeoutMs: Int): NativeTestResult
     private external fun nativeTestTlsHandshake(host: String, port: Int, timeoutMs: Int): NativeTestResult
@@ -315,4 +332,5 @@ class NativeConnectionTest {
     private external fun nativeTestFullLifecycle(host: String, port: Int, username: String, password: String, timeoutMs: Int): NativeTestResult
     private external fun nativeTestDhcp(host: String, port: Int, username: String, password: String, timeoutMs: Int): NativeTestResult
     private external fun nativeTestInternetConnectivity(host: String, port: Int, username: String, password: String, timeoutMs: Int): NativeTestResult
+    private external fun nativeTestRudpV2Loopback(): NativeTestResult
 }

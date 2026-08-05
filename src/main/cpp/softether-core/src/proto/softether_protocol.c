@@ -682,7 +682,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         pack_add_int(&p, "support_hmac_on_bulk_of_rudp", 1);
         pack_add_int(&p, "support_udp_recovery", 1);
         pack_add_data(&p, "unique_id", unique_id, SHA1_SIZE);
-        pack_add_int(&p, "rudp_bulk_max_version", 1);
+        pack_add_int(&p, "rudp_bulk_max_version", 2);
     }
 
     // RUDP client fields
@@ -691,7 +691,7 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
         pack_add_data(&p, "udp_acceleration_client_key", rudp->my_key, RUDP_COMMON_KEY_SIZE_V1);
         pack_add_data(&p, "udp_acceleration_client_key_v2", rudp->my_key_v2, RUDP_COMMON_KEY_SIZE_V2);
         pack_add_int(&p, "udp_acceleration_client_cookie", rudp->my_cookie);
-        pack_add_int(&p, "udp_acceleration_max_version", 1);
+        pack_add_int(&p, "udp_acceleration_max_version", 2);
         pack_add_int(&p, "support_hmac_on_udp_acceleration", 1);
         pack_add_int(&p, "udp_acceleration_client_ip", 0);   // all-zeros IP → server will replace with client's TCP remote IP
         pack_add_int(&p, "udp_acceleration_client_port", rudp->my_port);
@@ -1303,7 +1303,7 @@ static int perform_authentication_http(softether_connection_t* conn,
                 LOGD("RUDP: server port = %u", conn->rudp_server_port);
             }
 
-            // Server key (V1)
+            // Server key (V1) - server always sends both, parse independently
             uint32_t key_len = 0;
             if (pack_get_data((const uint8_t*)body, body_len,
                               "udp_acceleration_server_key",
@@ -1312,17 +1312,17 @@ static int perform_authentication_http(softether_connection_t* conn,
                               &key_len) == 0 && key_len > 0) {
                 conn->rudp_server_key_size = (int)key_len;
                 LOGD("RUDP: server key received (%u bytes)", key_len);
-            } else {
-                // Try V2 key
-                key_len = 0;
-                if (pack_get_data((const uint8_t*)body, body_len,
-                                  "udp_acceleration_server_key_v2",
-                                  conn->rudp_server_key,
-                                  sizeof(conn->rudp_server_key),
-                                  &key_len) == 0 && key_len > 0) {
-                    conn->rudp_server_key_size = (int)key_len;
-                    LOGD("RUDP: server key V2 received (%u bytes)", key_len);
-                }
+            }
+
+            // Server key (V2)
+            key_len = 0;
+            if (pack_get_data((const uint8_t*)body, body_len,
+                              "udp_acceleration_server_key_v2",
+                              conn->rudp_server_key_v2,
+                              sizeof(conn->rudp_server_key_v2),
+                              &key_len) == 0 && key_len > 0) {
+                conn->rudp_server_key_v2_size = (int)key_len;
+                LOGD("RUDP: server key V2 received (%u bytes)", key_len);
             }
 
             // Cookies
@@ -1533,14 +1533,22 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // ---- SoftEther Protocol: Step 3 ----
     // If server supports RUDP, initialize the RUDP context
     if (!use_tcp && conn->rudp && conn->rudp_enabled) {
-        if (conn->rudp_server_port == 0 || conn->rudp_server_key_size == 0) {
+        if (conn->rudp_server_port == 0 ||
+            (conn->rudp_server_key_size == 0 && conn->rudp_server_key_v2_size == 0)) {
             LOGW("RUDP enabled by server but missing port/key - disabling");
             conn->rudp_enabled = 0;
         } else {
+            // Select the key by negotiated RUDP version (server always sends both V1 and V2 keys)
+            const uint8_t* server_key = conn->rudp_server_key;
+            int server_key_size = conn->rudp_server_key_size;
+            if (conn->rudp_version >= 2 && conn->rudp_server_key_v2_size > 0) {
+                server_key = conn->rudp_server_key_v2;
+                server_key_size = conn->rudp_server_key_v2_size;
+            }
             // Init RUDP client with server params
             int r = rudp_init_client(conn->rudp,
-                                     conn->rudp_server_key,
-                                     conn->rudp_server_key_size,
+                                     server_key,
+                                     server_key_size,
                                      conn->rudp_server_ip[0] ?
                                          conn->rudp_server_ip : conn->server_ip,
                                      conn->rudp_server_port,

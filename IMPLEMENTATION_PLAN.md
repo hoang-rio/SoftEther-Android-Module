@@ -42,6 +42,7 @@ All core implementation phases are complete and stable:
 - ✅ zlib compression on RUDP and TCP data paths
 - ✅ Always-compress policy to prevent server inflate stream corruption
 - ✅ Simultaneous RUDP+TCP polling with 100ms timeout
+- ✅ RUDP V2 (ChaCha20-Poly1305 AEAD): V2 cipher contexts, AEAD send/receive, MAC verification, `udp_acceleration_max_version=2` negotiation, self-test `test_rudp_v2_loopback` passed on device
 
 ### Key Improvements (2026-02-27 → 2026-03-09)
 
@@ -95,11 +96,11 @@ All core implementation phases are complete and stable:
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | ✅ V1 Working (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
+| UDP (SoftEther RUDP) | ✅ V1 + V2 Working (See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md)) |
 
 **TCP** connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
 
-**UDP (RUDP) V1** is implemented and working. Data is transported via UDP with RC4 encryption, keepalive polling, zlib compression, and TCP fallback. V2 (ChaCha20-Poly1305 AEAD) is planned.
+**UDP (RUDP) V1 and V2** are implemented and working. Data is transported via UDP with RC4 encryption (V1) or ChaCha20-Poly1305 AEAD (V2), keepalive polling, zlib compression, and TCP fallback. The client advertises `udp_acceleration_max_version=2`; servers that don't support V2 negotiate back down to V1 automatically.
 
 ---
 
@@ -197,10 +198,11 @@ Client                              Server
    - Implement send-side socket selection and receive-side multi-socket polling
    - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 6
 
-2. **V2 (ChaCha20-Poly1305 AEAD)**
-   - Replace RC4+zero-verify with AEAD encryption
+2. **V2 (ChaCha20-Poly1305 AEAD)** — ✅ **Complete (2026-08)**
+   - Replaced RC4+zero-verify with AEAD encryption
    - Persistent EVP_CIPHER_CTX for ChaCha20-Poly1305
    - Version negotiation (`udp_acceleration_max_version=2`)
+   - Verified by `NativeConnectionTest#test12RudpV2Loopback` on device; live-server interop still to confirm
    - See [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 7
 
 3. **Additional Stability & Testing**
@@ -213,5 +215,5 @@ Client                              Server
 
 ---
 
-*Last Updated: 2026-07-25*
-*Status: ✅ TCP + RUDP V1 working, compression implemented, multi-connection and V2 planned*
+*Last Updated: 2026-08-05*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented, multi-connection planned*

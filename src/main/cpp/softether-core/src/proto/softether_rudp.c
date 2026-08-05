@@ -106,11 +106,38 @@ rudp_context_t* rudp_create(int is_client) {
 
 void rudp_destroy(rudp_context_t* ctx) {
     if (ctx == NULL) return;
+    if (ctx->evp_encrypt_ctx) EVP_CIPHER_CTX_free((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx);
+    if (ctx->evp_decrypt_ctx) EVP_CIPHER_CTX_free((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx);
     if (ctx->udp_fd >= 0) {
         close(ctx->udp_fd);
         ctx->udp_fd = -1;
     }
     free(ctx);
+}
+
+// Initialize the V2 ChaCha20-Poly1305 cipher contexts from the established keys.
+// Send uses my_key_v2, recv uses your_key_v2. Falls back to v2_cipher_inited=0
+// if OpenSSL context allocation fails.
+static void rudp_init_v2_cipher(rudp_context_t* ctx) {
+    EVP_CIPHER_CTX* enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* dec = EVP_CIPHER_CTX_new();
+    if (enc == NULL || dec == NULL) {
+        if (enc) EVP_CIPHER_CTX_free(enc);
+        if (dec) EVP_CIPHER_CTX_free(dec);
+        ctx->evp_encrypt_ctx = NULL;
+        ctx->evp_decrypt_ctx = NULL;
+        ctx->v2_cipher_inited = 0;
+        return;
+    }
+    EVP_EncryptInit_ex(enc, EVP_chacha20_poly1305(), NULL, NULL, NULL);
+    EVP_CIPHER_CTX_ctrl(enc, EVP_CTRL_AEAD_SET_IVLEN, RUDP_PACKET_IV_SIZE_V2, NULL);
+    EVP_EncryptInit_ex(enc, NULL, NULL, ctx->my_key_v2, NULL);
+    EVP_DecryptInit_ex(dec, EVP_chacha20_poly1305(), NULL, NULL, NULL);
+    EVP_CIPHER_CTX_ctrl(dec, EVP_CTRL_AEAD_SET_IVLEN, RUDP_PACKET_IV_SIZE_V2, NULL);
+    EVP_DecryptInit_ex(dec, NULL, NULL, ctx->your_key_v2, NULL);
+    ctx->evp_encrypt_ctx = enc;
+    ctx->evp_decrypt_ctx = dec;
+    ctx->v2_cipher_inited = 1;
 }
 
 int rudp_init_client(rudp_context_t* ctx,
@@ -146,6 +173,10 @@ int rudp_init_client(rudp_context_t* ctx,
         }
     }
 
+    if (server_key_size >= RUDP_COMMON_KEY_SIZE_V2) {
+        rudp_init_v2_cipher(ctx);
+    }
+
     ctx->your_cookie = server_cookie;
     ctx->my_cookie = client_cookie;
     ctx->inited = 1;
@@ -177,6 +208,10 @@ int rudp_init_server(rudp_context_t* ctx,
         }
     }
 
+    if (client_key_size >= RUDP_COMMON_KEY_SIZE_V2) {
+        rudp_init_v2_cipher(ctx);
+    }
+
     ctx->inited = 1;
     ctx->now = tick64();
 
@@ -191,7 +226,7 @@ void rudp_set_tick(rudp_context_t* ctx, uint64_t tick) {
 
 void rudp_set_version(rudp_context_t* ctx, int version) {
     if (ctx == NULL) return;
-    ctx->version = 1; // only V1 implemented
+    ctx->version = (version >= 2 && ctx->v2_cipher_inited) ? 2 : 1;
 }
 
 void rudp_set_fast_detect(rudp_context_t* ctx, int fast) {
@@ -221,6 +256,7 @@ int rudp_is_active(rudp_context_t* ctx) {
 }
 
 uint32_t rudp_calc_mss(rudp_context_t* ctx) {
+    if (ctx != NULL && ctx->version >= 2) return RUDP_DEFAULT_MSS_V2;
     return RUDP_DEFAULT_MSS;
 }
 
@@ -245,6 +281,126 @@ int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
     }
 
     return 1;
+}
+
+// Parse and validate the decrypted inner fields of a received RUDP packet.
+// buf/size must cover everything after the IV. verify_padding is 1 for V1
+// (trailing 20-byte zero-verify) and 0 for V2 (padding is ignored).
+// Returns 0 if accepted, -1 if the packet must be dropped.
+static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
+                              const struct sockaddr_in* from_addr,
+                              int verify_padding) {
+    if (size < sizeof(uint32_t)) return -1;
+    uint32_t cookie;
+    memcpy(&cookie, buf, sizeof(uint32_t));
+    cookie = ntohl(cookie);
+    buf += sizeof(uint32_t);
+    size -= sizeof(uint32_t);
+
+    if (cookie != ctx->my_cookie) return -1;
+
+    if (size < sizeof(uint64_t)) return -1;
+    uint64_t my_tick;
+    memcpy(&my_tick, buf, sizeof(uint64_t));
+    my_tick = be64toh(my_tick);
+    buf += sizeof(uint64_t);
+    size -= sizeof(uint64_t);
+
+    if (size < sizeof(uint64_t)) return -1;
+    uint64_t your_tick;
+    memcpy(&your_tick, buf, sizeof(uint64_t));
+    your_tick = be64toh(your_tick);
+    buf += sizeof(uint64_t);
+    size -= sizeof(uint64_t);
+
+    if (size < sizeof(uint16_t)) return -1;
+    uint16_t inner_size;
+    memcpy(&inner_size, buf, sizeof(uint16_t));
+    inner_size = ntohs(inner_size);
+    buf += sizeof(uint16_t);
+    size -= sizeof(uint16_t);
+
+    if (size < sizeof(uint8_t)) return -1;
+    uint8_t flag = buf[0];
+    buf += sizeof(uint8_t);
+    size -= sizeof(uint8_t);
+
+    if (size < inner_size) return -1;
+    uint8_t* inner_data = NULL;
+    if (inner_size > 0) {
+        inner_data = buf;
+        buf += inner_size;
+        size -= inner_size;
+    }
+
+    if (verify_padding) {
+        // Verify the 20-byte zero verify field
+        if (size >= RUDP_PACKET_IV_SIZE_V1) {
+            uint32_t pad_size = size - RUDP_PACKET_IV_SIZE_V1;
+            uint8_t* verify = buf + pad_size;
+            int verify_ok = 1;
+            for (uint32_t z = 0; z < RUDP_PACKET_IV_SIZE_V1; z++) {
+                if (verify[z] != 0) { verify_ok = 0; break; }
+            }
+            if (!verify_ok) return -1;
+        } else {
+            return -1;
+        }
+    }
+
+    // Window check
+    if (my_tick < ctx->last_recv_your_tick &&
+        (ctx->last_recv_your_tick - my_tick) >= RUDP_WINDOW_SIZE_MSEC) {
+        // LOGD("rudp_poll: packet outside window, dropping");
+        return -1;
+    }
+
+    ctx->last_recv_my_tick = (your_tick > ctx->last_recv_my_tick) ? your_tick : ctx->last_recv_my_tick;
+    ctx->last_recv_your_tick = (my_tick > ctx->last_recv_your_tick) ? my_tick : ctx->last_recv_your_tick;
+
+    // Update peer address from received packet
+    ctx->peer_addr = *from_addr;
+    ctx->peer_addr_set = 1;
+
+    // Update receive timing
+    if (ctx->last_recv_my_tick != 0 &&
+        (ctx->last_recv_my_tick + RUDP_WINDOW_SIZE_MSEC) >= ctx->now) {
+        ctx->last_recv_tick = ctx->now;
+        if (ctx->first_stable_receive_tick == 0) {
+            ctx->first_stable_receive_tick = ctx->now;
+        }
+    }
+
+    // Queue the data if present
+    if (inner_size > 0 && inner_data != NULL) {
+        // Decompress if RUDP_FLAG_COMPRESSED is set
+        const uint8_t* queue_data = inner_data;
+        uint32_t queue_len = inner_size;
+        uint8_t decomp_buf[RUDP_MAX_PAYLOAD_SIZE + 256];
+
+        if (flag & RUDP_FLAG_COMPRESSED) {
+            uint32_t decomp_len = sizeof(decomp_buf);
+            if (uncompress_data(inner_data, inner_size,
+                                decomp_buf, &decomp_len) != 0) {
+                LOGE("rudp_poll: decompression failed (%u bytes)", inner_size);
+                return -1;
+            }
+            queue_data = decomp_buf;
+            queue_len = decomp_len;
+        }
+
+        if (queue_len <= RUDP_MAX_PAYLOAD_SIZE &&
+            ctx->recv_queue_count < RUDP_RECV_QUEUE_SIZE) {
+            rudp_queued_block_t* entry = &ctx->recv_queue[ctx->recv_queue_tail];
+            memcpy(entry->data, queue_data, queue_len);
+            entry->len = queue_len;
+            ctx->recv_queue_tail = (ctx->recv_queue_tail + 1) % RUDP_RECV_QUEUE_SIZE;
+            ctx->recv_queue_count++;
+            LOGD("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
+                 (flag & RUDP_FLAG_COMPRESSED) ? 1 : 0);
+        }
+    }
+    return 0;
 }
 
 void rudp_poll(rudp_context_t* ctx) {
@@ -299,7 +455,7 @@ void rudp_poll(rudp_context_t* ctx) {
 
         ctx->now = tick64();
 
-        // Process V1 packet (V2 support can be added later)
+        // Process V1 packet
         if (ctx->version == 1) {
             uint8_t* buf = tmp;
             uint32_t size = (uint32_t)ret;
@@ -318,115 +474,37 @@ void rudp_poll(rudp_context_t* ctx) {
             RC4_set_key(&rc4_key, RUDP_PACKET_KEY_SIZE_V1, key);
             RC4(&rc4_key, size, buf, buf);
 
-            // Parse fields
-            if (size < sizeof(uint32_t)) continue;
-            uint32_t cookie;
-            memcpy(&cookie, buf, sizeof(uint32_t));
-            cookie = ntohl(cookie);
-            buf += sizeof(uint32_t);
-            size -= sizeof(uint32_t);
-
-            if (cookie != ctx->my_cookie) continue;
-
-            if (size < sizeof(uint64_t)) continue;
-            uint64_t my_tick;
-            memcpy(&my_tick, buf, sizeof(uint64_t));
-            my_tick = be64toh(my_tick);
-            buf += sizeof(uint64_t);
-            size -= sizeof(uint64_t);
-
-            if (size < sizeof(uint64_t)) continue;
-            uint64_t your_tick;
-            memcpy(&your_tick, buf, sizeof(uint64_t));
-            your_tick = be64toh(your_tick);
-            buf += sizeof(uint64_t);
-            size -= sizeof(uint64_t);
-
-            if (size < sizeof(uint16_t)) continue;
-            uint16_t inner_size;
-            memcpy(&inner_size, buf, sizeof(uint16_t));
-            inner_size = ntohs(inner_size);
-            buf += sizeof(uint16_t);
-            size -= sizeof(uint16_t);
-
-            if (size < sizeof(uint8_t)) continue;
-            uint8_t flag = buf[0];
-            buf += sizeof(uint8_t);
-            size -= sizeof(uint8_t);
-
-            if (size < inner_size) continue;
-            uint8_t* inner_data = NULL;
-            if (inner_size > 0) {
-                inner_data = buf;
-                buf += inner_size;
-                size -= inner_size;
-            }
-
-            // Skip padding
-            if (size >= RUDP_PACKET_IV_SIZE_V1) {
-                // Verify the 20-byte zero verify field
-                uint32_t pad_size = size - RUDP_PACKET_IV_SIZE_V1;
-                uint8_t* verify = buf + pad_size;
-                int verify_ok = 1;
-                for (uint32_t z = 0; z < RUDP_PACKET_IV_SIZE_V1; z++) {
-                    if (verify[z] != 0) { verify_ok = 0; break; }
-                }
-                if (!verify_ok) continue;
-            } else {
+            if (rudp_process_inner(ctx, buf, size, &from_addr, 1) != 0) {
                 continue;
             }
+        } else if (ctx->version == 2) {
+            // V2: ChaCha20-Poly1305 AEAD
+            if ((uint32_t)ret < RUDP_PACKET_IV_SIZE_V2 + RUDP_PACKET_MAC_SIZE_V2 +
+                               sizeof(uint32_t) + 1) {
+                continue;  // Too small
+            }
 
-            // Window check
-            if (my_tick < ctx->last_recv_your_tick &&
-                (ctx->last_recv_your_tick - my_tick) >= RUDP_WINDOW_SIZE_MSEC) {
-                // LOGD("rudp_poll: packet outside window, dropping");
+            uint8_t* iv = tmp;
+            uint8_t* buf = tmp + RUDP_PACKET_IV_SIZE_V2;
+            uint32_t size = (uint32_t)ret - RUDP_PACKET_IV_SIZE_V2;
+
+            // AEAD decrypt (ciphertext + MAC) in place with YourKey_V2 + packet IV
+            int outlen = 0;
+            EVP_DecryptInit_ex((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx, NULL, NULL,
+                               NULL, iv);
+            EVP_CIPHER_CTX_ctrl((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx,
+                                EVP_CTRL_AEAD_SET_TAG, RUDP_PACKET_MAC_SIZE_V2,
+                                tmp + ret - RUDP_PACKET_MAC_SIZE_V2);
+            EVP_DecryptUpdate((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx, buf, &outlen,
+                              buf, size - RUDP_PACKET_MAC_SIZE_V2);
+            if (EVP_DecryptFinal_ex((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx,
+                                    buf + outlen, &outlen) != 1) {
+                continue;  // MAC failure - drop
+            }
+            size -= RUDP_PACKET_MAC_SIZE_V2;
+
+            if (rudp_process_inner(ctx, buf, size, &from_addr, 0) != 0) {
                 continue;
-            }
-
-            ctx->last_recv_my_tick = (your_tick > ctx->last_recv_my_tick) ? your_tick : ctx->last_recv_my_tick;
-            ctx->last_recv_your_tick = (my_tick > ctx->last_recv_your_tick) ? my_tick : ctx->last_recv_your_tick;
-
-            // Update peer address from received packet
-            ctx->peer_addr = from_addr;
-            ctx->peer_addr_set = 1;
-
-            // Update receive timing
-            if (ctx->last_recv_my_tick != 0 &&
-                (ctx->last_recv_my_tick + RUDP_WINDOW_SIZE_MSEC) >= ctx->now) {
-                ctx->last_recv_tick = ctx->now;
-                if (ctx->first_stable_receive_tick == 0) {
-                    ctx->first_stable_receive_tick = ctx->now;
-                }
-            }
-
-            // Queue the data if present
-            if (inner_size > 0 && inner_data != NULL) {
-                // Decompress if RUDP_FLAG_COMPRESSED is set
-                const uint8_t* queue_data = inner_data;
-                uint32_t queue_len = inner_size;
-                uint8_t decomp_buf[RUDP_MAX_PAYLOAD_SIZE + 256];
-
-                if (flag & RUDP_FLAG_COMPRESSED) {
-                    uint32_t decomp_len = sizeof(decomp_buf);
-                    if (uncompress_data(inner_data, inner_size,
-                                        decomp_buf, &decomp_len) != 0) {
-                        LOGE("rudp_poll: decompression failed (%u bytes)", inner_size);
-                        continue;
-                    }
-                    queue_data = decomp_buf;
-                    queue_len = decomp_len;
-                }
-
-                if (queue_len <= RUDP_MAX_PAYLOAD_SIZE &&
-                    ctx->recv_queue_count < RUDP_RECV_QUEUE_SIZE) {
-                    rudp_queued_block_t* entry = &ctx->recv_queue[ctx->recv_queue_tail];
-                    memcpy(entry->data, queue_data, queue_len);
-                    entry->len = queue_len;
-                    ctx->recv_queue_tail = (ctx->recv_queue_tail + 1) % RUDP_RECV_QUEUE_SIZE;
-                    ctx->recv_queue_count++;
-                    LOGD("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
-                         (flag & RUDP_FLAG_COMPRESSED) ? 1 : 0);
-                }
             }
         }
     }
@@ -541,9 +619,45 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
         // Update IV for next packet
         memcpy(ctx->next_iv, buf - RUDP_PACKET_IV_SIZE_V1, RUDP_PACKET_IV_SIZE_V1);
     } else {
-        // V2 not implemented yet
-        LOGE("rudp_send: V2 not implemented");
-        return -1;
+        // V2: ChaCha20-Poly1305 AEAD
+        uint32_t current_size = RUDP_PACKET_IV_SIZE_V2 + sizeof(uint32_t) +
+            sizeof(uint64_t) * 2 + sizeof(uint16_t) + sizeof(uint8_t) +
+            send_size + RUDP_PACKET_MAC_SIZE_V2;
+
+        if (current_size < ctx->max_udp_packet_size) {
+            uint32_t pad_size = ctx->max_udp_packet_size - current_size;
+            if (pad_size > RUDP_MAX_PADDING_SIZE) pad_size = RUDP_MAX_PADDING_SIZE;
+            pad_size = (uint32_t)(rand() % (pad_size + 1));
+            memset(buf, 0, pad_size);
+            buf += pad_size;
+            size += pad_size;
+            current_size += pad_size;
+        }
+
+        // Guard: total packet (IV + inner + MAC) must fit the temp buffer
+        if (current_size > RUDP_TMP_BUF_SIZE) {
+            LOGE("rudp_send: V2 packet too large (%u bytes)", current_size);
+            return -1;
+        }
+
+        // Encrypt inner (everything after IV) in place
+        uint32_t inner_len = size - RUDP_PACKET_IV_SIZE_V2;
+        int outlen = 0;
+        EVP_EncryptInit_ex((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx, NULL, NULL,
+                           NULL, ctx->next_iv_v2);
+        EVP_EncryptUpdate((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx,
+                          tmp + RUDP_PACKET_IV_SIZE_V2, &outlen,
+                          tmp + RUDP_PACKET_IV_SIZE_V2, inner_len);
+        EVP_EncryptFinal_ex((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx,
+                            tmp + RUDP_PACKET_IV_SIZE_V2 + inner_len, &outlen);
+        EVP_CIPHER_CTX_ctrl((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx,
+                            EVP_CTRL_AEAD_GET_TAG, RUDP_PACKET_MAC_SIZE_V2,
+                            tmp + size);
+        size += RUDP_PACKET_MAC_SIZE_V2;
+
+        // Update IV for next packet (first 12 bytes of the ciphertext)
+        memcpy(ctx->next_iv_v2, tmp + RUDP_PACKET_IV_SIZE_V2,
+               RUDP_PACKET_IV_SIZE_V2);
     }
 
     // Send

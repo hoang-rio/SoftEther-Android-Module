@@ -134,6 +134,8 @@ typedef struct softether_connection {
     uint32_t rudp_client_cookie;
     uint8_t rudp_server_key[128];
     int rudp_server_key_size;
+    uint8_t rudp_server_key_v2[128];
+    int rudp_server_key_v2_size;
     char rudp_server_ip[64];
     uint16_t rudp_server_port;
     int rudp_version;

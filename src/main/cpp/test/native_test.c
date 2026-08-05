@@ -945,3 +945,154 @@ native_test_result_t test_internet_connectivity(const native_test_config_t *conf
   LOGD("Internet connectivity test PASSED: %s", msg);
   return result;
 }
+
+// Poll until a payload arrives or the deadline elapses (UDP delivery is async).
+static int rudp_poll_recv_until(rudp_context_t *ctx, uint8_t *buf,
+                                uint32_t *len, uint32_t max_len,
+                                long deadline_ms) {
+  long deadline = get_test_timestamp_ms() + deadline_ms;
+  while (get_test_timestamp_ms() < deadline) {
+    rudp_poll(ctx);
+    *len = 0;
+    int rr = rudp_recv(ctx, buf, len, max_len);
+    if (rr > 0) return rr;
+    usleep(5000);
+  }
+  return 0;
+}
+
+// Self-contained RUDP V2 (ChaCha20-Poly1305 AEAD) loopback test.
+// No VPN server required - a client and server rudp_context_t talk over 127.0.0.1.
+native_test_result_t test_rudp_v2_loopback(void) {
+  native_test_result_t result;
+  long start_time = get_test_timestamp_ms();
+
+  rudp_context_t *client = rudp_create(1);
+  rudp_context_t *server = rudp_create(0);
+  if (client == NULL || server == NULL) {
+    if (client) rudp_destroy(client);
+    if (server) rudp_destroy(server);
+    test_result_init(&result, false, ERR_UNKNOWN, "rudp_create failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // Exchange each side's own V2 key (mirrors the real login flow)
+  if (rudp_init_server(server, client->my_key_v2, RUDP_COMMON_KEY_SIZE_V2,
+                       "127.0.0.1", client->my_port) != 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_UNKNOWN, "rudp_init_server failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+  if (rudp_init_client(client, server->my_key_v2, RUDP_COMMON_KEY_SIZE_V2,
+                       "127.0.0.1", server->my_port,
+                       server->my_cookie, server->your_cookie) != 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_UNKNOWN, "rudp_init_client failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  rudp_set_version(client, 2);
+  rudp_set_version(server, 2);
+  if (client->version != 2 || server->version != 2) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_UNKNOWN,
+                     "V2 cipher not initialized (version not set to 2)",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // Client -> server payload (auto-compressed by rudp_send)
+  uint8_t payload[64];
+  memset(payload, 0xAB, sizeof(payload));
+  if (rudp_send(client, payload, sizeof(payload), 0) < 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "client rudp_send failed", get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  uint8_t rbuf[256];
+  uint32_t rlen = 0;
+  int rr = rudp_poll_recv_until(server, rbuf, &rlen, sizeof(rbuf), 2000);
+  if (rr < 0 || rlen != sizeof(payload) ||
+      memcmp(rbuf, payload, sizeof(payload)) != 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "client->server payload mismatch",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // Server -> client payload
+  uint8_t payload2[48];
+  memset(payload2, 0xCD, sizeof(payload2));
+  if (rudp_send(server, payload2, sizeof(payload2), 0) < 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "server rudp_send failed", get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  rlen = 0;
+  rr = rudp_poll_recv_until(client, rbuf, &rlen, sizeof(rbuf), 2000);
+  if (rr < 0 || rlen != sizeof(payload2) ||
+      memcmp(rbuf, payload2, sizeof(payload2)) != 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "server->client payload mismatch",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // A corrupt-MAC V2 packet must be silently dropped
+  uint8_t corrupt[64];
+  for (int i = 0; i < (int)sizeof(corrupt); i++) {
+    corrupt[i] = (uint8_t)(rand() & 0xFF);
+  }
+  struct sockaddr_in srv_addr;
+  memset(&srv_addr, 0, sizeof(srv_addr));
+  srv_addr.sin_family = AF_INET;
+  srv_addr.sin_port = htons(server->my_port);
+  srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  sendto(rudp_get_udp_fd(client), corrupt, sizeof(corrupt), 0,
+         (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+
+  // Poll briefly so the corrupt packet is actually processed by the server
+  long corrupt_deadline = get_test_timestamp_ms() + 1000;
+  while (get_test_timestamp_ms() < corrupt_deadline) {
+    rudp_poll(server);
+    usleep(5000);
+  }
+  rlen = 0;
+  rr = rudp_recv(server, rbuf, &rlen, sizeof(rbuf));
+  if (rr != 0) {
+    rudp_destroy(client);
+    rudp_destroy(server);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "corrupt-MAC packet was not dropped",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  rudp_destroy(client);
+  rudp_destroy(server);
+
+  long duration = get_test_timestamp_ms() - start_time;
+  char msg[256];
+  snprintf(msg, sizeof(msg),
+           "RUDP V2 loopback OK: both directions + corrupt-MAC dropped (%ld ms)",
+           duration);
+  test_result_init(&result, true, ERR_NONE, msg, duration);
+  LOGD("RUDP V2 loopback test PASSED: %s", msg);
+  return result;
+}

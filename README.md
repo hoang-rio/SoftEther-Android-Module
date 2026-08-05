@@ -7,11 +7,11 @@ SoftEther-Android-Module for [vpngate-connector](https://github.com/hoang-rio/vp
 | Transport | Status |
 |-----------|--------|
 | TCP (SoftEther over HTTPS/TLS) | ✅ Supported |
-| UDP (SoftEther RUDP) | ✅ V1 Working |
+| UDP (SoftEther RUDP) | ✅ V1 + V2 Working |
 
 **TCP** connects via the SoftEther HTTPS/TLS channel on the server's SE-VPN TCP port.
 
-**UDP (RUDP) V1** is implemented and working. V1 uses RC4 encryption with SHA1 key derivation. V2 (ChaCha20-Poly1305 AEAD) is planned for improved security. See the [RUDP Implementation Plan](RUDP_IMPLEMENTATION_PLAN.md) for details.
+**UDP (RUDP)** V1 (RC4 + SHA1 key derivation) and V2 (ChaCha20-Poly1305 AEAD, 128-byte key, 12-byte IV + 16-byte Poly1305 MAC) are implemented and working. The client advertises `udp_acceleration_max_version=2` and falls back to V1 when the server only supports V1. See the [RUDP Implementation Plan](RUDP_IMPLEMENTATION_PLAN.md) for details.
 
 # Implementation Status
 

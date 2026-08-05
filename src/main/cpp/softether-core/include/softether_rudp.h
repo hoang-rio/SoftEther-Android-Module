@@ -38,6 +38,8 @@ extern "C" {
 
 #define RUDP_MSS_OVERHEAD_V1        145  // IV(20)+Cookie(4)+MyTick(8)+YourTick(8)+Size(2)+Flag(1)+Verify(20)+Eth(14)+IP(20)+TCP(20)+UDP(8)
 #define RUDP_DEFAULT_MSS            1355 // 1500 - 145
+#define RUDP_MSS_OVERHEAD_V2        137  // IV(12)+Cookie(4)+MyTick(8)+YourTick(8)+Size(2)+Flag(1)+MAC(16)+Eth(14)+IP(20)+TCP(20)+UDP(8)
+#define RUDP_DEFAULT_MSS_V2         1363 // 1500 - 137
 
 // RUDP flags
 #define RUDP_FLAG_COMPRESSED        0x01
@@ -66,6 +68,11 @@ typedef struct {
     // IVs
     uint8_t next_iv[RUDP_PACKET_IV_SIZE_V1];
     uint8_t next_iv_v2[RUDP_PACKET_IV_SIZE_V2];
+
+    // V2 cipher contexts (EVP_CIPHER_CTX* for ChaCha20-Poly1305)
+    void* evp_encrypt_ctx;
+    void* evp_decrypt_ctx;
+    int v2_cipher_inited;
 
     // Cookies
     uint32_t my_cookie;
