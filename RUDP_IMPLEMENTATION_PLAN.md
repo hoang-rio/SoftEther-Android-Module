@@ -11,7 +11,7 @@ This document outlines the plan to implement SoftEther's UDP Acceleration (RUDP)
 
 ### Protocol Versions
 
-| Feature | V1 (Implemented) | V2 (Planned) |
+| Feature | V1 (Implemented) | V2 (Implemented) |
 |---------|-------------------|--------------|
 | **Encryption** | RC4 (stream cipher) | ChaCha20-Poly1305 AEAD |
 | **Key Derivation** | SHA1(common_key \|\| IV) per packet | Raw 128-byte key, persistent cipher context |
@@ -85,10 +85,10 @@ Key V2 differences:
 ### Phase 5: Compression Support (✅ Complete)
 - ✅ Link zlib in CMakeLists.txt (Android NDK built-in)
 - ✅ Implement zlib wrapper functions: `compress_data()`, `uncompress_data()`, `calc_compress_bound()`
-- ✅ Enable `use_compress=1` in login PACK (`softether_protocol.c:636`)
-- ✅ RUDP: always compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` (`softether_rudp.c:447-453`)
-- ✅ RUDP: decompress on receive if flag set (`softether_rudp.c:409-418`)
-- ✅ TCP: always compress when `server_use_compress=1` (`packet_handler.c:173-186`)
+- ✅ Enable `use_compress=1` in login PACK (`softether_protocol.c:637`)
+- ✅ RUDP: always compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` (`softether_rudp.c:519-532`)
+- ✅ RUDP: decompress on receive if flag set (`softether_rudp.c:381-390`)
+- ✅ TCP: always compress when `server_use_compress=1` (`packet_handler.c:259`)
 - ✅ Skip compression for small packets (≤1 byte)
 - ✅ Always-compress policy to prevent server inflate stream corruption
 
@@ -152,10 +152,10 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 | Component | Status | Details |
 |-----------|--------|---------|
 | `RUDP_FLAG_COMPRESSED` (0x01) | ✅ Used | Set automatically in `rudp_send()` when compression succeeds |
-| `use_compress` login PACK | ✅ Enabled | Set to 1 in `softether_protocol.c:636` |
+| `use_compress` login PACK | ✅ Enabled | Set to 1 in `softether_protocol.c:637` |
 | RUDP send | ✅ Compresses | Always compresses when `data_size > 1`; sets `RUDP_FLAG_COMPRESSED` |
 | RUDP receive | ✅ Decompresses | `rudp_poll()` checks flag, calls `uncompress_data()` |
-| TCP send | ✅ Compresses | Always compresses when `server_use_compress=1` (no size check) |
+| TCP send | ✅ Compresses | Always compresses when `server_use_compress=1` and `payload_len > 1` |
 | zlib linkage | ✅ Linked | `find_library(z-lib z)` in CMakeLists.txt |
 | Wrapper functions | ✅ Implemented | `compress_data()`, `uncompress_data()`, `calc_compress_bound()` in `compress.c` |
 
@@ -204,7 +204,7 @@ uint32_t calc_compress_bound(uint32_t src_size) {
 
 **Step 3: Enable `use_compress` in login PACK**
 
-`softether_protocol.c:636`:
+`softether_protocol.c:637`:
 ```c
 pack_add_int(&p, "use_compress", 1);  // was 0
 ```
@@ -257,8 +257,8 @@ The TCP path uses a different framing format (`CONNECTION_BULK_COMPRESS_SIGNATUR
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| `max_connection` in login PACK | ✅ Set to 4 | `softether_protocol.c:641` |
-| `half_connection` in login PACK | Hardcoded to 0 | `softether_protocol.c:644` |
+| `max_connection` in login PACK | ✅ Set to 4 | `softether_protocol.c:635` |
+| `half_connection` in login PACK | ✅ Set to 1 | `softether_protocol.c:638` |
 | Socket management | ✅ Primary + additional array | `softether_connection_t` has `additional[MAX_SE_CONNECTIONS]` |
 | `server_max_connection` | ✅ Parsed and enforced | Clamped to `min(server_max, client_max)` |
 | Additional connections | ✅ Implemented | `softether_additional_connect()` with full handshake |
@@ -318,7 +318,7 @@ int half_connection;     // 0 or 1
 `softether_protocol.c`:
 ```c
 pack_add_int(&p, "max_connection", 4);        // was 1
-pack_add_int(&p, "half_connection", 0);        // keep 0 initially
+pack_add_int(&p, "half_connection", 1);        // enabled — unidirectional per socket
 ```
 
 **Step 3: Implement additional connection handshake**
@@ -655,7 +655,7 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 | Prebuilt libs (`jniLibs/{abi}/libssl.a`, `libcrypto.a`) | ❌ 1.1.1w | Confirmed via `strings`; 11 Sep 2023 final 1.1.1 release |
 | Source tree (`src/main/cpp/openssl`) | ❌ 1.1.1w | HEAD detached at `OpenSSL_1_1_1w`; git-ignored (local build artifact) |
 | 1.1.1 series support | ❌ EOL | 1.1.1 EOL 11 Sep 2023; 1.1.1w is the last security-patched version |
-| `RC4()` low-level usage | ⚠️ Deprecated in 3.x | `softether_rudp.c:319,538` — direct calls, still compile in 3.x |
+| `RC4()` low-level usage | ⚠️ Deprecated in 3.x | `softether_rudp.c:473-475,614-616` — direct calls, still compile in 3.x |
 | `EVP_chacha20_poly1305()` | ✅ Available | Needed for Phase 7 V2; present in 1.1.1 and 3.x |
 | Upstream SoftEther 3.x support | ✅ Present | `#if OPENSSL_VERSION_NUMBER >= 0x30000000L` + `OSSL_PROVIDER_load` (`Encrypt.c:139,158,5117,5156`) |
 
@@ -671,7 +671,7 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 ### Why 1.1.1w Was Used
 
 1. **Final release of the 1.1.1 LTS series** — last security-patched version before EOL
-2. **Code targets 1.1.x API generation**: direct `RC4()` calls (`softether_rudp.c:319,538`), `EVP_aes_*_cbc()/gcm()`, `EVP_md5()`, `EVP_sha1()`
+2. **Code targets 1.1.x API generation**: direct `RC4()` calls (`softether_rudp.c:473-475,614-616`), `EVP_aes_*_cbc()/gcm()`, `EVP_md5()`, `EVP_sha1()`
 3. **Android NDK ships no OpenSSL** — must build from source; source tree vendored and pinned
 
 ### Upgrade Steps
@@ -721,8 +721,8 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 |-----|----------|----------------|
 | `EVP_aes_*_cbc()/gcm()` | `aes_wrapper.c:70-80` | ✅ Default provider |
 | `EVP_md5()` / `EVP_sha1()` | `aes_wrapper.c:455,500` | ✅ Default provider |
-| `EVP_chacha20_poly1305()` | Phase 7 (planned) | ✅ Both 1.1.1 and 3.x |
-| `RC4()` low-level | `softether_rudp.c:319,538` | ⚠️ Deprecated, still compiles |
+| `EVP_chacha20_poly1305()` | Phase 7 (implemented) | ✅ Both 1.1.1 and 3.x |
+| `RC4()` low-level | `softether_rudp.c:473-475,614-616` | ⚠️ Deprecated, still compiles |
 | `SSL_CTX`, `SSL`, TLS | `aes_wrapper.c` | ✅ |
 | `RAND_*` | `aes_wrapper.c` | ✅ |
 
@@ -751,7 +751,7 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 
 | Risk | Feature | Mitigation |
 |------|---------|------------|
-| CPU overhead on compress/decompress | Compression | Use `Z_DEFAULT_COMPRESSION` (level 6); skip compression for small packets (< 256 bytes) |
+| CPU overhead on compress/decompress | Compression | Use `Z_DEFAULT_COMPRESSION` (level 6); skip compression for small packets (≤1 byte) |
 | Buffer overflow from decompression | Compression | Always check `uncompress()` return value; use `compressBound()` for max size estimates |
 | Server doesn't honor `use_compress=0` | Compression | Server should respect client's setting; if not, disable compression and log error |
 | OpenSSL prebuilt lib lacks `EVP_chacha20_poly1305()` | V2 | Verify with compile test; fallback to V1 if unavailable |
@@ -793,7 +793,7 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 | RUDP V1 regression | V1 | Connect, send/receive VPN traffic, verify unchanged behavior |
 | Compression send/receive | Compression | Enable `use_compress=1`, verify data arrives and is smaller on wire |
 | Compress flag propagation | Compression | Verify `RUDP_FLAG_COMPRESSED` (0x01) is set in RUDP header when compressed |
-| Small packet skip | Compression | Verify packets < 256 bytes are not compressed |
+| Small packet skip | Compression | Verify packets ≤1 byte are not compressed |
 | V2 negotiation | V2 | Connect with `max_version=2`, check server responds `version=2` — 🚧 pending live-server interop; version advertisement is set to 2 |
 | V2 data transfer | V2 | Send/receive VPN traffic over V2 channel — ✅ verified via `test_rudp_v2_loopback` (self-contained, on device) |
 | V2 keepalive | V2 | Verify keepalive timing works identically to V1 — ✅ logic is version-agnostic (`rudp_process_inner`), covered by loopback |
