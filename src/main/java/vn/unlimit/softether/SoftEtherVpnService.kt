@@ -494,13 +494,23 @@ class SoftEtherVpnService : VpnService() {
 
         // IPv6 tunnel: unique per-install ULA address, full default route, public DNS
         // Multiple clients must not share the same ULA — derive a stable unique one.
-        val localV6 = if (config.localAddressV6.isBlank() || config.localAddressV6 == "fd00::2") {
-            deriveUniqueLocalAddressV6()
-        } else {
-            config.localAddressV6
+        // Never let IPv6 address setup take down the whole tunnel on a bad value.
+        val localV6 = try {
+            if (config.localAddressV6.isBlank() || config.localAddressV6 == "fd00::2") {
+                deriveUniqueLocalAddressV6()
+            } else {
+                config.localAddressV6
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "IPv6 ULA derivation failed, skipping IPv6 address", e)
+            ""
         }
         if (localV6.isNotEmpty()) {
-            builder.addAddress(localV6, config.prefixLengthV6)
+            try {
+                builder.addAddress(localV6, config.prefixLengthV6)
+            } catch (e: Exception) {
+                Log.w(TAG, "Invalid IPv6 ULA, skipping: $localV6", e)
+            }
         }
         if (config.dnsServerV6.isNotEmpty()) {
             builder.addDnsServer(config.dnsServerV6)
@@ -546,14 +556,19 @@ class SoftEtherVpnService : VpnService() {
         if (!androidId.isNullOrBlank()) {
             val hex = androidId.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }.lowercase()
             if (hex.length >= 4) {
-                return "fd00::$hex"
+                return buildUla(hex)
             }
         }
         val prefs = getSharedPreferences("softether_vpn", Context.MODE_PRIVATE)
         prefs.getString(KEY_ULA_V6, null)?.let { return it }
-        val generated = "fd00::" + java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+        val generated = buildUla(java.util.UUID.randomUUID().toString().replace("-", "").take(16))
         prefs.edit().putString(KEY_ULA_V6, generated).apply()
         return generated
+    }
+
+    private fun buildUla(hex: String): String {
+        val groups = hex.chunked(4).joinToString(":")
+        return "fd00::$groups"
     }
 
     private fun createNotificationChannel() {
