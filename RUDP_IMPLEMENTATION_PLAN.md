@@ -118,11 +118,11 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] V2 MSS calculation (8 bytes less overhead than V1)
 - [x] Self-test `test_rudp_v2_loopback`: loopback client/server pair over `127.0.0.1`, both directions + corrupt-MAC drop — **passed on device** (SM-A736B, Android 16) via `NativeConnectionTest#test12RudpV2Loopback`
 
-### Phase 8: IPv6 Tunnel Support (📋 Planned)
-- [ ] Add IPv6 fields to `ConnectionConfig.kt` (`localAddressV6`, `dnsServerV6`, `routesV6`)
-- [ ] Configure VPN interface with IPv6 address (`fd00::2/128`), route (`::/0`), DNS (`2001:4860:4860::8888`)
-- [ ] Accept `Inet6Address` in `ConnectionController.kt` `buildClientInfo()`
-- [ ] Support IPv6 in `ClientInfo.kt` (`getLocalIPv6Address()`, `isIPv6` flag)
+### Phase 8: IPv6 Tunnel Support (✅ Complete)
+- [x] Add IPv6 fields to `ConnectionConfig.kt` (`localAddressV6`, `dnsServerV6`, `routesV6`)
+- [x] Configure VPN interface with IPv6 address (`fd00::2/128`), route (`::/0`), DNS (`2001:4860:4860::8888`)
+- [x] Accept `Inet6Address` in `ConnectionController.kt` `buildClientInfo()`
+- [x] Support IPv6 in `ClientInfo.kt` (`getLocalIPv6Address()`, `isIPv6` flag)
 
 ### Phase 9: Dual-Stack Socket Support (📋 Planned)
 - [ ] Replace `sockaddr_in` with `sockaddr_storage` in `softether_socket.h`, `softether_rudp.h`
@@ -478,7 +478,7 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | TCP socket creation | ❌ IPv4 only | `AF_INET` hardcoded in `tcp_socket.c:27` |
 | DNS resolution | ❌ IPv4 only | `gethostbyname()` in `tcp_socket.c:60` |
 | RUDP socket | ❌ IPv4 only | `AF_INET` in `softether_rudp.c:46` |
-| VPN interface | ❌ IPv4 only | No IPv6 address/route/DNS in `SoftEtherVpnService.kt` |
+| VPN interface | ✅ IPv6 enabled | `fd00::2/128`, `::/0`, `2001:4860:4860::8888` in `SoftEtherVpnService.kt` |
 | Protocol handshake | ❌ IPv4 only | `ClientIpAddress` as 32-bit int (`softether_protocol.c:659`) |
 | Connection struct | ❌ IPv4 only | No `*_ip_v6` or `is_ipv6` fields |
 
@@ -502,7 +502,7 @@ Key upstream IPv6 functions:
 
 Route IPv6 traffic through the VPN tunnel once connected over IPv4.
 
-**Step 1: Add IPv6 fields to `ConnectionConfig.kt`**
+**Step 1: Add IPv6 fields to `ConnectionConfig.kt`** (✅ Done)
 
 ```kotlin
 data class ConnectionConfig(
@@ -514,26 +514,26 @@ data class ConnectionConfig(
 )
 ```
 
-**Step 2: Configure VPN interface in `SoftEtherVpnService.kt`**
+**Step 2: Configure VPN interface in `SoftEtherVpnService.kt`** (✅ Done)
 
-In `establishVpnInterface()` (~line 449):
+In `establishVpnInterface()` (`SoftEtherVpnService.kt:493-502`):
 ```kotlin
 builder.addAddress(config.localAddressV6, config.prefixLengthV6)
-builder.addRoute("::", 0)  // IPv6 default route
+builder.addRoute(route.address, route.prefixLength)  // ::/0
 builder.addDnsServer(config.dnsServerV6)
 ```
 
-**Step 3: Accept IPv6 in `ConnectionController.kt`**
+**Step 3: Accept IPv6 in `ConnectionController.kt`** (✅ Done)
 
-In `buildClientInfo()` (~line 190):
+In `buildClientInfo()` (`ConnectionController.kt:188-196`):
 ```kotlin
 // Before: if (addr is Inet4Address)
-// After:  if (addr is Inet4Address || addr is Inet6Address)
+// After:  if (addr is Inet4Address || addr is Inet6Address), excluding link-local
 ```
 
-**Step 4: IPv6 address detection in `ClientInfo.kt`**
+**Step 4: IPv6 address detection in `ClientInfo.kt`** (✅ Done)
 
-Add `getLocalIPv6Address()` method and `isIPv6` flag.
+Add `getLocalIPv6Address()` method and `isIPv6` flag; falls back to `::` when no global IPv6 exists.
 
 ### Phase B: Dual-Stack Sockets (Harder)
 
@@ -634,15 +634,23 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 
 ### Success Criteria
 
-- [ ] VPN interface has IPv6 address (`fd00::2/128`) and default route (`::/0`)
-- [ ] IPv6 DNS server configured (`2001:4860:4860::8888`)
-- [ ] Connected devices can reach IPv6 endpoints through tunnel
+Phase A (IPv6 Tunnel):
+- [x] VPN interface has IPv6 address (`fd00::2/128`) and default route (`::/0`)
+- [x] IPv6 DNS server configured (`2001:4860:4860::8888`)
+- [x] Connected devices can reach IPv6 endpoints through tunnel (NAT66 on the host; see field notes below)
+
+Phase B (Dual-Stack Sockets):
 - [ ] `resolve_hostname()` returns both IPv4 and IPv6 addresses
 - [ ] TCP connection tries IPv4 first, falls back to IPv6
 - [ ] R-UDP creates IPv6 UDP socket when peer is IPv6
 - [ ] Login PACK includes `ClientIpv6Address` (16-byte DATA) when IPv6
 - [ ] MTU adjusted for IPv6 header (40 bytes vs 20)
 - [ ] Can connect to server over IPv6 when IPv4 is unavailable
+
+> **Field notes (2026-08): host-side IPv6 delivery.** Phase A moves IPv6 packets through the L2 tunnel, but the reply path needs the host to deliver frames back to the phone. Two hard-won findings on the paid SoftEther server (hub `VPNGatePaid`, local TAP bridge):
+> 1. The hub mangles ND: the host kernel never learns the phone's tun MAC by NUD (entries stay `FAILED`/`INCOMPLETE`) even though the phone answers every NS with a valid NA. Fix: static neighbor pin on the host (`ip -6 neigh replace fd00::2 lladdr <phone-mac> dev tap_net nud permanent`), re-learned per session because Android rotates the tun MAC on reconnect.
+> 2. Global egress uses NAT66 (`ip6tables -t nat -A POSTROUTING -s fd00::/8 -o eth0 -j MASQUERADE`) plus `ndppd` with only `rule ::/0 { static }` to answer the phone's NS for global destinations. `radvd` must advertise **no prefix** and `AdvDefaultLifetime 0` so Android stops SLAAC-rotating addresses.
+> Persistence for all of this lives in `server-setup/nat66/` (setup script + systemd units, incl. a self-healing 30s neighbor-pin timer).
 
 ---
 
@@ -808,10 +816,10 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 | Socket protection | Multi-Connection | Verify additional sockets are protected via VpnService.protect() |
 | Background connect non-blocking | Multi-Connection | Verify receive loop continues while additional connections are being established in background thread |
 | Background connect cleanup | Multi-Connection | Disconnect during background connect, verify no crash/hang (pthread_join) |
-| IPv6 tunnel address | IPv6 Tunnel | Verify VPN interface has `fd00::2/128` address |
-| IPv6 default route | IPv6 Tunnel | Verify `::/0` route added to VPN interface |
-| IPv6 DNS | IPv6 Tunnel | Verify `2001:4860:4860::8888` DNS server configured |
-| IPv6 traffic through tunnel | IPv6 Tunnel | Ping IPv6 endpoint through VPN tunnel |
+| IPv6 tunnel address | IPv6 Tunnel | Verify VPN interface has `fd00::2/128` address — ✅ verified |
+| IPv6 default route | IPv6 Tunnel | Verify `::/0` route added to VPN interface — ✅ verified |
+| IPv6 DNS | IPv6 Tunnel | Verify `2001:4860:4860::8888` DNS server configured — ✅ verified |
+| IPv6 traffic through tunnel | IPv6 Tunnel | Ping IPv6 endpoint through VPN tunnel — ✅ verified end-to-end (host `ping6 fd00::2` round-trips; phone reaches `2001:4860:4860::8888` via NAT66) |
 | Dual-stack DNS resolution | Dual-Stack | Verify `getaddrinfo` returns both A and AAAA |
 | IPv6 TCP fallback | Dual-Stack | Block IPv4, verify connection succeeds over IPv6 |
 | IPv6 RUDP socket | Dual-Stack | Verify `AF_INET6` UDP socket created for IPv6 peer |

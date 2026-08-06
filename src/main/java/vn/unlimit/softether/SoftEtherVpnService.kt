@@ -490,6 +490,17 @@ class SoftEtherVpnService : VpnService() {
             builder.addRoute(route.address, route.prefixLength)
         }
 
+        // IPv6 tunnel: static ULA address, full default route, public DNS
+        if (config.localAddressV6.isNotEmpty()) {
+            builder.addAddress(config.localAddressV6, config.prefixLengthV6)
+        }
+        if (config.dnsServerV6.isNotEmpty()) {
+            builder.addDnsServer(config.dnsServerV6)
+        }
+        config.routesV6.forEach { route ->
+            builder.addRoute(route.address, route.prefixLength)
+        }
+
         // Exclude apps from VPN tunnel (they will use normal network instead)
         config.excludedApps.forEach { packageName ->
             try {

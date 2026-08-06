@@ -23,12 +23,16 @@ data class ConnectionConfig(
     val password: String,
     val virtualHub: String = "VPN",
     val sessionName: String = "SoftEther VPN",
-    val localAddress: String = "10.0.0.2",
+    val localAddress: String = "10.21.0.2",
     val prefixLength: Int = 24,
     val dnsServer: String = "8.8.8.8",
     val secondaryDnsServer: String = "8.8.4.4",
     val mtu: Int = 1500,
     val routes: List<Route> = listOf(Route("0.0.0.0", 0)), // Default route all traffic
+    val localAddressV6: String = "fd00::2",
+    val prefixLengthV6: Int = 128,
+    val dnsServerV6: String = "2001:4860:4860::8888",
+    val routesV6: List<Route> = listOf(Route("::", 0)),
     val excludedApps: List<String> = emptyList(), // Apps excluded from VPN (bypass VPN tunnel)
     val isMetered: Boolean = false,
     val useTcp: Boolean = true,
@@ -51,12 +55,16 @@ data class ConnectionConfig(
         password = parcel.readString() ?: "",
         virtualHub = parcel.readString() ?: "VPN",
         sessionName = parcel.readString() ?: "SoftEther VPN",
-        localAddress = parcel.readString() ?: "10.0.0.2",
+        localAddress = parcel.readString() ?: "10.21.0.2",
         prefixLength = parcel.readInt(),
         dnsServer = parcel.readString() ?: "8.8.8.8",
         secondaryDnsServer = parcel.readString() ?: "8.8.4.4",
         mtu = parcel.readInt(),
         routes = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("0.0.0.0", 0)),
+        localAddressV6 = parcel.readString() ?: "fd00::2",
+        prefixLengthV6 = parcel.readInt(),
+        dnsServerV6 = parcel.readString() ?: "2001:4860:4860::8888",
+        routesV6 = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("::", 0)),
         excludedApps = parcel.createStringArrayList() ?: emptyList(),
         isMetered = parcel.readByte() != 0.toByte(),
         useTcp = parcel.readByte() != 0.toByte(),
@@ -85,6 +93,10 @@ data class ConnectionConfig(
         parcel.writeString(secondaryDnsServer)
         parcel.writeInt(mtu)
         parcel.writeTypedList(routes)
+        parcel.writeString(localAddressV6)
+        parcel.writeInt(prefixLengthV6)
+        parcel.writeString(dnsServerV6)
+        parcel.writeTypedList(routesV6)
         parcel.writeStringList(excludedApps)
         parcel.writeByte(if (isMetered) 1 else 0)
         parcel.writeByte(if (useTcp) 1 else 0)

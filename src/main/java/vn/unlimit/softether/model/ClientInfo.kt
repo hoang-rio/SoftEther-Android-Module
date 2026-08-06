@@ -13,6 +13,7 @@ data class ClientInfo(
     val osProductId: String,
     val hostName: String,
     val clientIpAddress: String,
+    val isIPv6: Boolean = clientIpAddress.contains(":"),
     val clientPort: Int,
     val serverHostName: String,
     val serverIpAddress: String,
@@ -28,6 +29,7 @@ data class ClientInfo(
         osProductId = parcel.readString() ?: "",
         hostName = parcel.readString() ?: "",
         clientIpAddress = parcel.readString() ?: "",
+        isIPv6 = parcel.readByte() != 0.toByte(),
         clientPort = parcel.readInt(),
         serverHostName = parcel.readString() ?: "",
         serverIpAddress = parcel.readString() ?: "",
@@ -43,6 +45,7 @@ data class ClientInfo(
         parcel.writeString(osProductId)
         parcel.writeString(hostName)
         parcel.writeString(clientIpAddress)
+        parcel.writeByte(if (isIPv6) 1 else 0)
         parcel.writeInt(clientPort)
         parcel.writeString(serverHostName)
         parcel.writeString(serverIpAddress)
@@ -70,7 +73,9 @@ object ClientInfoFactory {
         config: ConnectionConfig,
         rudpPort: Int = 0,
         hostName: String = getLocalHostName(),
-        clientIpAddress: String = getLocalIpAddress()
+        clientIpAddress: String = getLocalIpAddress().takeIf { it.isNotEmpty() && it != "0.0.0.0" }
+            ?: getLocalIPv6Address(),
+        isIPv6: Boolean = clientIpAddress.contains(":")
     ): ClientInfo {
         return ClientInfo(
             productName = productName,
@@ -81,6 +86,7 @@ object ClientInfoFactory {
             osProductId = Build.FINGERPRINT,
             hostName = hostName,
             clientIpAddress = clientIpAddress,
+            isIPv6 = isIPv6,
             clientPort = rudpPort,
             serverHostName = config.serverHost,
             serverIpAddress = resolveHostName(config.serverHost),
@@ -112,6 +118,28 @@ object ClientInfoFactory {
             return "0.0.0.0"
         } catch (e: Exception) {
             return "0.0.0.0"
+        }
+    }
+
+    private fun getLocalIPv6Address(): String {
+        return try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress &&
+                        !addr.isLinkLocalAddress &&
+                        addr is java.net.Inet6Address
+                    ) {
+                        return addr.hostAddress
+                    }
+                }
+            }
+            return "::"
+        } catch (e: Exception) {
+            return "::"
         }
     }
 

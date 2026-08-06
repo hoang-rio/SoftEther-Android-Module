@@ -188,7 +188,10 @@ class ConnectionController(
                     val addresses = iface.inetAddresses
                     while (addresses.hasMoreElements()) {
                         val addr = addresses.nextElement()
-                        if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        if (!addr.isLoopbackAddress &&
+                            !addr.isLinkLocalAddress &&
+                            (addr is java.net.Inet4Address || addr is java.net.Inet6Address)
+                        ) {
                             clientIp = addr.hostAddress
                             break
                         }
