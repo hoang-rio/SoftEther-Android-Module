@@ -29,7 +29,7 @@ data class ConnectionConfig(
     val secondaryDnsServer: String = "8.8.4.4",
     val mtu: Int = 1500,
     val routes: List<Route> = listOf(Route("0.0.0.0", 0)), // Default route all traffic
-    val localAddressV6: String = "fd00::2",
+    val localAddressV6: String = "",
     val prefixLengthV6: Int = 128,
     val dnsServerV6: String = "2001:4860:4860::8888",
     val routesV6: List<Route> = listOf(Route("::", 0)),
@@ -61,7 +61,7 @@ data class ConnectionConfig(
         secondaryDnsServer = parcel.readString() ?: "8.8.4.4",
         mtu = parcel.readInt(),
         routes = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("0.0.0.0", 0)),
-        localAddressV6 = parcel.readString() ?: "fd00::2",
+        localAddressV6 = parcel.readString() ?: "",
         prefixLengthV6 = parcel.readInt(),
         dnsServerV6 = parcel.readString() ?: "2001:4860:4860::8888",
         routesV6 = parcel.createTypedArrayList(Route.CREATOR) ?: listOf(Route("::", 0)),

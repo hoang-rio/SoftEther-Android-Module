@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -53,6 +54,7 @@ class SoftEtherVpnService : VpnService() {
         private const val TRAFFIC_PREFS_SUFFIX = "_preferences"
         private const val DOWNLOADED_DATA_KEY = "downloaded_data"
         private const val UPLOADED_DATA_KEY = "uploaded_data"
+        private const val KEY_ULA_V6 = "ula_v6"
 
         // Actions (kept for service start/stop intents)
         const val ACTION_CONNECT = "vn.unlimit.softether.CONNECT"
@@ -490,9 +492,15 @@ class SoftEtherVpnService : VpnService() {
             builder.addRoute(route.address, route.prefixLength)
         }
 
-        // IPv6 tunnel: static ULA address, full default route, public DNS
-        if (config.localAddressV6.isNotEmpty()) {
-            builder.addAddress(config.localAddressV6, config.prefixLengthV6)
+        // IPv6 tunnel: unique per-install ULA address, full default route, public DNS
+        // Multiple clients must not share the same ULA — derive a stable unique one.
+        val localV6 = if (config.localAddressV6.isBlank() || config.localAddressV6 == "fd00::2") {
+            deriveUniqueLocalAddressV6()
+        } else {
+            config.localAddressV6
+        }
+        if (localV6.isNotEmpty()) {
+            builder.addAddress(localV6, config.prefixLengthV6)
         }
         if (config.dnsServerV6.isNotEmpty()) {
             builder.addDnsServer(config.dnsServerV6)
@@ -522,6 +530,30 @@ class SoftEtherVpnService : VpnService() {
 
         vpnInterface = builder.establish()
         return vpnInterface
+    }
+
+    /**
+     * Stable unique ULA (fd00::/8) per install so concurrent clients never
+     * share an address. Derived from ANDROID_ID when available, else a random
+     * value persisted across sessions.
+     */
+    private fun deriveUniqueLocalAddressV6(): String {
+        val androidId = try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+        } catch (e: Exception) {
+            null
+        }
+        if (!androidId.isNullOrBlank()) {
+            val hex = androidId.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }.lowercase()
+            if (hex.length >= 4) {
+                return "fd00::$hex"
+            }
+        }
+        val prefs = getSharedPreferences("softether_vpn", Context.MODE_PRIVATE)
+        prefs.getString(KEY_ULA_V6, null)?.let { return it }
+        val generated = "fd00::" + java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+        prefs.edit().putString(KEY_ULA_V6, generated).apply()
+        return generated
     }
 
     private fun createNotificationChannel() {
