@@ -143,6 +143,29 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [ ] Verify TLS handshake, AES CBC/GCM, MD5/SHA1 against VPN Gate servers
 - [ ] Run full instrumentation suite for regression
 
+### Phase 11: IPv6 for All Protocols (📋 Planned)
+
+Phase 8 tunneled IPv6 for **SoftEther only**. OpenVPN (`vpnLib`) and MS-SSTP (`sstpClient`) are still IPv4-only in this app even though their client stacks are IPv6-capable. Tasks below are grouped by module; the parent repo (`vpngate-connector`) holds `app/`, `sstpClient/`, `vpnLib/`, while SoftEther code lives in this submodule.
+
+OpenVPN (`vpnLib`, ics-openvpn fork):
+- [ ] Parse `tun-ipv6` in `ConfigParser.java` (currently in the ignored-options list, line ~85) and store as a new `mUseIPv6` flag on `VpnProfile`
+- [ ] Emit `tun-ipv6` in `VpnProfile.getOpenVpnConfiguration()` so the OpenVPN binary actually negotiates IPv6
+- [ ] Parse `ifconfig-ipv6` / `ifconfig-ipv6-push` from the `.ovpn` file into `mIPv6Address` (currently only settable via profile UI)
+- [ ] Confirm `route-ipv6` parsing (`ConfigParser.java:398-405`) and default `route-ipv6 ::/0` (`mUseDefaultRoutev6=true`) survive profile round-trip
+- [ ] Verify management parser handles `IFCONFIG6` + `ROUTE6` (`OpenVpnManagementThread.java:573-588`) — already present, confirm on device
+- [ ] On-device test: VPN Gate OpenVPN server (TCP+UDP) must pass IPv6 traffic and `::/0` must be installed
+
+MS-SSTP (`sstpClient`, kittoku/osc fork):
+- [ ] Enable `PPP_IPv6_ENABLED` in the app's SSTP connect paths (`DetailActivity.connectSSTPVPN()`, `ServerActivity` handler) — default is `false` (`preference/constant.kt:73`)
+- [ ] Make IPv6CP failure non-fatal: `IPTerminal.kt:68-82` currently aborts the whole VPN with `ERR_INVALID_ADDRESS` if IPv6 is enabled but `currentIPv6` stays all-zero — must degrade to IPv4-only instead of disconnecting
+- [ ] Verify IPv6CP negotiation against VPN Gate (SoftEther SSTP) servers — unknown server-side support, needs a live test
+- [ ] Add IPv6 DNS handling to `IPTerminal.kt` (IPv6CP supplies no DNS; wire `bridge.currentProposedDNS`/custom DNS v6)
+- [ ] Confirm `FE80::/64` link-local address (`IPTerminal.kt:74-79`) plus `::/0` + `fc00::/7` routes are installed on-device
+
+App layer (`app/`):
+- [ ] Apply dual-stack IPv6 defaults consistently for OpenVPN and SSTP connections in `DetailActivity.kt` / `ServerActivity.kt` (mirror the SoftEther `ConnectionConfig` IPv6 fields)
+- [ ] Surface IPv6 state in connection status / analytics (`LAST_CONNECT_METHOD`, StatusFragment)
+
 ---
 
 ## 3. Compression Implementation Details
@@ -478,9 +501,17 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | TCP socket creation | ❌ IPv4 only | `AF_INET` hardcoded in `tcp_socket.c:27` |
 | DNS resolution | ❌ IPv4 only | `gethostbyname()` in `tcp_socket.c:60` |
 | RUDP socket | ❌ IPv4 only | `AF_INET` in `softether_rudp.c:46` |
-| VPN interface | ✅ IPv6 enabled | `fd00::2/128`, `::/0`, `2001:4860:4860::8888` in `SoftEtherVpnService.kt` |
+| VPN interface (SoftEther) | ✅ IPv6 enabled | Per-install ULA (`fd00::<ANDROID_ID>`), `::/0`, `2001:4860:4860::8888` in `SoftEtherVpnService.kt` (Phase A); guarded so a bad ULA only skips IPv6, never drops the tunnel |
 | Protocol handshake | ❌ IPv4 only | `ClientIpAddress` as 32-bit int (`softether_protocol.c:659`) |
 | Connection struct | ❌ IPv4 only | No `*_ip_v6` or `is_ipv6` fields |
+
+**Other protocol modules** (parent repo `vpngate-connector`):
+
+| Module | IPv6 capability | Gap |
+|--------|-----------------|-----|
+| `vpnLib` (OpenVPN) | ✅ Engine + management thread are IPv6-ready (`IFCONFIG6`/`ROUTE6` in `OpenVpnManagementThread.java:573-588`; `setLocalIPv6`, v6 routes/DNS in `OpenVPNService.java`; `route-ipv6 ::/0` emitted) | `tun-ipv6` dropped by parser (`ConfigParser.java:85`) → binary never negotiates IPv6; `ifconfig-ipv6` never parsed into `mIPv6Address` |
+| `sstpClient` (MS-SSTP) | ✅ IPv6CP implemented (`Ipv6cpClient.kt`), tun v6 setup done (`IPTerminal.kt:68-82`: `FE80::/64` link-local, `::/0`, `fc00::/7`) | `PPP_IPv6_ENABLED` default `false` (`preference/constant.kt:73`) and app never enables it; IPv6CP failure aborts the whole VPN instead of degrading to IPv4 |
+| `app` | ❌ No IPv6 defaults for OpenVPN/SSTP | `connectSSTPVPN()`/`loadVpnProfile()` in `DetailActivity.kt` / `ServerActivity.kt` configure only IPv4; no per-protocol IPv6 knobs |
 
 ### How Upstream SoftEther Handles IPv6
 
@@ -507,7 +538,7 @@ Route IPv6 traffic through the VPN tunnel once connected over IPv4.
 ```kotlin
 data class ConnectionConfig(
     // ... existing IPv4 fields ...
-    val localAddressV6: String = "fd00::2",
+    val localAddressV6: String = "",   // empty → service derives per-install ULA
     val prefixLengthV6: Int = 128,
     val dnsServerV6: String = "2001:4860:4860::8888",
     val routesV6: List<Route> = listOf(Route("::", 0)),
@@ -518,10 +549,12 @@ data class ConnectionConfig(
 
 In `establishVpnInterface()` (`SoftEtherVpnService.kt:493-502`):
 ```kotlin
-builder.addAddress(config.localAddressV6, config.prefixLengthV6)
+// ULA derived per-install from ANDROID_ID: fd00::<grouped-hex>
+builder.addAddress(ulaAddress, config.prefixLengthV6)
 builder.addRoute(route.address, route.prefixLength)  // ::/0
 builder.addDnsServer(config.dnsServerV6)
 ```
+Per-install ULA (not the shared `fd00::2`) so concurrent clients don't collide on the host bridge; formatting is colon-grouped and the IPv6 block is guarded so a malformed value only skips IPv6, never aborts the tunnel.
 
 **Step 3: Accept IPv6 in `ConnectionController.kt`** (✅ Done)
 
@@ -635,7 +668,7 @@ Replace `resolve_hostname()` with dual-stack resolution. Try IPv4 first, fallbac
 ### Success Criteria
 
 Phase A (IPv6 Tunnel):
-- [x] VPN interface has IPv6 address (`fd00::2/128`) and default route (`::/0`)
+- [x] VPN interface has per-install IPv6 ULA (`fd00::<ANDROID_ID>/128`) and default route (`::/0`)
 - [x] IPv6 DNS server configured (`2001:4860:4860::8888`)
 - [x] Connected devices can reach IPv6 endpoints through tunnel (NAT66 on the host; see field notes below)
 
@@ -651,6 +684,50 @@ Phase B (Dual-Stack Sockets):
 > 1. The hub mangles ND: the host kernel never learns the phone's tun MAC by NUD (entries stay `FAILED`/`INCOMPLETE`) even though the phone answers every NS with a valid NA. Fix: static neighbor pin on the host (`ip -6 neigh replace fd00::2 lladdr <phone-mac> dev tap_net nud permanent`), re-learned per session because Android rotates the tun MAC on reconnect.
 > 2. Global egress uses NAT66 (`ip6tables -t nat -A POSTROUTING -s fd00::/8 -o eth0 -j MASQUERADE`) plus `ndppd` with only `rule ::/0 { static }` to answer the phone's NS for global destinations. `radvd` must advertise **no prefix** and `AdvDefaultLifetime 0` so Android stops SLAAC-rotating addresses.
 > Persistence for all of this lives in `server-setup/nat66/` (setup script + systemd units, incl. a self-healing 30s neighbor-pin timer).
+
+### Phase C: OpenVPN IPv6 (`vpnLib`, parent repo)
+
+The OpenVPN engine is IPv6-ready; the parser deliberately strips the one line that enables it.
+
+| What | Where | Status |
+|------|-------|--------|
+| `IFCONFIG6` / `ROUTE6` management commands | `OpenVpnManagementThread.java:573-588` | ✅ present |
+| IPv6 tun address + v6 routes/DNS | `OpenVPNService.java` (`setLocalIPv6` :1385, `addRoutev6`, tun config :954-957) | ✅ present |
+| `route-ipv6 ::/0` emitted when `mUseDefaultRoutev6` | `VpnProfile.java:632-637` | ✅ present (default `true` :140) |
+| `route-ipv6` parsed from file | `ConfigParser.java:398-405` | ✅ present |
+| `tun-ipv6` option | `ConfigParser.java:85` (**ignored**) | ❌ **the blocker** |
+| `ifconfig-ipv6` from file | not parsed → `mIPv6Address` never set | ❌ minor |
+
+**Work items:**
+1. Move `tun-ipv6` out of the ignored list in `ConfigParser.java:70-89` and set a new `mUseIPv6` flag on `VpnProfile` (mirror ics-openvpn upstream `mUseIPv6`).
+2. In `VpnProfile.getOpenVpnConfiguration()`, emit `tun-ipv6\n` when `mUseIPv6` is set (and default-enable it for this app so VPN Gate `.ovpn` files get IPv6 even when the directive is absent).
+3. Parse `ifconfig-ipv6` into `mIPv6Address` (only needed for non-pull configs; VPN Gate uses `pull`).
+4. On-device: VPN Gate OpenVPN TCP+UDP — assert `IFCONFIG6` received, `::/0` installed, IPv6 destination reachable. The server PUSH_REPLY must include `ifconfig-ipv6`; most VPN Gate OpenVPN servers push v4 only, so expect partial coverage — pick servers with IPv6.
+
+> Note: OpenVPN tunnel IPv6 uses link-local + server-assigned address (no NAT66 needed). The host's `server-setup/nat66/` config is SoftEther-specific.
+
+### Phase D: MS-SSTP IPv6 (`sstpClient`, parent repo)
+
+kittoku/osc already negotiates IPv6CP and builds the v6 tun; the app never turns it on, and failure handling is all-or-nothing.
+
+| What | Where | Status |
+|------|-------|--------|
+| IPv6CP negotiation | `client/ppp/Ipv6cpClient.kt` | ✅ present |
+| `FE80::/64` link-local addr + v6 routes | `terminal/IPTerminal.kt:68-82` (`::/0`, `fc00::/7`) | ✅ present |
+| `PPP_IPv6_ENABLED` pref | `preference/constant.kt:73` default `false` | ❌ off |
+| App enables it | `DetailActivity.connectSSTPVPN()` :987-1004, `ServerActivity` handler | ❌ never set |
+| IPv6CP failure handling | `IPTerminal.kt:68-72` → `ERR_INVALID_ADDRESS`, aborts VPN | ❌ must degrade |
+
+**Work items:**
+1. Set `OscPrefKey.PPP_IPv6_ENABLED` → `true` in both app SSTP connect paths.
+2. Make IPv6 optional in `IPTerminal.kt`: if IPv6 is enabled but `currentIPv6` stayed all-zero after IPv6CP (server doesn't support it), skip the v6 block and keep IPv4 — do NOT send `ERR_INVALID_ADDRESS`.
+3. Verify IPv6CP against VPN Gate SSTP servers (SoftEther server-side SSTP/PPP IPv6 support is unconfirmed — live test required; if unsupported, tunneling IPv6 over SSTP is not possible and Phase D reduces to "enabled + graceful degradation").
+4. DNS: IPv6CP carries no DNS option — ensure v6 DNS is set via existing custom-DNS path when `PPP_IPv6_ENABLED`.
+
+### Phase E: App-level IPv6
+
+- Mirror the SoftEther `ConnectionConfig` IPv6 fields (`localAddressV6`/`dnsServerV6`/`routesV6`) into the OpenVPN and SSTP connect flows (`DetailActivity.kt`, `ServerActivity.kt`) so IPv6 isn't SoftEther-only.
+- Surface IPv6 status in connection state / analytics (`LAST_CONNECT_METHOD`, StatusFragment), matching the SoftEther `isIPv6`/`getLocalIPv6Address()` work in `ClientInfo.kt`.
 
 ---
 
@@ -816,10 +893,16 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 | Socket protection | Multi-Connection | Verify additional sockets are protected via VpnService.protect() |
 | Background connect non-blocking | Multi-Connection | Verify receive loop continues while additional connections are being established in background thread |
 | Background connect cleanup | Multi-Connection | Disconnect during background connect, verify no crash/hang (pthread_join) |
-| IPv6 tunnel address | IPv6 Tunnel | Verify VPN interface has `fd00::2/128` address — ✅ verified |
+| IPv6 tunnel address | IPv6 Tunnel | Verify VPN interface has per-install ULA (`fd00::<ANDROID_ID>/128`) — ✅ verified |
 | IPv6 default route | IPv6 Tunnel | Verify `::/0` route added to VPN interface — ✅ verified |
 | IPv6 DNS | IPv6 Tunnel | Verify `2001:4860:4860::8888` DNS server configured — ✅ verified |
 | IPv6 traffic through tunnel | IPv6 Tunnel | Ping IPv6 endpoint through VPN tunnel — ✅ verified end-to-end (host `ping6 fd00::2` round-trips; phone reaches `2001:4860:4860::8888` via NAT66) |
+| OpenVPN tun-ipv6 emitted | IPv6 OpenVPN | Generated config contains `tun-ipv6`; management log shows `IFCONFIG6` on connect |
+| OpenVPN IPv6 routes | IPv6 OpenVPN | `::/0` (or server-pushed) IPv6 route installed; IPv6 site reachable over VPN Gate OpenVPN server |
+| OpenVPN IPv6 fallback | IPv6 OpenVPN | Server without IPv6 push still connects (IPv4-only), no config error |
+| SSTP IPv6CP enabled | IPv6 SSTP | `PPP_IPv6_ENABLED` set by app; connection log shows IPv6CP configure/ack |
+| SSTP IPv6 tunnel | IPv6 SSTP | `FE80::/64` link-local + `::/0` installed; IPv6 destination reachable over MS-SSTP |
+| SSTP no-IPv6 degrade | IPv6 SSTP | Server that rejects IPv6CP still connects IPv4-only — no `ERR_INVALID_ADDRESS` abort |
 | Dual-stack DNS resolution | Dual-Stack | Verify `getaddrinfo` returns both A and AAAA |
 | IPv6 TCP fallback | Dual-Stack | Block IPv4, verify connection succeeds over IPv6 |
 | IPv6 RUDP socket | Dual-Stack | Verify `AF_INET6` UDP socket created for IPv6 peer |
@@ -847,5 +930,7 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 | IPv6 UDP socket | `NewUDP6()` in `Network.c:12921`, `NewUdpAccel()` IPv6 handling in `UdpAccel.c:1145-1181` |
 | IPv6 protocol info | `ClientIpAddress6`/`ServerIpAddress6` in `Protocol.c:4780-4825` |
 | IPv6 hub filtering | `FilterIPv6`, `CheckIPv6`, `NoIPv6DefaultRouterInRA` in `Hub.c`, `Account.c` |
+| OpenVPN IPv6 (`vpnLib`) | `ConfigParser.java:85` (`tun-ipv6`), `:398-405` (`route-ipv6`), `OpenVpnManagementThread.java:573-588` (`IFCONFIG6`/`ROUTE6`), `OpenVPNService.java:1385` (`setLocalIPv6`) |
+| SSTP IPv6 (`sstpClient`) | `client/ppp/Ipv6cpClient.kt`, `terminal/IPTerminal.kt:68-82` (v6 tun), `preference/constant.kt:73` (`PPP_IPv6_ENABLED` default false) |
 | OpenSSL versions | OpenSSL 3.5.7 (LTS, EOL 08 Apr 2030); 1.1.1w was final 1.1.1 release. Release strategy: https://openssl-library.org/policies/releasestrat/ |
 | OpenSSL 3.x provider support | `OSSL_PROVIDER_load` default/legacy in `Encrypt.c:5156-5158`; RC4-MD5 3.0 bug note in `Encrypt.h:147` |
