@@ -520,6 +520,21 @@ V2 IV is 12 bytes (vs V1 20), MAC is 16 bytes (vs V1 20 verify). Net: 8 bytes le
 | `sstpClient` (MS-SSTP) | ✅ Client done — `PPP_IPv6_ENABLED` on in both connect paths, random IPv6CP IID (RFC 5072), per-install ULA via `HOME_ULA_V6`/`IPTerminal.kt`, IPv6CP failure degrades to IPv4 | **Server:** Stable Edition has no IPv6CP symbols; works only on Developer Edition |
 | `app` | ✅ Dual-stack for OpenVPN+SSTP — `Ipv6Ula.kt` shared per-install ULA (`fd00::<ANDROID_ID>`) + `::/0` injected in `DetailActivity.kt` / `ServerActivity.kt` | IPv6 status not surfaced in analytics / StatusFragment yet |
 
+### Server-Side IPv6 Support Matrix (VPN Gate / SoftEther hosts)
+
+Client work is done; these are the **server-side limits** that decide whether IPv6 actually reaches the tunnel (verified 2026-08-10 against `SoftEtherVPN_Stable` v4.44-9807-rtm and the Developer Edition branch):
+
+| Server capability | Edition | IPv6 tunneled? | Limit (source) | Impact / workaround |
+|-------------------|---------|----------------|----------------|----------------------|
+| **Native SoftEther protocol** (Layer 2 bridge) | Stable + DE | ✅ Yes | None — full IPv6 packet parsing, ICMPv6 RS/RA, DHCPv6 (`Hub.c:4492-4579`) | IPv6 works end-to-end (Phase 8/Phase A). Host needs NAT66 (`server-setup/nat66/`) for global egress |
+| **OpenVPN clone (L3/tun)** | Stable + DE | ❌ No | `IPCSendIPv4(...)` hardcoded for `OPENVPN_MODE_L3` (`Interop_OpenVPN.c:380-381` / DE `Proto_OpenVPN.c`); `IPsec_IPC.c:1736-1741` drops any IPC packet with version nibble ≠ 4 | Cannot be fixed in the app. Run a real OpenVPN daemon bridged to `tap_net` (or `server-ipv6`) and point the app at it |
+| **MS-SSTP / PPP** | Stable | ❌ No | **Zero** `IPV6CP` symbols in `src/Cedar` — PPP never negotiates IPv6CP | Client already degrades to IPv4-only. SSTP IPv6 requires a DE server |
+| **MS-SSTP / PPP** | DE | ✅ Yes | `PPP_PROTOCOL_IPV6CP` + `PPPProcessIPv6CPRequestPacket` in `Proto_PPP.c` | Client negotiates IPv6CP (RFC 5072 IID) + injects ULA; verify on-device against a DE host |
+| **L2TP/IPsec over IPv6** | Stable + DE | N/A | L2TP/IPsec server transport is IPv4-oriented; not used by this app | Out of scope for Phase 11 |
+| **Server reachable via IPv6** (v6 transport) | Stable + DE | ⚠️ Limited | R-UDP (NAT-T) is IPv4-only and disabled when the server is IPv6 (`UdpAccel.c:1147-1150`); upstream client connects v6 TCP only as a fallback | Not relevant to VPN Gate hosts (they are IPv4-reachable); noted for completeness |
+
+**Bottom line:** the only path that carries IPv6 to the phone today is the **native SoftEther protocol** (Phase 8). OpenVPN and SSTP client stacks are IPv6-ready but the VPN Gate servers they target cannot deliver v6 — OpenVPN on any edition, SSTP on Stable — so the "blocked" items in Phase 11 are purely server-side.
+
 ### How Upstream SoftEther Handles IPv6
 
 SoftEther's tunnel is a **Layer 2 Ethernet bridge** — IPv6 packets flow through once connected. The upstream Windows client:
