@@ -134,14 +134,14 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Add `ClientIpv6Address` PACK field in `build_login_pack()`
 - [x] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
 
-### Phase 10: OpenSSL Upgrade to 3.5 LTS (🟢 On-Device Verified — Instrumentation Pending)
+### Phase 10: OpenSSL Upgrade to 3.5 LTS (✅ Complete)
 - [x] Update `src/main/cpp/openssl` source tree to OpenSSL 3.5.7 (tag `openssl-3.5.7`, `8cf17aaeb4`; was 1.1.1w)
 - [x] Rebuild prebuilt OpenSSL 3.5.x libs for all 4 ABIs (armeabi-v7a, arm64-v8a, x86, x86_64)
 - [x] Replace `jniLibs/{abi}/libssl.a` and `libcrypto.a` with 3.5.x builds
 - [x] Address RC4 low-level deprecation in `softether_rudp.c` (`RC4()` calls) — replaced with `EVP_rc4()` via `EVP_CIPHER_CTX` (decrypt path in `rudp_receive`, encrypt path in `rudp_send`)
 - [x] Verify `EVP_chacha20_poly1305()` availability (Phase 7 V2 prerequisite check)
 - [x] Verify TLS handshake, AES CBC/GCM, MD5/SHA1 against VPN Gate servers (on-device runtime test) — SG1 via SoftEther UDP: TLS handshake OK, RUDP V1 RC4 data path OK, RUDP V2 acceleration negotiated, tunnel routed ping, no deprecated-API errors (2026-08-11)
-- [ ] Run full instrumentation suite for regression
+- [x] Run full instrumentation suite for regression — 2026-08-11: app free 5/5, app pro 5/5 (fixed ExampleInstrumentedTest hardcoded free package), SoftEtherClient 12/12 (test10Dhcp flaky on real VPNGate DHCP — passes on re-run), unit tests 4/4
 
 > **fdsan crash fixed (2026-08-11):** Phase 9's `rudp_create_udp_socket()` guard (`if (ctx->udp_fd >= 0) close()`) misfired on fresh contexts — `calloc` zero-initialized `udp_fd` to 0, so connect could `close(0)`, which the JVM's `SocketImpl` owns → intermittent `SIGABRT` (fdsan). Fixed in `rudp_create()` by initializing `udp_fd = -1` (commit `0225498`).
 
@@ -830,7 +830,7 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 - TLS handshake against VPN Gate servers (TCP path) ✅ done 2026-08-11 (SG1, SoftEther UDP)
 - RUDP V1 RC4 data path ✅ done 2026-08-11 (data flowing, no errors)
 - AES CBC/GCM, MD5/SHA1 usage in `aes_wrapper.c` ✅ exercised via login PACK / TLS
-- Full instrumentation suite ⏳
+- Full instrumentation suite ✅ done 2026-08-11 (app free/pro 5/5 each, SoftEtherClient 12/12, unit 4/4)
 
 ### API Compatibility with Local Client Code
 
@@ -861,7 +861,7 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 - [x] `EVP_chacha20_poly1305()` resolves (Phase 7 V2 readiness)
 - [x] TCP/RUDP V1 connections work against VPN Gate servers — on-device (SG1 SoftEther UDP: CONNECTED ip=10.21.x.x, tunnel routed ping; 3 connect cycles no crash)
 - [x] No runtime errors from deprecated API removal — on-device (no OpenSSL warnings; only unrelated system `ashmem` notes)
-- [ ] Instrumentation suite passes — on-device
+- [x] Instrumentation suite passes — on-device (see Phase 10 checklist)
 
 ---
 
