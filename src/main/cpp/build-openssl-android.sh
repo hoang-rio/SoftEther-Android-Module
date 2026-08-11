@@ -108,7 +108,9 @@ build_openssl() {
     # Clean previous builds
     log_info "Cleaning previous build..."
     make clean 2>/dev/null || true
-    rm -f Makefile include/openssl/opensslconf.h 2>/dev/null || true
+    # NOTE: in OpenSSL 3.x, include/openssl/opensslconf.h is a committed
+    # wrapper (includes generated configuration.h) and must NOT be deleted.
+    rm -f Makefile 2>/dev/null || true
     
     # Setup NDK toolchain
     setup_ndk_toolchain "$ABI"
@@ -163,8 +165,13 @@ generate_headers() {
     
     cd "$OPENSSL_DIR"
     
-    # Check if headers already exist in the repository
-    if [ -f "$OPENSSL_DIR/include/openssl/opensslconf.h" ]; then
+    # Check if headers already exist in the repository.
+    # NOTE: in OpenSSL 3.x, opensslconf.h is a *committed* wrapper that
+    # includes configuration.h, which Configure generates from
+    # configuration.h.in. A fresh checkout has opensslconf.h but NOT
+    # configuration.h, so we must gate on configuration.h — otherwise
+    # headers-only mode would skip Configure and leave the build broken.
+    if [ -f "$OPENSSL_DIR/include/openssl/configuration.h" ]; then
         log_info "OpenSSL headers already exist in repository"
         log_info "✓ Using existing headers from $OPENSSL_DIR/include/openssl/"
         return 0
@@ -185,11 +192,11 @@ generate_headers() {
         exit 1
     fi
     
-    if [ -f "$OPENSSL_DIR/include/openssl/opensslconf.h" ]; then
+    if [ -f "$OPENSSL_DIR/include/openssl/configuration.h" ]; then
         log_info "✓ Headers generated successfully"
     else
         log_error "Headers were not generated properly"
-        log_error "Expected file: $OPENSSL_DIR/include/openssl/opensslconf.h"
+        log_error "Expected file: $OPENSSL_DIR/include/openssl/configuration.h"
         exit 1
     fi
 }

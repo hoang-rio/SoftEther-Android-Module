@@ -134,14 +134,16 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Add `ClientIpv6Address` PACK field in `build_login_pack()`
 - [x] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
 
-### Phase 10: OpenSSL Upgrade to 3.5 LTS (📋 Planned)
-- [ ] Rebuild prebuilt OpenSSL 3.5.x libs for all 4 ABIs (armeabi-v7a, arm64-v8a, x86, x86_64)
-- [ ] Update `src/main/cpp/openssl` source tree to OpenSSL 3.5.7
-- [ ] Replace `jniLibs/{abi}/libssl.a` and `libcrypto.a` with 3.5.x builds
-- [ ] Address RC4 low-level deprecation in `softether_rudp.c` (`RC4()` calls)
-- [ ] Verify `EVP_chacha20_poly1305()` availability (Phase 7 V2 prerequisite check)
-- [ ] Verify TLS handshake, AES CBC/GCM, MD5/SHA1 against VPN Gate servers
+### Phase 10: OpenSSL Upgrade to 3.5 LTS (🟢 In Progress)
+- [x] Update `src/main/cpp/openssl` source tree to OpenSSL 3.5.7 (tag `openssl-3.5.7`, `8cf17aaeb4`; was 1.1.1w)
+- [x] Rebuild prebuilt OpenSSL 3.5.x libs for all 4 ABIs (armeabi-v7a, arm64-v8a, x86, x86_64)
+- [x] Replace `jniLibs/{abi}/libssl.a` and `libcrypto.a` with 3.5.x builds
+- [x] Address RC4 low-level deprecation in `softether_rudp.c` (`RC4()` calls) — replaced with `EVP_rc4()` via `EVP_CIPHER_CTX` (decrypt path in `rudp_receive`, encrypt path in `rudp_send`)
+- [x] Verify `EVP_chacha20_poly1305()` availability (Phase 7 V2 prerequisite check)
+- [ ] Verify TLS handshake, AES CBC/GCM, MD5/SHA1 against VPN Gate servers (on-device runtime test)
 - [ ] Run full instrumentation suite for regression
+
+> Note: OpenSSL 3.5 no longer generates `include/openssl/opensslconf.h` at build time — it is a committed wrapper that includes the generated `configuration.h`. The build script must not delete it (fixed in `build-openssl-android.sh`).
 
 ### Phase 11: IPv6 for All Protocols (🟢 Client Done — Server-Blocked)
 
@@ -762,11 +764,11 @@ kittoku/osc already negotiates IPv6CP and builds the v6 tun; the app never turns
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Prebuilt libs (`jniLibs/{abi}/libssl.a`, `libcrypto.a`) | ❌ 1.1.1w | Confirmed via `strings`; 11 Sep 2023 final 1.1.1 release |
-| Source tree (`src/main/cpp/openssl`) | ❌ 1.1.1w | HEAD detached at `OpenSSL_1_1_1w`; git-ignored (local build artifact) |
-| 1.1.1 series support | ❌ EOL | 1.1.1 EOL 11 Sep 2023; 1.1.1w is the last security-patched version |
-| `RC4()` low-level usage | ⚠️ Deprecated in 3.x | `softether_rudp.c:473-475,614-616` — direct calls, still compile in 3.x |
-| `EVP_chacha20_poly1305()` | ✅ Available | Needed for Phase 7 V2; present in 1.1.1 and 3.x |
+| Prebuilt libs (`jniLibs/{abi}/libssl.a`, `libcrypto.a`) | ✅ 3.5.7 | Built 2026-08-11; confirmed via `strings`: "OpenSSL 3.5.7 9 Jun 2026" |
+| Source tree (`src/main/cpp/openssl`) | ✅ 3.5.7 | HEAD detached at `openssl-3.5.7` (`8cf17aaeb4`); tracked git submodule, pointer bump pending |
+| 1.1.1 series support | ❌ EOL | 1.1.1 EOL 11 Sep 2023; 1.1.1w was the last security-patched version |
+| `RC4()` low-level usage | ✅ Fixed | `softether_rudp.c` — replaced `RC4_KEY`/`RC4()` with `EVP_rc4()` + `EVP_CIPHER_CTX` (decrypt in `rudp_receive`, encrypt in `rudp_send`) |
+| `EVP_chacha20_poly1305()` | ✅ Available | Verified in 3.5.7 headers (`evp.h:1168`) and linked libs |
 | Upstream SoftEther 3.x support | ✅ Present | `#if OPENSSL_VERSION_NUMBER >= 0x30000000L` + `OSSL_PROVIDER_load` (`Encrypt.c:139,158,5117,5156`) |
 
 ### OpenSSL Version Matrix (as of 2026-08)
@@ -795,35 +797,38 @@ git fetch origin openssl-3.5.7
 git checkout openssl-3.5.7
 ```
 
-**Step 2: Rebuild for all 4 ABIs with Android NDK**
+**Step 2: Rebuild for all 4 ABIs with Android NDK** ✅ (done 2026-08-11)
 
-Configure with Android NDK toolchain for each ABI:
+Use the project's build script (must keep NDK toolchain `bin/` on `PATH` — 3.x Configure errors "no NDK <arch>-linux-android-gcc on $PATH" otherwise):
 ```bash
-export ANDROID_NDK_HOME=<path-to-ndk>
+export ANDROID_NDK_ROOT=<path-to-ndk>   # e.g. .../ndk/28.2.13676358
+export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
 export ANDROID_API=23
-perl Configure android-arm64 -D__ANDROID_API__=$ANDROID_API
-make depend && make -j$(nproc)
-# Repeat for android-arm, android-x86, android-x86_64
+export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
+./build-openssl-android.sh arm64-v8a     # then armeabi-v7a, x86, x86_64
 ```
 
-Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` + `libcrypto.a`.
+Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` + `libcrypto.a`. (Script does this automatically.)
 
-**Step 3: Address RC4 deprecation**
+> **3.x gotcha:** `include/openssl/opensslconf.h` is a **committed wrapper** in 3.5 (it `#include`s the generated `configuration.h`), NOT a generated file. The old script's `rm -f include/openssl/opensslconf.h` deleted it and `make build_generated` never recreated it, breaking `crypto/aes/*.c` compiles. Fixed by not deleting it.
 
-`softether_rudp.c` uses direct `RC4()` calls. In OpenSSL 3.x these still compile but emit deprecation warnings. Options:
-- **Keep direct calls** (simplest) — works in 3.x, suppress warnings with `-Wno-deprecated-declarations` for the file
-- **Switch to EVP + legacy provider** (upstream approach) — load "legacy" provider, use `EVP_rc4()`/`EVP_CipherInit_ex`; requires provider init at startup
+**Step 3: Address RC4 deprecation** ✅ (done 2026-08-11)
 
-**Step 4: Verify Phase 7 V2 prerequisite**
+`softether_rudp.c` used direct `RC4()`/`RC4_KEY`. Replaced with the EVP API (RC4 lives in OpenSSL 3.x's **default** provider, no legacy provider needed):
+- Decrypt path (`rudp_receive`): `EVP_CIPHER_CTX_new()` + `EVP_DecryptInit_ex(..., EVP_rc4(), ...)` + `EVP_DecryptUpdate(...)` (in-place)
+- Encrypt path (`rudp_send`): same with `EVP_EncryptInit_ex`/`EVP_EncryptUpdate`
+- Dropped the now-unused `#include <openssl/rc4.h>`
 
-`EVP_chacha20_poly1305()` must be confirmed available in the rebuilt 3.5.7 libs (it is, since OpenSSL 1.1.0).
+**Step 4: Verify Phase 7 V2 prerequisite** ✅
+
+`EVP_chacha20_poly1305()` confirmed in 3.5.7 (`evp.h:1168`) and present in linked `libsoftether.so` (905 `EVP_*` dynamic symbols on arm64-v8a).
 
 **Step 5: Regression test**
 
-- TLS handshake against VPN Gate servers (TCP path)
-- RUDP V1 RC4 data path
-- AES CBC/GCM, MD5/SHA1 usage in `aes_wrapper.c`
-- Full instrumentation suite
+- TLS handshake against VPN Gate servers (TCP path) ⏳ on-device
+- RUDP V1 RC4 data path ⏳ on-device
+- AES CBC/GCM, MD5/SHA1 usage in `aes_wrapper.c` ⏳ on-device
+- Full instrumentation suite ⏳
 
 ### API Compatibility with Local Client Code
 
@@ -831,8 +836,8 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 |-----|----------|----------------|
 | `EVP_aes_*_cbc()/gcm()` | `aes_wrapper.c:70-80` | ✅ Default provider |
 | `EVP_md5()` / `EVP_sha1()` | `aes_wrapper.c:455,500` | ✅ Default provider |
-| `EVP_chacha20_poly1305()` | Phase 7 (implemented) | ✅ Both 1.1.1 and 3.x |
-| `RC4()` low-level | `softether_rudp.c:473-475,614-616` | ⚠️ Deprecated, still compiles |
+| `EVP_chacha20_poly1305()` | Phase 7 (implemented) | ✅ Verified in 3.5.7 |
+| `RC4()` low-level | `softether_rudp.c` | ✅ Replaced with `EVP_rc4()` (default provider) |
 | `SSL_CTX`, `SSL`, TLS | `aes_wrapper.c` | ✅ |
 | `RAND_*` | `aes_wrapper.c` | ✅ |
 
@@ -840,20 +845,21 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 
 | File | Change |
 |------|--------|
-| `src/main/cpp/openssl/` | Checkout OpenSSL 3.5.7 source (git-ignored, local only) |
-| `src/main/jniLibs/{4 ABIs}/libssl.a` | Replace with 3.5.7 build |
-| `src/main/jniLibs/{4 ABIs}/libcrypto.a` | Replace with 3.5.7 build |
-| `softether_rudp.c` | Address RC4 deprecation (keep direct calls or switch to EVP+legacy) |
+| `src/main/cpp/openssl/` | Checkout OpenSSL 3.5.7 source — **tracked git submodule** (not git-ignored); pointer bump to `8cf17aaeb4` pending commit |
+| `src/main/jniLibs/{4 ABIs}/libssl.a` | Replaced with 3.5.7 build ✅ |
+| `src/main/jniLibs/{4 ABIs}/libcrypto.a` | Replaced with 3.5.7 build ✅ |
+| `softether_rudp.c` | RC4 → `EVP_rc4()` (decrypt in `rudp_receive`, encrypt in `rudp_send`) ✅ |
+| `build-openssl-android.sh` | Stop deleting `include/openssl/opensslconf.h` (committed in 3.x) ✅ |
 | `CMakeLists.txt` | Unchanged — paths stay the same |
 
 ### Success Criteria
 
-- [ ] Prebuilt libs report `OpenSSL 3.5.x` (verify with `strings` on libcrypto.a)
-- [ ] All 4 ABIs build and link
-- [ ] `EVP_chacha20_poly1305()` resolves (Phase 7 V2 readiness)
-- [ ] TCP/RUDP V1 connections work against VPN Gate servers
-- [ ] No runtime errors from deprecated API removal
-- [ ] Instrumentation suite passes
+- [x] Prebuilt libs report `OpenSSL 3.5.x` (verify with `strings` on libcrypto.a) — all 4 ABIs report "OpenSSL 3.5.7 9 Jun 2026"
+- [x] All 4 ABIs build and link — `assembleDebug` success, `libsoftether.so` in all ABIs exports 900+ `EVP_*` symbols
+- [x] `EVP_chacha20_poly1305()` resolves (Phase 7 V2 readiness)
+- [ ] TCP/RUDP V1 connections work against VPN Gate servers — on-device
+- [ ] No runtime errors from deprecated API removal — on-device
+- [ ] Instrumentation suite passes — on-device
 
 ---
 
