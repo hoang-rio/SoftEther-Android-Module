@@ -41,6 +41,16 @@ extern "C" {
 #define RUDP_MSS_OVERHEAD_V2        137  // IV(12)+Cookie(4)+MyTick(8)+YourTick(8)+Size(2)+Flag(1)+MAC(16)+Eth(14)+IP(20)+TCP(20)+UDP(8)
 #define RUDP_DEFAULT_MSS_V2         1363 // 1500 - 137
 
+// IPv6 variants (IPv6 header is 40 bytes vs 20 for IPv4)
+#define RUDP_MSS_OVERHEAD_V1_IPV6   165  // RUDP_MSS_OVERHEAD_V1 + 20
+#define RUDP_DEFAULT_MSS_IPV6       1335 // 1500 - 165
+#define RUDP_MSS_OVERHEAD_V2_IPV6   157  // RUDP_MSS_OVERHEAD_V2 + 20
+#define RUDP_DEFAULT_MSS_V2_IPV6    1343 // 1500 - 157
+
+// Max UDP payload (MTU - IP header - UDP header)
+#define RUDP_MAX_UDP_PACKET_IPV4    1472 // 1500 - 20 - 8
+#define RUDP_MAX_UDP_PACKET_IPV6    1452 // 1500 - 40 - 8
+
 // RUDP flags
 #define RUDP_FLAG_COMPRESSED        0x01
 
@@ -82,8 +92,10 @@ typedef struct {
     uint16_t my_port;
 
     // Peer address
-    struct sockaddr_in peer_addr;
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_addr_len;
     int peer_addr_set;
+    int is_ipv6;             // 1 if the UDP socket / peer is IPv6
 
     // Timing
     uint64_t now;
@@ -120,6 +132,11 @@ int rudp_init_client(rudp_context_t* ctx,
 int rudp_init_server(rudp_context_t* ctx,
                      const uint8_t* client_key, int client_key_size,
                      const char* client_ip, uint16_t client_port);
+
+// Recreate the UDP socket for the given address family (AF_INET or AF_INET6),
+// re-binding to a fresh ephemeral port. Use before the login PACK is sent so
+// the advertised client port matches the socket actually used.
+int rudp_set_udp_family(rudp_context_t* ctx, int family);
 
 void rudp_poll(rudp_context_t* ctx);
 void rudp_set_tick(rudp_context_t* ctx, uint64_t tick);

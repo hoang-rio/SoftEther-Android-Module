@@ -21,7 +21,9 @@ extern "C" {
 typedef struct {
     int fd;
     int type;
-    struct sockaddr_in addr;
+    int family;                // AF_INET or AF_INET6 (domain of sock->fd)
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
     int connected;
     int timeout_ms;
 } softether_socket_t;

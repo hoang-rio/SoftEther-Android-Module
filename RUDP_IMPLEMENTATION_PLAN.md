@@ -124,15 +124,15 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Accept `Inet6Address` in `ConnectionController.kt` `buildClientInfo()`
 - [x] Support IPv6 in `ClientInfo.kt` (`getLocalIPv6Address()`, `isIPv6` flag)
 
-### Phase 9: Dual-Stack Socket Support (📋 Planned)
-- [ ] Replace `sockaddr_in` with `sockaddr_storage` in `softether_socket.h`, `softether_rudp.h`
-- [ ] Replace `gethostbyname()` with `getaddrinfo(AF_UNSPEC)` in `tcp_socket.c`
-- [ ] Implement IPv4-first, IPv6-fallback in `socket_connect_timeout()`
-- [ ] Support `AF_INET6` UDP socket creation in `rudp_create()` for IPv6 peers
-- [ ] Adjust R-UDP MTU calculation for IPv6 header (40 bytes vs 20)
-- [ ] Add `client_ip_v6`, `server_ip_v6`, `is_ipv6` fields to `softether_connection_t`
-- [ ] Add `ClientIpv6Address` PACK field in `build_login_pack()`
-- [ ] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
+### Phase 9: Dual-Stack Socket Support (🟢 Client Done)
+- [x] Replace `sockaddr_in` with `sockaddr_storage` in `softether_socket.h`, `softether_rudp.h`
+- [x] Replace `gethostbyname()` with `getaddrinfo(AF_UNSPEC)` in `tcp_socket.c`
+- [x] Implement IPv4-first, IPv6-fallback in `socket_connect_timeout()`
+- [x] Support `AF_INET6` UDP socket creation in `rudp_create()` for IPv6 peers
+- [x] Adjust R-UDP MTU calculation for IPv6 header (40 bytes vs 20)
+- [x] Add `client_ip_v6`, `server_ip_v6`, `is_ipv6` fields to `softether_connection_t`
+- [x] Add `ClientIpv6Address` PACK field in `build_login_pack()`
+- [x] Replace `resolve_hostname()` with dual-stack resolution in `softether_connect_with_hub()`
 
 ### Phase 10: OpenSSL Upgrade to 3.5 LTS (📋 Planned)
 - [ ] Rebuild prebuilt OpenSSL 3.5.x libs for all 4 ABIs (armeabi-v7a, arm64-v8a, x86, x86_64)

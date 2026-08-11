@@ -152,6 +152,10 @@ typedef struct softether_connection {
     char server_host_name[128];
     char server_ip_address[64];
     int server_port_reported;
+    // IPv6 fields (dual-stack support)
+    char client_ip_v6[128];   // Client IPv6 address (reported in login PACK)
+    char server_ip_v6[128];   // Server IPv6 address (from resolved host)
+    int is_ipv6;              // 1 if the connection is over IPv6
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     // Multi-connection support

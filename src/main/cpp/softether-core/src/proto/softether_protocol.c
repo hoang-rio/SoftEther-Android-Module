@@ -584,6 +584,12 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     size += PACK_INT_SZ("ServerIpAddress");
     size += PACK_INT_SZ("ServerPort2");
 
+    // Client IPv6 address (STR, matching InRpcNodeInfo ClientIpv6Address)
+    if (conn->client_ip_v6[0]) {
+        num_elems += 1;
+        size += PACK_STR_SZ("ClientIpv6Address", conn->client_ip_v6);
+    }
+
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
         num_elems += 5;
@@ -675,6 +681,11 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     }
     pack_add_int(&p, "ServerIpAddress", server_ip_uint);
     pack_add_int(&p, "ServerPort2", softether_endian32((uint32_t)conn->server_port_reported));
+
+    // Client IPv6 address (STR, matching InRpcNodeInfo ClientIpv6Address)
+    if (conn->client_ip_v6[0]) {
+        pack_add_str(&p, "ClientIpv6Address", conn->client_ip_v6);
+    }
 
     // RUDP-related fields (only sent when RUDP mode is active)
     if (rudp != NULL) {
@@ -1422,14 +1433,24 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         strncpy(conn->client_host_name, client_host_name, sizeof(conn->client_host_name) - 1);
     }
     if (client_ip_address && client_ip_address[0]) {
-        strncpy(conn->client_ip_address, client_ip_address, sizeof(conn->client_ip_address) - 1);
+        if (strchr(client_ip_address, ':') != NULL) {
+            strncpy(conn->client_ip_v6, client_ip_address, sizeof(conn->client_ip_v6) - 1);
+            LOGD("Client IPv6 address: %s", conn->client_ip_v6);
+        } else {
+            strncpy(conn->client_ip_address, client_ip_address, sizeof(conn->client_ip_address) - 1);
+        }
     }
     conn->client_port = client_port;
     if (server_host_name && server_host_name[0]) {
         strncpy(conn->server_host_name, server_host_name, sizeof(conn->server_host_name) - 1);
     }
     if (server_ip_address && server_ip_address[0]) {
-        strncpy(conn->server_ip_address, server_ip_address, sizeof(conn->server_ip_address) - 1);
+        if (strchr(server_ip_address, ':') != NULL) {
+            strncpy(conn->server_ip_v6, server_ip_address, sizeof(conn->server_ip_v6) - 1);
+            LOGD("Server IPv6 address: %s", conn->server_ip_v6);
+        } else {
+            strncpy(conn->server_ip_address, server_ip_address, sizeof(conn->server_ip_address) - 1);
+        }
     }
     conn->server_port_reported = server_port;
 
@@ -1452,6 +1473,11 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // Store server info
     strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
+    conn->is_ipv6 = (strchr(resolved_ip, ':') != NULL);
+    if (conn->is_ipv6) {
+        strncpy(conn->server_ip_v6, resolved_ip, sizeof(conn->server_ip_v6) - 1);
+        LOGD("IPv6 server detected: %s", resolved_ip);
+    }
 
     // Create TCP socket and connect
     softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
@@ -1511,6 +1537,17 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         } else {
             LOGD("RUDP context created (my_port=%u, cookie=0x%08X)",
                  conn->rudp->my_port, conn->rudp->my_cookie);
+            // Pre-create the UDP socket for the server's address family so the
+            // client port advertised in the login PACK matches the actual socket.
+            if (conn->is_ipv6) {
+                if (rudp_set_udp_family(conn->rudp, AF_INET6) != 0) {
+                    LOGW("Failed to create IPv6 RUDP socket (UDP acceleration disabled)");
+                    rudp_destroy(conn->rudp);
+                    conn->rudp = NULL;
+                } else {
+                    LOGD("RUDP context recreated for IPv6 (my_port=%u)", conn->rudp->my_port);
+                }
+            }
         }
     } else {
         conn->rudp = NULL;

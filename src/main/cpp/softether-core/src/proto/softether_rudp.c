@@ -33,6 +33,69 @@ static void calc_key(uint8_t* key, const uint8_t* common_key, const uint8_t* iv)
     SHA1(tmp, sizeof(tmp), key);
 }
 
+// Create (or re-create) the UDP socket for the given address family, bind it
+// to an ephemeral port, and refresh ctx->my_port. Used by rudp_create (AF_INET)
+// and by rudp_init_* / rudp_set_udp_family when the peer is IPv6.
+static int rudp_create_udp_socket(rudp_context_t* ctx, int family) {
+    if (ctx == NULL || (family != AF_INET && family != AF_INET6)) {
+        return -1;
+    }
+
+    if (ctx->udp_fd >= 0) {
+        close(ctx->udp_fd);
+        ctx->udp_fd = -1;
+    }
+
+    ctx->udp_fd = socket(family, SOCK_DGRAM, 0);
+    if (ctx->udp_fd < 0) {
+        LOGE("rudp_create_udp_socket: failed to create UDP socket family=%d (errno=%d)",
+             family, errno);
+        return -1;
+    }
+
+    // Bind to any available port
+    struct sockaddr_storage bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    if (family == AF_INET6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)&bind_addr;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_addr = in6addr_any;
+        sa6->sin6_port = 0;
+    } else {
+        struct sockaddr_in* sa4 = (struct sockaddr_in*)&bind_addr;
+        sa4->sin_family = AF_INET;
+        sa4->sin_addr.s_addr = INADDR_ANY;
+        sa4->sin_port = 0;
+    }
+    if (bind(ctx->udp_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        LOGE("rudp_create_udp_socket: bind failed family=%d (errno=%d)", family, errno);
+        close(ctx->udp_fd);
+        ctx->udp_fd = -1;
+        return -1;
+    }
+
+    // Get the bound port
+    {
+        struct sockaddr_storage sa;
+        socklen_t sa_len = sizeof(sa);
+        if (getsockname(ctx->udp_fd, (struct sockaddr*)&sa, &sa_len) == 0) {
+            if (sa.ss_family == AF_INET6) {
+                ctx->my_port = ntohs(((struct sockaddr_in6*)&sa)->sin6_port);
+            } else {
+                ctx->my_port = ntohs(((struct sockaddr_in*)&sa)->sin_port);
+            }
+        }
+    }
+
+    // Non-blocking
+    int flags = fcntl(ctx->udp_fd, F_GETFL, 0);
+    fcntl(ctx->udp_fd, F_SETFL, flags | O_NONBLOCK);
+
+    ctx->is_ipv6 = (family == AF_INET6);
+    LOGD("rudp_create_udp_socket: fd=%d family=%d my_port=%u", ctx->udp_fd, family, ctx->my_port);
+    return 0;
+}
+
 rudp_context_t* rudp_create(int is_client) {
     rudp_context_t* ctx = (rudp_context_t*)calloc(1, sizeof(rudp_context_t));
     if (ctx == NULL) return NULL;
@@ -40,41 +103,13 @@ rudp_context_t* rudp_create(int is_client) {
     ctx->is_client_mode = is_client;
     ctx->version = 1;
     ctx->mss = RUDP_DEFAULT_MSS;
-    ctx->max_udp_packet_size = 1500 - 20 - 8;  // MTU - IPv4 - UDP
+    ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV4;  // MTU - IPv4 - UDP
 
-    // Create UDP socket
-    ctx->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx->udp_fd < 0) {
-        LOGE("rudp_create: failed to create UDP socket");
+    // Create UDP socket (AF_INET by default; recreated as AF_INET6 for IPv6 peers)
+    if (rudp_create_udp_socket(ctx, AF_INET) != 0) {
         free(ctx);
         return NULL;
     }
-
-    // Bind to any available port
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = INADDR_ANY;
-    bind_addr.sin_port = 0;
-    if (bind(ctx->udp_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-        LOGE("rudp_create: bind failed");
-        close(ctx->udp_fd);
-        free(ctx);
-        return NULL;
-    }
-
-    // Get the bound port
-    {
-        struct sockaddr_in sa;
-        socklen_t sa_len = sizeof(sa);
-        if (getsockname(ctx->udp_fd, (struct sockaddr*)&sa, &sa_len) == 0) {
-            ctx->my_port = ntohs(sa.sin_port);
-        }
-    }
-
-    // Non-blocking
-    int flags = fcntl(ctx->udp_fd, F_GETFL, 0);
-    fcntl(ctx->udp_fd, F_SETFL, flags | O_NONBLOCK);
 
     // Generate random keys and IVs
     for (int i = 0; i < (int)sizeof(ctx->my_key); i++)
@@ -147,15 +182,52 @@ int rudp_init_client(rudp_context_t* ctx,
                      uint32_t client_cookie) {
     if (ctx == NULL || server_ip == NULL) return -1;
 
-    // Setup peer address
-    memset(&ctx->peer_addr, 0, sizeof(ctx->peer_addr));
-    ctx->peer_addr.sin_family = AF_INET;
-    ctx->peer_addr.sin_port = htons(server_port);
-    if (inet_pton(AF_INET, server_ip, &ctx->peer_addr.sin_addr) <= 0) {
+    // Determine the peer's address family and (re)create the UDP socket to match
+    struct in_addr in4;
+    struct in6_addr in6;
+    int ipv6 = (inet_pton(AF_INET6, server_ip, &in6) == 1);
+    if (!ipv6 && inet_pton(AF_INET, server_ip, &in4) != 1) {
         LOGE("rudp_init_client: invalid server IP: %s", server_ip);
         return -1;
     }
+    if (ipv6 != ctx->is_ipv6) {
+        if (rudp_create_udp_socket(ctx, ipv6 ? AF_INET6 : AF_INET) != 0) {
+            return -1;
+        }
+    }
+
+    // Setup peer address
+    memset(&ctx->peer_addr, 0, sizeof(ctx->peer_addr));
+    if (ipv6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)&ctx->peer_addr;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons(server_port);
+        if (inet_pton(AF_INET6, server_ip, &sa6->sin6_addr) <= 0) {
+            LOGE("rudp_init_client: invalid IPv6 server IP: %s", server_ip);
+            return -1;
+        }
+        ctx->peer_addr_len = sizeof(*sa6);
+    } else {
+        struct sockaddr_in* sa4 = (struct sockaddr_in*)&ctx->peer_addr;
+        sa4->sin_family = AF_INET;
+        sa4->sin_port = htons(server_port);
+        if (inet_pton(AF_INET, server_ip, &sa4->sin_addr) <= 0) {
+            LOGE("rudp_init_client: invalid IPv4 server IP: %s", server_ip);
+            return -1;
+        }
+        ctx->peer_addr_len = sizeof(*sa4);
+    }
     ctx->peer_addr_set = 1;
+
+    // Adjust MTU/MSS for the IPv6 header (40 bytes vs 20 for IPv4)
+    if (ipv6) {
+        ctx->mss = RUDP_DEFAULT_MSS_IPV6;
+        ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV6;
+        LOGD("rudp_init_client: IPv6 peer, MSS=%u max_udp=%u", ctx->mss, ctx->max_udp_packet_size);
+    } else {
+        ctx->mss = RUDP_DEFAULT_MSS;
+        ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV4;
+    }
 
     // Copy server's key as our encryption key (sending direction)
     // Server's "MyKey" = our "YourKey" (receiving direction)
@@ -192,12 +264,44 @@ int rudp_init_server(rudp_context_t* ctx,
                      const char* client_ip, uint16_t client_port) {
     if (ctx == NULL || client_ip == NULL) return -1;
 
-    memset(&ctx->peer_addr, 0, sizeof(ctx->peer_addr));
-    ctx->peer_addr.sin_family = AF_INET;
-    ctx->peer_addr.sin_port = htons(client_port);
-    if (inet_pton(AF_INET, client_ip, &ctx->peer_addr.sin_addr) <= 0) {
+    // Determine the peer's address family and (re)create the UDP socket to match
+    struct in_addr in4;
+    struct in6_addr in6;
+    int ipv6 = (inet_pton(AF_INET6, client_ip, &in6) == 1);
+    if (!ipv6 && inet_pton(AF_INET, client_ip, &in4) != 1) {
         LOGE("rudp_init_server: invalid client IP: %s", client_ip);
         return -1;
+    }
+    if (ipv6 != ctx->is_ipv6) {
+        if (rudp_create_udp_socket(ctx, ipv6 ? AF_INET6 : AF_INET) != 0) {
+            return -1;
+        }
+    }
+
+    // Setup peer address
+    memset(&ctx->peer_addr, 0, sizeof(ctx->peer_addr));
+    if (ipv6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)&ctx->peer_addr;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons(client_port);
+        if (inet_pton(AF_INET6, client_ip, &sa6->sin6_addr) <= 0) {
+            LOGE("rudp_init_server: invalid IPv6 client IP: %s", client_ip);
+            return -1;
+        }
+        ctx->peer_addr_len = sizeof(*sa6);
+        ctx->mss = RUDP_DEFAULT_MSS_IPV6;
+        ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV6;
+    } else {
+        struct sockaddr_in* sa4 = (struct sockaddr_in*)&ctx->peer_addr;
+        sa4->sin_family = AF_INET;
+        sa4->sin_port = htons(client_port);
+        if (inet_pton(AF_INET, client_ip, &sa4->sin_addr) <= 0) {
+            LOGE("rudp_init_server: invalid IPv4 client IP: %s", client_ip);
+            return -1;
+        }
+        ctx->peer_addr_len = sizeof(*sa4);
+        ctx->mss = RUDP_DEFAULT_MSS;
+        ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV4;
     }
     ctx->peer_addr_set = 1;
 
@@ -217,6 +321,16 @@ int rudp_init_server(rudp_context_t* ctx,
 
     LOGD("rudp_init_server: client=%s:%u", client_ip, client_port);
     return 0;
+}
+
+int rudp_set_udp_family(rudp_context_t* ctx, int family) {
+    if (ctx == NULL || (family != AF_INET && family != AF_INET6)) {
+        return -1;
+    }
+    if (ctx->is_ipv6 == (family == AF_INET6)) {
+        return 0;
+    }
+    return rudp_create_udp_socket(ctx, family);
 }
 
 void rudp_set_tick(rudp_context_t* ctx, uint64_t tick) {
@@ -256,8 +370,11 @@ int rudp_is_active(rudp_context_t* ctx) {
 }
 
 uint32_t rudp_calc_mss(rudp_context_t* ctx) {
-    if (ctx != NULL && ctx->version >= 2) return RUDP_DEFAULT_MSS_V2;
-    return RUDP_DEFAULT_MSS;
+    if (ctx == NULL) return RUDP_DEFAULT_MSS;
+    if (ctx->is_ipv6) {
+        return (ctx->version >= 2) ? RUDP_DEFAULT_MSS_V2_IPV6 : RUDP_DEFAULT_MSS_IPV6;
+    }
+    return (ctx->version >= 2) ? RUDP_DEFAULT_MSS_V2 : RUDP_DEFAULT_MSS;
 }
 
 int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
@@ -288,7 +405,8 @@ int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
 // (trailing 20-byte zero-verify) and 0 for V2 (padding is ignored).
 // Returns 0 if accepted, -1 if the packet must be dropped.
 static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
-                              const struct sockaddr_in* from_addr,
+                              const struct sockaddr_storage* from_addr,
+                              socklen_t from_len,
                               int verify_padding) {
     if (size < sizeof(uint32_t)) return -1;
     uint32_t cookie;
@@ -360,7 +478,9 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
 
     // Update peer address from received packet
     ctx->peer_addr = *from_addr;
+    ctx->peer_addr_len = from_len;
     ctx->peer_addr_set = 1;
+    ctx->is_ipv6 = (from_addr->ss_family == AF_INET6);
 
     // Update receive timing
     if (ctx->last_recv_my_tick != 0 &&
@@ -436,7 +556,7 @@ void rudp_poll(rudp_context_t* ctx) {
 
     // Read all available UDP packets
     uint8_t tmp[RUDP_TMP_BUF_SIZE];
-    struct sockaddr_in from_addr;
+    struct sockaddr_storage from_addr;
     socklen_t from_len = sizeof(from_addr);
 
     while (1) {
@@ -474,7 +594,7 @@ void rudp_poll(rudp_context_t* ctx) {
             RC4_set_key(&rc4_key, RUDP_PACKET_KEY_SIZE_V1, key);
             RC4(&rc4_key, size, buf, buf);
 
-            if (rudp_process_inner(ctx, buf, size, &from_addr, 1) != 0) {
+            if (rudp_process_inner(ctx, buf, size, &from_addr, from_len, 1) != 0) {
                 continue;
             }
         } else if (ctx->version == 2) {
@@ -503,7 +623,7 @@ void rudp_poll(rudp_context_t* ctx) {
             }
             size -= RUDP_PACKET_MAC_SIZE_V2;
 
-            if (rudp_process_inner(ctx, buf, size, &from_addr, 0) != 0) {
+            if (rudp_process_inner(ctx, buf, size, &from_addr, from_len, 0) != 0) {
                 continue;
             }
         }
@@ -662,7 +782,8 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
 
     // Send
     int ret = (int)sendto(ctx->udp_fd, tmp, size, 0,
-                          (struct sockaddr*)&ctx->peer_addr, sizeof(ctx->peer_addr));
+                          (struct sockaddr*)&ctx->peer_addr,
+                          ctx->peer_addr_len > 0 ? ctx->peer_addr_len : sizeof(ctx->peer_addr));
     if (ret < 0) {
         LOGE("rudp_send: sendto failed (errno=%d)", errno);
         return -1;

@@ -32,6 +32,7 @@ softether_socket_t* socket_create(int type) {
     }
     
     sock->type = type;
+    sock->family = AF_INET;
     sock->connected = 0;
     sock->timeout_ms = SOCKET_TIMEOUT_MS;
     
@@ -57,63 +58,143 @@ void socket_destroy(softether_socket_t* sock) {
 }
 
 int resolve_hostname(const char* hostname, char* ip_buffer, size_t buffer_size) {
-    struct hostent* host = gethostbyname(hostname);
-    if (host == NULL) {
-        LOGE("Failed to resolve hostname: %s", hostname);
+    if (hostname == NULL || ip_buffer == NULL || buffer_size == 0) {
         return -1;
     }
-    
-    struct in_addr** addr_list = (struct in_addr**)host->h_addr_list;
-    if (addr_list[0] == NULL) {
+
+    // Literal IPs (v4 or v6) pass through unchanged
+    struct in_addr in4;
+    struct in6_addr in6;
+    if (inet_pton(AF_INET, hostname, &in4) == 1 ||
+        inet_pton(AF_INET6, hostname, &in6) == 1) {
+        strncpy(ip_buffer, hostname, buffer_size - 1);
+        ip_buffer[buffer_size - 1] = '\0';
+        return 0;
+    }
+
+    struct addrinfo hints;
+    struct addrinfo* res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // dual-stack
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(hostname, NULL, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        LOGE("Failed to resolve hostname: %s (%s)", hostname, gai_strerror(rc));
+        return -1;
+    }
+
+    // IPv4-first, IPv6-fallback
+    struct addrinfo* best = NULL;
+    for (struct addrinfo* ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) { best = ai; break; }
+    }
+    if (best == NULL) {
+        for (struct addrinfo* ai = res; ai != NULL; ai = ai->ai_next) {
+            if (ai->ai_family == AF_INET6) { best = ai; break; }
+        }
+    }
+
+    const void* src = NULL;
+    if (best == NULL) {
+        freeaddrinfo(res);
         LOGE("No addresses found for hostname: %s", hostname);
         return -1;
+    } else if (best->ai_family == AF_INET) {
+        src = &((struct sockaddr_in*)best->ai_addr)->sin_addr;
+    } else if (best->ai_family == AF_INET6) {
+        src = &((struct sockaddr_in6*)best->ai_addr)->sin6_addr;
     }
-    
-    strncpy(ip_buffer, inet_ntoa(*addr_list[0]), buffer_size - 1);
-    ip_buffer[buffer_size - 1] = '\0';
-    
+
+    if (src == NULL ||
+        inet_ntop(best->ai_family, src, ip_buffer, buffer_size) == NULL) {
+        freeaddrinfo(res);
+        LOGE("Failed to format address for hostname: %s", hostname);
+        return -1;
+    }
+
+    freeaddrinfo(res);
     LOGD("Resolved %s to %s", hostname, ip_buffer);
     return 0;
 }
 
-int socket_connect_timeout(softether_socket_t* sock, const char* host, int port, int timeout_ms) {
-    if (sock == NULL || sock->fd < 0) {
-        LOGE("Invalid socket");
+// Close and re-create sock->fd for the given address family, re-applying
+// non-blocking mode and socket timeouts. No-op if the family already matches.
+static int socket_recreate_for_family(softether_socket_t* sock, int family) {
+    if (sock == NULL || (family != AF_INET && family != AF_INET6)) {
         return -1;
     }
+    if (sock->fd >= 0 && sock->family == family) {
+        return 0;
+    }
 
-    char ip_str[64];
-    // Try treating host as a literal IP first to avoid redundant DNS lookup
-    if (inet_pton(AF_INET, host, &(struct in_addr){0}) == 1) {
-        strncpy(ip_str, host, sizeof(ip_str) - 1);
-        ip_str[sizeof(ip_str) - 1] = '\0';
-    } else if (resolve_hostname(host, ip_str, sizeof(ip_str)) != 0) {
+    if (sock->fd >= 0) {
+        close(sock->fd);
+        sock->fd = -1;
+    }
+
+    int socket_type = (sock->type == SOCKET_TYPE_UDP) ? SOCK_DGRAM : SOCK_STREAM;
+    sock->fd = socket(family, socket_type, 0);
+    if (sock->fd < 0) {
+        sock->family = AF_UNSPEC;
+        LOGE("Failed to create socket family=%d: %s", family, strerror(errno));
+        return -1;
+    }
+    sock->family = family;
+
+    int flags = fcntl(sock->fd, F_GETFL, 0);
+    fcntl(sock->fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (sock->timeout_ms > 0) {
+        struct timeval tv;
+        tv.tv_sec = sock->timeout_ms / 1000;
+        tv.tv_usec = (sock->timeout_ms % 1000) * 1000;
+        setsockopt(sock->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    LOGD("Socket recreated for family=%d: fd=%d", family, sock->fd);
+    return 0;
+}
+
+// Attempt a non-blocking connect to a single resolved address.
+// On success, sock->addr holds the connected peer address and 0 is returned.
+static int try_connect_addr(softether_socket_t* sock, struct addrinfo* ai,
+                            int timeout_ms, char* log_ip, size_t log_ip_size) {
+    if (socket_recreate_for_family(sock, ai->ai_family) != 0) {
         return -1;
     }
 
     memset(&sock->addr, 0, sizeof(sock->addr));
-    sock->addr.sin_family = AF_INET;
-    sock->addr.sin_port = htons(port);
+    memcpy(&sock->addr, ai->ai_addr, ai->ai_addrlen);
+    sock->addr_len = ai->ai_addrlen;
 
-    if (inet_pton(AF_INET, ip_str, &sock->addr.sin_addr) <= 0) {
-        LOGE("Invalid address: %s", ip_str);
-        return -1;
+    if (log_ip && log_ip_size > 0) {
+        const void* src = NULL;
+        if (ai->ai_family == AF_INET) {
+            src = &((struct sockaddr_in*)ai->ai_addr)->sin_addr;
+        } else if (ai->ai_family == AF_INET6) {
+            src = &((struct sockaddr_in6*)ai->ai_addr)->sin6_addr;
+        }
+        if (src != NULL) {
+            inet_ntop(ai->ai_family, src, log_ip, log_ip_size);
+        }
     }
-    
-    int result = connect(sock->fd, (struct sockaddr*)&sock->addr, sizeof(sock->addr));
-    
+
+    int result = connect(sock->fd, (struct sockaddr*)&sock->addr, sock->addr_len);
+
     if (result < 0 && errno == EINPROGRESS) {
         // Connection in progress, wait for it
         fd_set fdset;
         FD_ZERO(&fdset);
         FD_SET(sock->fd, &fdset);
-        
+
         struct timeval tv;
         tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
-        
+
         result = select(sock->fd + 1, NULL, &fdset, NULL, &tv);
-        
+
         if (result < 0) {
             LOGE("Select failed: %s", strerror(errno));
             return -1;
@@ -121,12 +202,12 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
             LOGE("Connection timeout");
             return -1;
         }
-        
+
         // Check if connection succeeded
         int so_error;
         socklen_t len = sizeof(so_error);
         getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
-        
+
         if (so_error != 0) {
             LOGE("Connection failed: %s", strerror(so_error));
             return -1;
@@ -135,16 +216,79 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
         LOGE("Connect failed: %s", strerror(errno));
         return -1;
     }
-    
-    // Set back to blocking mode
-    int flags = fcntl(sock->fd, F_GETFL, 0);
-    fcntl(sock->fd, F_SETFL, flags & ~O_NONBLOCK);
-    
-    sock->connected = 1;
-    sock->timeout_ms = timeout_ms;
-    
-    LOGD("Connected to %s:%d", ip_str, port);
+
     return 0;
+}
+
+int socket_connect_timeout(softether_socket_t* sock, const char* host, int port, int timeout_ms) {
+    if (sock == NULL || host == NULL) {
+        LOGE("Invalid socket");
+        return -1;
+    }
+
+    struct addrinfo hints;
+    struct addrinfo* res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // dual-stack
+    hints.ai_socktype = SOCK_STREAM;
+
+    // Skip DNS for literal IPs (v4 or v6)
+    struct in_addr in4;
+    struct in6_addr in6;
+    if (inet_pton(AF_INET, host, &in4) == 1) {
+        hints.ai_family = AF_INET;
+    } else if (inet_pton(AF_INET6, host, &in6) == 1) {
+        hints.ai_family = AF_INET6;
+    }
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    int rc = getaddrinfo(host, port_str, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        LOGE("Failed to resolve %s:%d (%s)", host, port, gai_strerror(rc));
+        return -1;
+    }
+
+    char last_ip[INET6_ADDRSTRLEN] = "";
+    struct addrinfo* ai;
+    int attempts = 0;
+
+    // Pass 1: IPv4 first
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET) continue;
+        attempts++;
+        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
+            freeaddrinfo(res);
+            // Set back to blocking mode
+            int flags = fcntl(sock->fd, F_GETFL, 0);
+            fcntl(sock->fd, F_SETFL, flags & ~O_NONBLOCK);
+            sock->connected = 1;
+            sock->timeout_ms = timeout_ms;
+            LOGD("Connected to %s:%d", last_ip[0] ? last_ip : host, port);
+            return 0;
+        }
+    }
+
+    // Pass 2: IPv6 fallback
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET6) continue;
+        attempts++;
+        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
+            freeaddrinfo(res);
+            // Set back to blocking mode
+            int flags = fcntl(sock->fd, F_GETFL, 0);
+            fcntl(sock->fd, F_SETFL, flags & ~O_NONBLOCK);
+            sock->connected = 1;
+            sock->timeout_ms = timeout_ms;
+            LOGD("Connected to %s:%d", last_ip[0] ? last_ip : host, port);
+            return 0;
+        }
+    }
+
+    freeaddrinfo(res);
+    LOGE("Connect failed for %s:%d (%d attempts)", host, port, attempts);
+    return -1;
 }
 
 int socket_connect(softether_socket_t* sock, const char* host, int port) {
