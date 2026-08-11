@@ -84,16 +84,8 @@ int resolve_hostname(const char* hostname, char* ip_buffer, size_t buffer_size) 
         return -1;
     }
 
-    // IPv4-first, IPv6-fallback
-    struct addrinfo* best = NULL;
-    for (struct addrinfo* ai = res; ai != NULL; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET) { best = ai; break; }
-    }
-    if (best == NULL) {
-        for (struct addrinfo* ai = res; ai != NULL; ai = ai->ai_next) {
-            if (ai->ai_family == AF_INET6) { best = ai; break; }
-        }
-    }
+    // Use the first address returned by resolution (no family preference).
+    struct addrinfo* best = res;
 
     const void* src = NULL;
     if (best == NULL) {
@@ -116,6 +108,59 @@ int resolve_hostname(const char* hostname, char* ip_buffer, size_t buffer_size) 
     freeaddrinfo(res);
     LOGD("Resolved %s to %s", hostname, ip_buffer);
     return 0;
+}
+
+// Resolve a hostname (or literal IP) to an address of a specific family.
+// Returns 0 and fills ip_buffer on success, -1 if the family is unavailable.
+int resolve_hostname_family(const char* hostname, int family, char* ip_buffer, size_t buffer_size) {
+    if (hostname == NULL || ip_buffer == NULL || buffer_size == 0 ||
+        (family != AF_INET && family != AF_INET6)) {
+        return -1;
+    }
+
+    // Literal IPs pass through unchanged, but only if they match the requested family.
+    struct in_addr in4;
+    struct in6_addr in6;
+    if (family == AF_INET && inet_pton(AF_INET, hostname, &in4) == 1) {
+        strncpy(ip_buffer, hostname, buffer_size - 1);
+        ip_buffer[buffer_size - 1] = '\0';
+        return 0;
+    }
+    if (family == AF_INET6 && inet_pton(AF_INET6, hostname, &in6) == 1) {
+        strncpy(ip_buffer, hostname, buffer_size - 1);
+        ip_buffer[buffer_size - 1] = '\0';
+        return 0;
+    }
+
+    struct addrinfo hints;
+    struct addrinfo* res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(hostname, NULL, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        LOGD("No %s address for %s (%s)",
+             family == AF_INET ? "IPv4" : "IPv6", hostname, gai_strerror(rc));
+        return -1;
+    }
+
+    struct addrinfo* best = res;  // first matching address
+    const void* src = NULL;
+    if (best->ai_family == AF_INET) {
+        src = &((struct sockaddr_in*)best->ai_addr)->sin_addr;
+    } else if (best->ai_family == AF_INET6) {
+        src = &((struct sockaddr_in6*)best->ai_addr)->sin6_addr;
+    }
+
+    int result = -1;
+    if (src != NULL && inet_ntop(best->ai_family, src, ip_buffer, buffer_size) != NULL) {
+        LOGD("Resolved %s to %s (%s)", hostname, ip_buffer,
+             best->ai_family == AF_INET ? "IPv4" : "IPv6");
+        result = 0;
+    }
+    freeaddrinfo(res);
+    return result;
 }
 
 // Close and re-create sock->fd for the given address family, re-applying
@@ -254,9 +299,13 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
     struct addrinfo* ai;
     int attempts = 0;
 
-    // Pass 1: IPv4 first
+    // Pass 1: the family of the first resolved address (natural DNS order).
+    // Pass 2: the remaining IP version.
+    int first_family = (res->ai_family == AF_INET) ? AF_INET : AF_INET6;
+    int second_family = (first_family == AF_INET) ? AF_INET6 : AF_INET;
+
     for (ai = res; ai != NULL; ai = ai->ai_next) {
-        if (ai->ai_family != AF_INET) continue;
+        if (ai->ai_family != first_family) continue;
         attempts++;
         if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
             freeaddrinfo(res);
@@ -270,9 +319,9 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
         }
     }
 
-    // Pass 2: IPv6 fallback
+    // Pass 2: remaining IP version
     for (ai = res; ai != NULL; ai = ai->ai_next) {
-        if (ai->ai_family != AF_INET6) continue;
+        if (ai->ai_family != second_family) continue;
         attempts++;
         if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
             freeaddrinfo(res);

@@ -1461,23 +1461,17 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
     }
 
-    // Resolve hostname to IP upfront — use the IP for both TCP connect and TLS handshake.
+    // Resolve hostname to IP upfront for bookkeeping. The actual connect still
+    // uses the original host so socket_connect_timeout iterates the first
+    // resolved address family, then falls back to the remaining IP version.
     char resolved_ip[64];
     if (resolve_hostname(host, resolved_ip, sizeof(resolved_ip)) != 0) {
         LOGE("Failed to resolve hostname: %s", host);
         conn->state = STATE_DISCONNECTED;
         return ERR_TCP_CONNECT;
     }
-    const char* connect_host = resolved_ip;
-
-    // Store server info
-    strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
-    conn->server_port = port;
-    conn->is_ipv6 = (strchr(resolved_ip, ':') != NULL);
-    if (conn->is_ipv6) {
-        strncpy(conn->server_ip_v6, resolved_ip, sizeof(conn->server_ip_v6) - 1);
-        LOGD("IPv6 server detected: %s", resolved_ip);
-    }
+    const char* connect_host = host;
+    int preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
 
     // Create TCP socket and connect
     softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
@@ -1488,17 +1482,64 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
-        LOGE("Failed to connect to server");
-        socket_destroy(sock);
-        conn->state = STATE_DISCONNECTED;
-        return ERR_TCP_CONNECT;
+        // Fallback: retry with the remaining IP version explicitly resolved.
+        char fallback_ip[64] = "";
+        int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
+        if (resolve_hostname_family(host, fallback_family, fallback_ip, sizeof(fallback_ip)) == 0 &&
+            strcmp(fallback_ip, resolved_ip) != 0) {
+            LOGD("Connect via %s failed, retrying via %s: %s",
+                 preferred_ipv6 ? "IPv6" : "IPv4",
+                 preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
+            if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
+                strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
+                preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
+            } else {
+                LOGE("Failed to connect to server (both IP versions)");
+                socket_destroy(sock);
+                conn->state = STATE_DISCONNECTED;
+                return ERR_TCP_CONNECT;
+            }
+        } else {
+            LOGE("Failed to connect to server");
+            socket_destroy(sock);
+            conn->state = STATE_DISCONNECTED;
+            return ERR_TCP_CONNECT;
+        }
     }
 
     conn->socket_fd = sock->fd;
     sock->fd = -1;
+
+    // Sync server bookkeeping to the actually-connected address (may differ
+    // from the preferred family when the fallback path was used).
+    if (sock->addr_len > 0) {
+        char actual_ip[64] = "";
+        const void* src = NULL;
+        if (sock->addr.ss_family == AF_INET) {
+            src = &((struct sockaddr_in*)&sock->addr)->sin_addr;
+        } else if (sock->addr.ss_family == AF_INET6) {
+            src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
+        }
+        if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
+            strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
+            preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
+        }
+    }
     socket_destroy(sock);
 
-    // TLS handshake
+    // Store server info
+    strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
+    conn->server_port = port;
+    conn->is_ipv6 = preferred_ipv6;
+    if (conn->is_ipv6) {
+        strncpy(conn->server_ip_v6, resolved_ip, sizeof(conn->server_ip_v6) - 1);
+        LOGD("IPv6 server detected: %s", resolved_ip);
+    } else {
+        conn->server_ip_v6[0] = '\0';
+        LOGD("IPv4 server detected: %s", resolved_ip);
+    }
+
+    // TLS handshake — SNI uses the original hostname (better for cert checks).
     result = perform_tls_handshake(conn, connect_host);
     if (result != ERR_NONE) {
         LOGE("TLS handshake failed");

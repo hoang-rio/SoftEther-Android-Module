@@ -57,6 +57,7 @@ const char* socket_error_string(int error);
 
 // Address resolution
 int resolve_hostname(const char* hostname, char* ip_buffer, size_t buffer_size);
+int resolve_hostname_family(const char* hostname, int family, char* ip_buffer, size_t buffer_size);
 
 #ifdef __cplusplus
 }
