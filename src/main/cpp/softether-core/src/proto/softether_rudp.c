@@ -104,6 +104,11 @@ rudp_context_t* rudp_create(int is_client) {
     ctx->mss = RUDP_DEFAULT_MSS;
     ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV4;  // MTU - IPv4 - UDP
 
+    // udp_fd must start at -1: calloc zero-initializes it to 0, and
+    // rudp_create_udp_socket() closes it when >= 0 — closing fd 0 would
+    // trigger an fdsan abort (fd 0 is owned by the JVM's SocketImpl).
+    ctx->udp_fd = -1;
+
     // Create UDP socket (AF_INET by default; recreated as AF_INET6 for IPv6 peers)
     if (rudp_create_udp_socket(ctx, AF_INET) != 0) {
         free(ctx);
