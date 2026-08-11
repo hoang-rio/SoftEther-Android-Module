@@ -59,38 +59,38 @@ Key V2 differences:
 ## 2. Implementation Status
 
 ### Phase 1: V1 Core (✅ Complete)
-- `softether_rudp.h` / `softether_rudp.c`: V1 context struct, UDP socket creation, key generation
-- V1 packet format: IV(20) + Cookie + MyTick + YourTick + Size + Flag + Data + Padding + Verify(20)
-- RC4 encryption with SHA1(common_key ‖ IV) key derivation
-- Window-based receive validation
+- [x] `softether_rudp.h` / `softether_rudp.c`: V1 context struct, UDP socket creation, key generation
+- [x] V1 packet format: IV(20) + Cookie + MyTick + YourTick + Size + Flag + Data + Padding + Verify(20)
+- [x] RC4 encryption with SHA1(common_key ‖ IV) key derivation
+- [x] Window-based receive validation
 
 ### Phase 2: V1 Handshake Integration (✅ Complete)
-- `softether_protocol.c`: `build_login_pack` sends `udp_acceleration_client_key`, `udp_acceleration_client_cookie`, `udp_acceleration_client_port`
-- Welcome PACK parsing: extract server IP, port, key, cookies, version
-- `rudp_init_client` called after login to set up peer address and keys
+- [x] `softether_protocol.c`: `build_login_pack` sends `udp_acceleration_client_key`, `udp_acceleration_client_cookie`, `udp_acceleration_client_port`
+- [x] Welcome PACK parsing: extract server IP, port, key, cookies, version
+- [x] `rudp_init_client` called after login to set up peer address and keys
 
 ### Phase 3: V1 Data Path (✅ Complete)
-- `softether_send_data`: RUDP send with `rudp_is_send_ready` gate, TCP fallback
-- `softether_fill_recv_queue`: poll UDP socket, decode RUDP blocks, queue for Java
-- RUDP receive queue with head/tail/count ring buffer
+- [x] `softether_send_data`: RUDP send with `rudp_is_send_ready` gate, TCP fallback
+- [x] `softether_fill_recv_queue`: poll UDP socket, decode RUDP blocks, queue for Java
+- [x] RUDP receive queue with head/tail/count ring buffer
 
 ### Phase 4: V1 Hardening (✅ Complete)
-- Keep-alive polling with configurable interval (normal 1-3s, fast 0.5-1s)
-- 10-second continuous reception requirement (`RUDP_REQUIRE_CONTINUOUS`) before sending VPN data
-- `VpnService.protect()` for UDP socket to prevent TUN routing loop
-- DHCP over RUDP: poll UDP socket during DHCP wait loop
-- Simultaneous RUDP+TCP polling with 100ms timeout (prevents receive loop spinning)
-- Diagnostic logging for decompression failures in fallback path
+- [x] Keep-alive polling with configurable interval (normal 1-3s, fast 0.5-1s)
+- [x] 10-second continuous reception requirement (`RUDP_REQUIRE_CONTINUOUS`) before sending VPN data
+- [x] `VpnService.protect()` for UDP socket to prevent TUN routing loop
+- [x] DHCP over RUDP: poll UDP socket during DHCP wait loop
+- [x] Simultaneous RUDP+TCP polling with 100ms timeout (prevents receive loop spinning)
+- [x] Diagnostic logging for decompression failures in fallback path
 
 ### Phase 5: Compression Support (✅ Complete)
-- ✅ Link zlib in CMakeLists.txt (Android NDK built-in)
-- ✅ Implement zlib wrapper functions: `compress_data()`, `uncompress_data()`, `calc_compress_bound()`
-- ✅ Enable `use_compress=1` in login PACK (`softether_protocol.c:637`)
-- ✅ RUDP: always compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` (`softether_rudp.c:519-532`)
-- ✅ RUDP: decompress on receive if flag set (`softether_rudp.c:381-390`)
-- ✅ TCP: always compress when `server_use_compress=1` (`packet_handler.c:259`)
-- ✅ Skip compression for small packets (≤1 byte)
-- ✅ Always-compress policy to prevent server inflate stream corruption
+- [x] Link zlib in CMakeLists.txt (Android NDK built-in)
+- [x] Implement zlib wrapper functions: `compress_data()`, `uncompress_data()`, `calc_compress_bound()`
+- [x] Enable `use_compress=1` in login PACK (`softether_protocol.c:637`)
+- [x] RUDP: always compress in `rudp_send()`, set `RUDP_FLAG_COMPRESSED` (`softether_rudp.c:519-532`)
+- [x] RUDP: decompress on receive if flag set (`softether_rudp.c:381-390`)
+- [x] TCP: always compress when `server_use_compress=1` (`packet_handler.c:259`)
+- [x] Skip compression for small packets (≤1 byte)
+- [x] Always-compress policy to prevent server inflate stream corruption
 
 ### ~~Phase 6: NAT-T / Direct R-UDP~~ — Removed (Not Viable for VPN Gate)
 NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails DNS), VPN Gate servers have no R-UDP listener, and ICMP/DNS R-UDP is disabled by default. Direct R-UDP is impossible — the server's R-UDP socket binds to a random port via `RAND_PORT_ID_SERVER_LISTEN=1` (`Server.c:11109`), not the TCP port.
@@ -124,7 +124,7 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 - [x] Accept `Inet6Address` in `ConnectionController.kt` `buildClientInfo()`
 - [x] Support IPv6 in `ClientInfo.kt` (`getLocalIPv6Address()`, `isIPv6` flag)
 
-### Phase 9: Dual-Stack Socket Support (🟢 Client Done)
+### Phase 9: Dual-Stack Socket Support (✅ Client Done)
 - [x] Replace `sockaddr_in` with `sockaddr_storage` in `softether_socket.h`, `softether_rudp.h`
 - [x] Replace `gethostbyname()` with `getaddrinfo(AF_UNSPEC)` in `tcp_socket.c`
 - [x] Implement IPv4-first, IPv6-fallback in `socket_connect_timeout()`
@@ -147,7 +147,7 @@ NAT-T relay server is dead (`servers.nat-traversal.softether-network.net` fails 
 
 > Note: OpenSSL 3.5 no longer generates `include/openssl/opensslconf.h` at build time — it is a committed wrapper that includes the generated `configuration.h`. The build script must not delete it (fixed in `build-openssl-android.sh`).
 
-### Phase 11: IPv6 for All Protocols (🟢 Client Done — Server-Blocked)
+### Phase 11: IPv6 for All Protocols (✅ Client Done — Server-Blocked)
 
 Phase 8 tunneled IPv6 for **SoftEther only**. OpenVPN (`vpnLib`) and MS-SSTP (`sstpClient`) were IPv4-only in this app even though their client stacks are IPv6-capable. **All client-side work is now complete (2026-08-10).** On-device testing confirmed the remaining gaps are **server-side SoftEther limitations** (verified against `SoftEtherVPN_Stable` v4.44-9807-rtm source), not client bugs:
 
@@ -699,12 +699,12 @@ Phase A (IPv6 Tunnel):
 - [x] Connected devices can reach IPv6 endpoints through tunnel (NAT66 on the host; see field notes below)
 
 Phase B (Dual-Stack Sockets):
-- [ ] `resolve_hostname()` returns both IPv4 and IPv6 addresses
-- [ ] TCP connection tries IPv4 first, falls back to IPv6
-- [ ] R-UDP creates IPv6 UDP socket when peer is IPv6
-- [ ] Login PACK includes `ClientIpv6Address` (16-byte DATA) when IPv6
-- [ ] MTU adjusted for IPv6 header (40 bytes vs 20)
-- [ ] Can connect to server over IPv6 when IPv4 is unavailable
+- [x] `resolve_hostname()` returns both IPv4 and IPv6 addresses
+- [x] TCP connection tries IPv4 first, falls back to IPv6
+- [x] R-UDP creates IPv6 UDP socket when peer is IPv6
+- [x] Login PACK includes `ClientIpv6Address` (16-byte DATA) when IPv6
+- [x] MTU adjusted for IPv6 header (40 bytes vs 20)
+- [x] Can connect to server over IPv6 when IPv4 is unavailable
 
 > **Field notes (2026-08): host-side IPv6 delivery.** Phase A moves IPv6 packets through the L2 tunnel, but the reply path needs the host to deliver frames back to the phone. Two hard-won findings on the paid SoftEther server (hub `VPNGatePaid`, local TAP bridge):
 > 1. The hub mangles ND: the host kernel never learns the phone's tun MAC by NUD (entries stay `FAILED`/`INCOMPLETE`) even though the phone answers every NS with a valid NA. Fix: static neighbor pin on the host (`ip -6 neigh replace fd00::2 lladdr <phone-mac> dev tap_net nud permanent`), re-learned per session because Android rotates the tun MAC on reconnect.
