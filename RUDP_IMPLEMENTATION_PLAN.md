@@ -175,7 +175,6 @@ MS-SSTP (`sstpClient`, kittoku/osc fork):
 App layer (`app/`):
 - [x] Add `Ipv6Ula.kt` shared util: per-install ULA (`fd00::<ANDROID_ID hex>`), reuses the native `softether_vpn` pref so all protocols share one address
 - [x] Apply dual-stack IPv6 defaults consistently for OpenVPN and SSTP in `DetailActivity.kt` / `ServerActivity.kt` (ULA + `::/0`; mirror the SoftEther `ConnectionConfig` IPv6 fields)
-- [ ] Surface IPv6 state in connection status / analytics (`LAST_CONNECT_METHOD`, StatusFragment)
 
 ---
 
@@ -756,7 +755,6 @@ kittoku/osc already negotiates IPv6CP and builds the v6 tun; the app never turns
 
 - [x] Add `Ipv6Ula.kt` shared util (`app/src/main/java/com/hoangndx/vpngateconnector/util/Ipv6Ula.kt`): per-install ULA `fd00::<ANDROID_ID hex>`, derived via `getOrDerive()`, backed by the native `softether_vpn` pref so all protocols share one address.
 - [x] Mirror the SoftEther `ConnectionConfig` IPv6 fields (`localAddressV6`/`dnsServerV6`/`routesV6`) into the OpenVPN and SSTP connect flows (`DetailActivity.kt`, `ServerActivity.kt`) so IPv6 isn't SoftEther-only — both now inject ULA + `::/0`.
-- [ ] Surface IPv6 status in connection state / analytics (`LAST_CONNECT_METHOD`, StatusFragment), matching the SoftEther `isIPv6`/`getLocalIPv6Address()` work in `ClientInfo.kt`.
 
 ---
 
