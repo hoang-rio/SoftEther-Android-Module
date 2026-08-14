@@ -6,6 +6,7 @@
 #include <time.h>
 #include <pthread.h>
 #include "softether_rudp.h"
+#include "rudp_transport.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -130,6 +131,10 @@ typedef struct softether_connection {
     // RUDP (UDP acceleration)
     rudp_context_t* rudp;
     int rudp_enabled;
+    // NAT-T + RUDP transport fallback (used when the direct TCP/TLS connect
+    // fails — reaches servers behind NAT/CGNAT via the SoftEther relay).
+    rudp_transport_t* nat_t_transport;
+    int using_nat_t;  // 1 if the primary connection runs over the transport
     uint32_t rudp_server_cookie;
     uint32_t rudp_client_cookie;
     uint8_t rudp_server_key[128];

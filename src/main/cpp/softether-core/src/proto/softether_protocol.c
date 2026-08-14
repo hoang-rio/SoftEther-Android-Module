@@ -1,6 +1,8 @@
 #include "softether_protocol.h"
 #include "softether_socket.h"
 #include "softether_crypto.h"
+#include "softether_nat_t.h"
+#include "rudp_transport.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -968,6 +970,14 @@ void softether_destroy(softether_connection_t* conn) {
         softether_disconnect(conn);
     }
 
+    // Safety: ensure the NAT-T transport is gone even if we were already
+    // marked disconnected (edge case in reconnection).
+    if (conn->nat_t_transport != NULL) {
+        rudp_transport_destroy(conn->nat_t_transport);
+        conn->nat_t_transport = NULL;
+    }
+    conn->using_nat_t = 0;
+
     // Clear sensitive data
     if (conn->username[0] != '\0') {
         memset(conn->username, 0, sizeof(conn->username));
@@ -1079,6 +1089,9 @@ static int perform_authentication_http(softether_connection_t* conn,
     strncpy(conn->password, password, sizeof(conn->password) - 1);
 
     // Decide auth type: use forced_auth_type if set, otherwise auto-detect
+    // NOTE: CLIENT_AUTHTYPE_ANONYMOUS == 0 doubles as the "auto-detect"
+    // sentinel, so a non-zero forced value selects that type explicitly and
+    // 0 (the default) falls through to auto-detection below.
     int auth_type;
     uint8_t secure_password[SHA1_SIZE];
     memset(secure_password, 0, sizeof(secure_password));
@@ -1087,11 +1100,11 @@ static int perform_authentication_http(softether_connection_t* conn,
         // Plain password auth (used for RADIUS): send password in plaintext
         auth_type = CLIENT_AUTHTYPE_PLAIN_PASSWORD;
         LOGD("Using PLAIN_PASSWORD auth (RADIUS mode)");
-    } else if (conn->forced_auth_type == CLIENT_AUTHTYPE_ANONYMOUS) {
-        auth_type = CLIENT_AUTHTYPE_ANONYMOUS;
-        LOGD("Using ANONYMOUS auth (forced)");
+    } else if (conn->forced_auth_type == CLIENT_AUTHTYPE_PASSWORD) {
+        auth_type = CLIENT_AUTHTYPE_PASSWORD;
+        LOGD("Using PASSWORD auth (forced)");
     } else {
-        // Auto-detect: password if non-empty, else anonymous
+        // Auto-detect (default 0): hashed password if non-empty, else anonymous
         auth_type = (strlen(password) > 0) ? CLIENT_AUTHTYPE_PASSWORD : CLIENT_AUTHTYPE_ANONYMOUS;
     }
 
@@ -1112,15 +1125,17 @@ static int perform_authentication_http(softether_connection_t* conn,
             if (concat_buf) {
                 memcpy(concat_buf, password, pw_len);
                 memcpy(concat_buf + pw_len, upper_user, user_len);
-                sha1_hash(concat_buf, concat_len, hashed_pw);
+                // NOTE: SoftEther's HashPassword uses SHA-0 (Hash() -> Internal_SHA0)
+                sha0_hash(concat_buf, concat_len, hashed_pw);
                 free(concat_buf);
-                LOGD("HashedPassword (SHA1(pw+UPPER_user)) computed");
+                LOGD("HashedPassword (SHA0(pw+UPPER_user)) computed");
                 if (conn->has_server_random) {
                     uint8_t combined[SHA1_SIZE * 2];
                     memcpy(combined, hashed_pw, SHA1_SIZE);
                     memcpy(combined + SHA1_SIZE, conn->server_random, SHA1_SIZE);
-                    sha1_hash(combined, SHA1_SIZE * 2, secure_password);
-                    LOGD("SecurePassword (SHA1(hashed_pw+server_random)) computed");
+                    // NOTE: SoftEther's SecurePassword uses SHA-0 (Hash() -> Internal_SHA0)
+                    sha0_hash(combined, SHA1_SIZE * 2, secure_password);
+                    LOGD("SecurePassword (SHA0(hashed_pw+server_random)) computed");
                 } else {
                     memcpy(secure_password, hashed_pw, SHA1_SIZE);
                     LOGW("No server random available; using raw hashed password");
@@ -1396,6 +1411,66 @@ int softether_connect(softether_connection_t* conn, const char* host, int port,
         "", "", 0);
 }
 
+// Establish the primary connection over NAT-T + RUDP transport. Runs the
+// NAT-T rendezvous to learn the server's public UDP endpoint, then a RUDP
+// session over UDP. On success sets conn->socket_fd to the transport's
+// app-facing byte-stream fd (which behaves like a connected TCP socket) and
+// stores the transport in conn->nat_t_transport. Returns ERR_NONE on success.
+// resolved_ip must be an IPv4 address (NAT-T is IPv4-only).
+static int softether_try_nat_t_connect(softether_connection_t* conn,
+                                       const char* host, const char* resolved_ip,
+                                       int port) {
+    struct in_addr ip4;
+    char ip_str[INET_ADDRSTRLEN];
+
+    (void)host;
+    if (inet_pton(AF_INET, resolved_ip, &ip4) != 1) {
+        LOGE("NAT-T fallback requires an IPv4 server address (got %s)", resolved_ip);
+        return ERR_TCP_CONNECT;
+    }
+
+    LOGD("NAT-T rendezvous for %s:%d ...", resolved_ip, port);
+    softether_nat_t_result_t nr;
+    memset(&nr, 0, sizeof(nr));
+    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, (uint32_t)conn->timeout_ms, &nr) != 0) {
+        LOGE("NAT-T rendezvous failed: error=%d", nr.error_code);
+        return ERR_TCP_CONNECT;
+    }
+
+    if (nr.same_lan) {
+        LOGD("NAT-T reports same-LAN target at %s:%u (direct RUDP)",
+             inet_ntop(AF_INET, &nr.result_ip, ip_str, sizeof(ip_str)), nr.result_port);
+    } else {
+        LOGD("NAT-T resolved public UDP endpoint %s:%u",
+             inet_ntop(AF_INET, &nr.result_ip, ip_str, sizeof(ip_str)), nr.result_port);
+    }
+
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        if (nr.udp_fd >= 0) close(nr.udp_fd);
+        LOGE("Failed to allocate RUDP transport");
+        return ERR_TCP_CONNECT;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = nr.result_ip;            // network byte order
+    cfg.server_port = nr.result_port;        // host byte order
+    cfg.udp_fd = nr.same_lan ? -1 : nr.udp_fd;
+    cfg.connect_timeout_ms = (uint32_t)conn->timeout_ms;
+
+    if (rudp_transport_connect(tr, &cfg) != 0) {
+        LOGE("RUDP transport connect failed: %d", rudp_transport_get_error(tr));
+        rudp_transport_destroy(tr);
+        return ERR_TCP_CONNECT;
+    }
+
+    conn->nat_t_transport = tr;
+    conn->using_nat_t = 1;
+    conn->socket_fd = rudp_transport_get_fd(tr);
+    return ERR_NONE;
+}
+
 // Connect with HubName
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
                                const char* username, const char* password, const char* hub_name,
@@ -1408,6 +1483,14 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
+
+    // Ensure no stale NAT-T transport is carried into a fresh connect attempt
+    // (re-entered via softether_reconnect). The app fd must already be closed.
+    if (conn->nat_t_transport != NULL && conn->socket_fd < 0) {
+        rudp_transport_destroy(conn->nat_t_transport);
+        conn->nat_t_transport = NULL;
+    }
+    conn->using_nat_t = 0;
 
     LOGD("Connecting to %s:%d (hub: %s)", host, port, hub_name ? hub_name : "VPN");
     conn->state = STATE_CONNECTING;
@@ -1473,59 +1556,66 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     const char* connect_host = host;
     int preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
 
-    // Create TCP socket and connect
-    softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
-    if (sock == NULL) {
-        LOGE("Failed to create socket");
-        conn->state = STATE_DISCONNECTED;
-        return ERR_TCP_CONNECT;
+    // Test hook: force the NAT-T + RUDP fallback (skip TCP/TLS). Used by the
+    // host-side validation harness; never set in the Android app.
+    int force_nat_t = (getenv("SOFTETHER_FORCE_NAT_T") != NULL);
+    if (force_nat_t) {
+        LOGD("SOFTETHER_FORCE_NAT_T set - skipping TCP, forcing NAT-T fallback");
     }
 
-    if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
-        // Fallback: retry with the remaining IP version explicitly resolved.
-        char fallback_ip[64] = "";
-        int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
-        if (resolve_hostname_family(host, fallback_family, fallback_ip, sizeof(fallback_ip)) == 0 &&
-            strcmp(fallback_ip, resolved_ip) != 0) {
-            LOGD("Connect via %s failed, retrying via %s: %s",
-                 preferred_ipv6 ? "IPv6" : "IPv4",
-                 preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
-            if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
-                strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
-                preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
+    // Create TCP socket and connect
+    softether_socket_t* sock = force_nat_t ? NULL : socket_create(SOCKET_TYPE_TCP);
+    int tcp_ok = 0;
+    if (sock != NULL) {
+        if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
+            // Fallback: retry with the remaining IP version explicitly resolved.
+            char fallback_ip[64] = "";
+            int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
+            if (resolve_hostname_family(host, fallback_family, fallback_ip, sizeof(fallback_ip)) == 0 &&
+                strcmp(fallback_ip, resolved_ip) != 0) {
+                LOGD("Connect via %s failed, retrying via %s: %s",
+                     preferred_ipv6 ? "IPv6" : "IPv4",
+                     preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
+                if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
+                    strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
+                    preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
+                    tcp_ok = 1;
+                } else {
+                    LOGE("Failed to connect to server (both IP versions)");
+                }
             } else {
-                LOGE("Failed to connect to server (both IP versions)");
-                socket_destroy(sock);
-                conn->state = STATE_DISCONNECTED;
-                return ERR_TCP_CONNECT;
+                LOGE("Failed to connect to server");
             }
         } else {
-            LOGE("Failed to connect to server");
-            socket_destroy(sock);
-            conn->state = STATE_DISCONNECTED;
-            return ERR_TCP_CONNECT;
+            tcp_ok = 1;
+        }
+
+        if (tcp_ok) {
+            conn->socket_fd = sock->fd;
+            sock->fd = -1;
+
+            // Sync server bookkeeping to the actually-connected address (may
+            // differ from the preferred family when the fallback path was used).
+            if (sock->addr_len > 0) {
+                char actual_ip[64] = "";
+                const void* src = NULL;
+                if (sock->addr.ss_family == AF_INET) {
+                    src = &((struct sockaddr_in*)&sock->addr)->sin_addr;
+                } else if (sock->addr.ss_family == AF_INET6) {
+                    src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
+                }
+                if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
+                    strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
+                    preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
+                }
+            }
+        }
+        socket_destroy(sock);
+    } else {
+        if (!force_nat_t) {
+            LOGE("Failed to create socket");
         }
     }
-
-    conn->socket_fd = sock->fd;
-    sock->fd = -1;
-
-    // Sync server bookkeeping to the actually-connected address (may differ
-    // from the preferred family when the fallback path was used).
-    if (sock->addr_len > 0) {
-        char actual_ip[64] = "";
-        const void* src = NULL;
-        if (sock->addr.ss_family == AF_INET) {
-            src = &((struct sockaddr_in*)&sock->addr)->sin_addr;
-        } else if (sock->addr.ss_family == AF_INET6) {
-            src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
-        }
-        if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
-            strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
-            preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
-        }
-    }
-    socket_destroy(sock);
 
     // Store server info
     strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
@@ -1539,14 +1629,36 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         LOGD("IPv4 server detected: %s", resolved_ip);
     }
 
-    // TLS handshake — SNI uses the original hostname (better for cert checks).
-    result = perform_tls_handshake(conn, connect_host);
+    if (tcp_ok) {
+        // TLS handshake — SNI uses the original hostname (better for cert checks).
+        result = perform_tls_handshake(conn, connect_host);
+        if (result != ERR_NONE) {
+            LOGE("TLS handshake failed over TCP");
+            close(conn->socket_fd);
+            conn->socket_fd = -1;
+        }
+    } else {
+        result = ERR_TCP_CONNECT;
+    }
+
+    // NAT-T + RUDP fallback: direct TCP (or TLS) failed. Reach the server via
+    // the SoftEther relay + RUDP transport (works behind NAT/CGNAT).
     if (result != ERR_NONE) {
-        LOGE("TLS handshake failed");
-        close(conn->socket_fd);
-        conn->socket_fd = -1;
-        conn->state = STATE_DISCONNECTED;
-        return result;
+        LOGD("Direct TCP/TLS connect failed (%d); trying NAT-T + RUDP fallback", result);
+        result = softether_try_nat_t_connect(conn, host, resolved_ip, port);
+        if (result == ERR_NONE) {
+            // TLS handshake over the RUDP transport (SNI still the real host)
+            result = perform_tls_handshake(conn, connect_host);
+            if (result != ERR_NONE) {
+                LOGE("TLS handshake failed over RUDP transport");
+                softether_disconnect(conn);
+                return result;
+            }
+            LOGD("Connected via NAT-T + RUDP transport");
+        } else {
+            conn->state = STATE_DISCONNECTED;
+            return result;
+        }
     }
 
     // ---- SoftEther Protocol: Step 1 ----
@@ -1571,7 +1683,10 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // ---- SoftEther Protocol: Step 2 ----
     // Create RUDP context before building login PACK when UDP mode is requested,
     // so we can include client's keys/cookies in the login PACK for server negotiation.
-    if (!use_tcp) {
+    // (Skipped when the connection itself already runs over the NAT-T RUDP
+    // transport — UDP acceleration is pointless and would conflict with the
+    // transport's own UDP channel.)
+    if (!use_tcp && !conn->using_nat_t) {
         conn->rudp = rudp_create(1);  // 1 = client mode
         if (conn->rudp == NULL) {
             LOGW("Failed to create RUDP context (UDP acceleration disabled)");
@@ -1597,8 +1712,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
 
     // POST /vpnsvc/vpn.cgi with login PACK.
     // Server responds with Welcome PACK (error=0 on success).
-    LOGD("Performing PACK-based authentication...");
-    result = perform_authentication_http(conn, username, password);
+    LOGD("Performing PACK-based authentication...");    result = perform_authentication_http(conn, username, password);
 
     if (result != ERR_NONE) {
         LOGE("Authentication failed: %d (%s)", result, softether_error_string(result));
@@ -1666,17 +1780,25 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     conn->state = STATE_CONNECTED;
     LOGD("Connection established successfully");
 
-    // Schedule additional connections (multi-connection support)
-    // Clamp max_connection to what the server accepted
-    if (conn->server_max_connection > 0 && conn->server_max_connection < (uint32_t)conn->max_connection) {
-        conn->max_connection = (int)conn->server_max_connection;
+    // Schedule additional connections (multi-connection support).
+    // Skipped when connected via the NAT-T RUDP transport: additional TCP
+    // sockets to a CGNAT server would fail (the transport channel is primary).
+    if (conn->using_nat_t) {
+        conn->max_connection = 1;
+        conn->next_connect_time = 0;
+        LOGD("Multi-connection: disabled for NAT-T transport");
+    } else {
+        // Clamp max_connection to what the server accepted
+        if (conn->server_max_connection > 0 && conn->server_max_connection < (uint32_t)conn->max_connection) {
+            conn->max_connection = (int)conn->server_max_connection;
+        }
+        if (conn->max_connection > MAX_SE_CONNECTIONS) {
+            conn->max_connection = MAX_SE_CONNECTIONS;
+        }
+        conn->next_connect_time = softether_tick_ms() + ADDITIONAL_CONNECT_INTERVAL_MS;
+        LOGD("Multi-connection: max_connection=%d, server_max=%u, additional connections will open gradually",
+             conn->max_connection, conn->server_max_connection);
     }
-    if (conn->max_connection > MAX_SE_CONNECTIONS) {
-        conn->max_connection = MAX_SE_CONNECTIONS;
-    }
-    conn->next_connect_time = softether_tick_ms() + ADDITIONAL_CONNECT_INTERVAL_MS;
-    LOGD("Multi-connection: max_connection=%d, server_max=%u, additional connections will open gradually",
-         conn->max_connection, conn->server_max_connection);
     
     // Check for any leftover SSL data from the HTTP exchange
     {
@@ -1783,6 +1905,15 @@ void softether_disconnect(softether_connection_t* conn) {
         close(conn->socket_fd);
         conn->socket_fd = -1;
     }
+
+    // Destroy the NAT-T + RUDP transport if the connection used the fallback.
+    // (The app-facing fd above was closed first; destroy then stops the worker.)
+    if (conn->nat_t_transport != NULL) {
+        LOGD("Destroying NAT-T transport");
+        rudp_transport_destroy(conn->nat_t_transport);
+        conn->nat_t_transport = NULL;
+    }
+    conn->using_nat_t = 0;
 
     // Destroy RUDP context if present
     if (conn->rudp != NULL) {

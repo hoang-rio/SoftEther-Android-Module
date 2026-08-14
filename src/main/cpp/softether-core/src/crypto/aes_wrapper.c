@@ -207,6 +207,35 @@ void sha256_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
     EVP_MD_CTX_free(ctx);
 }
 
+void rc4_crypt(const uint8_t* key, size_t key_len, uint8_t* data, size_t data_len) {
+    if (key == NULL || key_len == 0 || data == NULL) {
+        return;
+    }
+
+    uint8_t sbox[256];
+    unsigned int i, j = 0;
+    for (i = 0; i < 256; i++) {
+        sbox[i] = (uint8_t)i;
+    }
+    for (i = 0; i < 256; i++) {
+        j = (j + sbox[i] + key[i % key_len]) & 0xFF;
+        uint8_t tmp = sbox[i];
+        sbox[i] = sbox[j];
+        sbox[j] = tmp;
+    }
+
+    i = 0;
+    j = 0;
+    for (size_t n = 0; n < data_len; n++) {
+        i = (i + 1) & 0xFF;
+        j = (j + sbox[i]) & 0xFF;
+        uint8_t tmp = sbox[i];
+        sbox[i] = sbox[j];
+        sbox[j] = tmp;
+        data[n] ^= sbox[(sbox[i] + sbox[j]) & 0xFF];
+    }
+}
+
 void hmac_sha256(const uint8_t* key, size_t key_len,
                  const uint8_t* data, size_t data_len,
                  uint8_t* mac) {
@@ -523,5 +552,78 @@ void sha1_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
     }
     
     memcpy(hash, md_buf, SHA1_HASH_SIZE);
-    LOGD("sha1_hash: Successfully hashed %zu bytes", data_len);
+}
+
+// SHA-0 (the original SHA-1 with no message-schedule rotation). SoftEther's
+// Hash() maps sha=true to Internal_SHA0, so the password authentication chain
+// (HashPassword / SecurePassword) MUST use SHA-0, not SHA-1.
+void sha0_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
+    if (data == NULL || hash == NULL) {
+        LOGE("sha0_hash: Invalid parameters");
+        return;
+    }
+
+    static const uint32_t k0 = 0x5A827999, k1 = 0x6ED9EBA1;
+    static const uint32_t k2 = 0x8F1BBCDC, k3 = 0xCA62C1D6;
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+
+    size_t mlen = data_len;
+    size_t padded = ((mlen + 8) / 64 + 1) * 64;
+    uint8_t* buf = (uint8_t*)calloc(1, padded);
+    if (buf == NULL) {
+        LOGE("sha0_hash: calloc failed");
+        return;
+    }
+    memcpy(buf, data, mlen);
+    buf[mlen] = 0x80;
+    uint64_t bits = (uint64_t)mlen * 8;
+    for (int i = 0; i < 8; i++) {
+        buf[padded - 1 - i] = (uint8_t)(bits >> (8 * i));
+    }
+
+    uint32_t w[80];
+    for (size_t off = 0; off < padded; off += 64) {
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)buf[off + i * 4] << 24) |
+                   ((uint32_t)buf[off + i * 4 + 1] << 16) |
+                   ((uint32_t)buf[off + i * 4 + 2] << 8) |
+                   ((uint32_t)buf[off + i * 4 + 3]);
+        }
+        for (int i = 16; i < 80; i++) {
+            w[i] = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+        }
+
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) {
+                f = (b & c) | ((~b) & d);
+                k = k0;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = k1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = k2;
+            } else {
+                f = b ^ c ^ d;
+                k = k3;
+            }
+            uint32_t t = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = (b << 30) | (b >> 2);
+            b = a;
+            a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        hash[i * 4] = (uint8_t)(h[i] >> 24);
+        hash[i * 4 + 1] = (uint8_t)(h[i] >> 16);
+        hash[i * 4 + 2] = (uint8_t)(h[i] >> 8);
+        hash[i * 4 + 3] = (uint8_t)(h[i]);
+    }
+    free(buf);
 }

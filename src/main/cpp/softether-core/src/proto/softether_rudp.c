@@ -1,4 +1,5 @@
 #include "softether_rudp.h"
+#include "softether_crypto.h"
 #include "softether_compress.h"
 #include <string.h>
 #include <stdlib.h>
@@ -593,16 +594,9 @@ void rudp_poll(rudp_context_t* ctx) {
             uint8_t key[RUDP_PACKET_KEY_SIZE_V1];
             calc_key(key, ctx->your_key, iv);
 
-            // Decrypt (everything after IV) via EVP (low-level RC4() is
-            // deprecated in OpenSSL 3.x)
-            EVP_CIPHER_CTX* rc4_ctx = EVP_CIPHER_CTX_new();
-            if (rc4_ctx == NULL) {
-                continue;
-            }
-            EVP_DecryptInit_ex(rc4_ctx, EVP_rc4(), NULL, key, NULL);
-            int rc4_outlen = 0;
-            EVP_DecryptUpdate(rc4_ctx, buf, &rc4_outlen, buf, (int)size);
-            EVP_CIPHER_CTX_free(rc4_ctx);
+            // Decrypt (everything after IV). RC4 is kept native because
+            // OpenSSL 3.x gates RC4 behind the legacy provider.
+            rc4_crypt(key, sizeof(key), buf, size);
 
             if (rudp_process_inner(ctx, buf, size, &from_addr, from_len, 1) != 0) {
                 continue;
@@ -737,20 +731,13 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
         buf += RUDP_PACKET_IV_SIZE_V1;
         size += RUDP_PACKET_IV_SIZE_V1;
 
-        // Derive key and encrypt (everything after IV) via EVP (low-level
-        // RC4() is deprecated in OpenSSL 3.x)
+        // Derive key and encrypt (everything after IV). RC4 is kept native
+        // because OpenSSL 3.x gates RC4 behind the legacy provider.
         uint8_t key[RUDP_PACKET_KEY_SIZE_V1];
         calc_key(key, ctx->my_key, ctx->next_iv);
 
-        EVP_CIPHER_CTX* rc4_ctx = EVP_CIPHER_CTX_new();
-        if (rc4_ctx != NULL) {
-            EVP_EncryptInit_ex(rc4_ctx, EVP_rc4(), NULL, key, NULL);
-            int rc4_outlen = 0;
-            EVP_EncryptUpdate(rc4_ctx, tmp + RUDP_PACKET_IV_SIZE_V1, &rc4_outlen,
-                              tmp + RUDP_PACKET_IV_SIZE_V1,
-                              (int)(size - RUDP_PACKET_IV_SIZE_V1));
-            EVP_CIPHER_CTX_free(rc4_ctx);
-        }
+        rc4_crypt(key, sizeof(key), tmp + RUDP_PACKET_IV_SIZE_V1,
+                  size - RUDP_PACKET_IV_SIZE_V1);
 
         // Update IV for next packet
         memcpy(ctx->next_iv, buf - RUDP_PACKET_IV_SIZE_V1, RUDP_PACKET_IV_SIZE_V1);

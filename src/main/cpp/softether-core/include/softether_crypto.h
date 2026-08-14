@@ -39,6 +39,15 @@ void md5_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
 #define SHA1_HASH_SIZE 20
 void sha1_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
 
+// SHA0 hashing (20 bytes output) - SoftEther's Hash() uses the original SHA-0
+// for the password authentication chain (HashPassword / SecurePassword).
+#define SHA0_HASH_SIZE 20
+void sha0_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
+
+// RC4 stream cipher (in-place) - OpenSSL 3.x gates RC4 behind the legacy
+// provider, so a native implementation is used for portability.
+void rc4_crypt(const uint8_t* key, size_t key_len, uint8_t* data, size_t data_len);
+
 // SHA256 hashing
 void sha256_hash(const uint8_t* data, size_t data_len, uint8_t* hash);
 
