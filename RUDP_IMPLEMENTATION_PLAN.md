@@ -208,6 +208,64 @@ App layer (`app/`):
 - [x] Add `Ipv6Ula.kt` shared util: per-install ULA (`fd00::<ANDROID_ID hex>`), reuses the native `softether_vpn` pref so all protocols share one address
 - [x] Apply dual-stack IPv6 defaults consistently for OpenVPN and SSTP in `DetailActivity.kt` / `ServerActivity.kt` (ULA + `::/0`; mirror the SoftEther `ConnectionConfig` IPv6 fields)
 
+### Phase 12: NAT-T Transport for UDP-only (CGNAT) Servers (📋 Planned)
+
+> **Reference note (2026-08-14):** the backup branch `backup/pre-nat-t-rudp-revert-20260725` does **not** contain a prior NAT-T implementation — its Phase 6 was only "📋 Planned", and the app's own `src/` has zero NAT-T code in either branch. The branch is still the reference snapshot for this phase: its Phase 6 plan section, and the vendored upstream `SoftEtherVPN_Stable/src/Mayaqua/Network.c` which holds the complete R-UDP / NAT-T implementation to port from.
+
+**Goal:** connect to VPN Gate servers whose only reachable transport is R-UDP through the SoftEther NAT-T relay — the "SSL-VPN UDP: Supported / no TCP port" rows (CGNAT, e.g. the Thailand example `vpn642164523.opengw.net` → `27.130.192.217`, reverse-DNS `27-130-192-217.24.nat.asay-cgn01.myaisfibre.com`). Such servers expose **no inbound TCP or direct-UDP port at all** (verified 2026-08-14: 0/13 common TCP listeners and 0/60,531 UDP R-UDP responders on `131.147.172.243`), so the only way to reach them is the relay path the official client already uses.
+
+**Trigger strategy (chosen 2026-08-14):** **TCP first, automatic fall back to NAT-T.** Keep the existing direct-TCP connect (with its IPv4/IPv6 fallback); on `ERR_TCP_CONNECT` (both families refused/timeout) retry once via NAT-T. No data-driven gate required — the fallback also rescues partially-firewalled servers that advertise a TCP port. Worst-case extra connect time ≈ existing TCP timeout + `RUDP_TIMEOUT` (12 s).
+
+**Verified protocol facts (2026-08-14, official client 4.44 Build 9807 wire captures + upstream source):**
+- NAT-T relay: hostname `x{sha1(ip)[2]}.x{sha1(ip)[3]}.servers.nat-traversal.softether-network.net.` derived from the **target server IP** (`RUDPGetRegisterHostNameByIP`, `Mayaqua/Network.c:4627`; tag `UDP_NAT_T_SERVER_TAG`, `Network.h:765`), **UDP 5004** (`UDP_NAT_T_PORT`, `Network.h:767`). Relay is alive — it answered a `nat_t_connect_request` with `ok=1` on the wire. (TCP 443/80 to the relay is refused; that is not the relay protocol.)
+- Rendezvous (client → relay, 258 B PACK): `opcode="nat_t_connect_request"`, `tran_id` (int64), `dest_ip` = server IP, `target_hostname` = server IP/hostname, `svc_name="SoftEther_VPN"` (`VPN_RUDP_SVC_NAME`, `Cedar/Cedar.h:304`), `cookie` (int64, 0 first round), `nat_traversal_version=1` (`UDP_NAT_TRAVERSAL_VERSION`, `Network.h:780`).
+- Relay reply (145 B PACK): `opcode="nat_t_connect_request"`, `tran_id` (echo), `ok` (bool), and when a mapping exists `result_ip` (str) + `result_port` (int) + `same_lan` (bool); on ambiguity `multi_candidates=1` → `RUDP_ERROR_NAT_T_TWO_OR_MORE`; on miss → not found. Client only proceeds when `ok && result_port != 0` (`NewRUDPClientNatT`, `Network.c:5252-5485`). No `result_ip`/`result_port` in the reply ⇒ keep re-sending until `RUDP_TIMEOUT` (12 s, `Network.h:664`).
+- After rendezvous, a **standard R-UDP transport session** runs against `result_ip:result_port` (relay forwards to the server's registered session), then TLS + the normal SoftEther handshake over the R-UDP byte stream. Transport handshake (from removed Phase 6 analysis, above): 39-byte CONNECT = `Key_Init(20)` + 19 random, resent every `RUDP_RESEND_TIMER`=200 ms while CONNECT_SENT; `key1 = SHA1(init ‖ "zurukko")`, `key2 = SHA1(init ‖ key1 ‖ "yasushineko")`; `Key_Send=key2`, `Key_Recv=key1`; server ACK within ~1.2 s flips ESTABLISHED (`Network.c:2124/3559`); segments are SHA1(Key)-signed + RC4(SHA1(IV‖Key)) (V1) or ChaCha20-Poly1305 (V2) — reuse the existing accel crypto.
+
+**Current-state gaps this phase closes:** the control channel is unconditionally TCP — `softether_connect_with_hub` always runs `socket_connect_timeout` (`softether_protocol.c:1477-1508`), so a UDP-only server fails with `ERR_TCP_CONNECT` before RUDP is ever considered. `use_tcp` only toggles post-login UDP *acceleration*, not transport. `softether_reconnect` hardcodes `use_tcp=1` (`softether_protocol.c:2783`) and must become transport-aware.
+
+Native core (`src/main/cpp/softether-core/`):
+- [ ] PACK writer/reader for the rendezvous exchange: serialization is currently hand-built (`build_login_pack`) with read-only bounds-safe `pack_read_*` helpers (`softether_protocol.c:52-131`); expose a small reusable PACK encode/decode util (match the SoftEther `Pack.c` wire format used by the relay) for `softether_nat_t.c`
+- [ ] New `src/proto/softether_nat_t.c` + `include/softether_nat_t.h`: `nat_t_relay_hostname(server_ip, buf)` (SHA1-derived, per `RUDPGetRegisterHostNameByIP`); `nat_t_connect(server_ip, timeout, out_result_ip, out_result_port, out_error)` — UDP socket to `relay:5004`, re-send `nat_t_connect_request` until reply/timeout, parse `ok`/`result_ip`/`result_port`/`multi_candidates`, map errors (`TWO_OR_MORE`, `NOT_FOUND`, `NO_RESPONSE`)
+- [ ] R-UDP **transport session** in `src/proto/softether_rudp.c` (distinct from the existing acceleration context): `rudp_transport_create_client(result_ip, result_port, timeout)` with CONNECT_SENT → ESTABLISHED; 39-byte CONNECT + 200 ms resend; SHA1 key derivation; ACK validation; segment framing/retransmit/window reusing the V1 (RC4/SHA1) and V2 (ChaCha20-Poly1305) crypto already in `softether_rudp.c`; byte-stream API `rudp_transport_send(ctx, buf, len)` / `rudp_transport_recv(ctx, buf, max)` + keepalive (port the minimal client subset of upstream `RUDP_SESSION` — `RUDPNewSession`/`RUDPSendSegmentNow`/`RUDPCheckSignOfRecvPacket` in `SoftEtherVPN_Stable/src/Mayaqua/Network.c`)
+- [ ] Socketpair + bridge thread in `src/socket/tcp_socket.c`: `socket_create_rudp_bridge(transport, int* fd_out)` — `socketpair(AF_UNIX, SOCK_STREAM)` with a pthread pumping transport↔fd; **TLS/HTTP-CONNECT/PACK-login then run unchanged** (`SSL_set_fd`, `aes_wrapper.c:303`; half-close/teardown must stop the bridge thread)
+- [ ] Transport-mode integration in `src/proto/softether_protocol.c`: NAT-T mode skips the TCP connect and wires `conn->socket_fd` to the bridge fd after `nat_t_connect` + transport ESTABLISHED; state surfaced for UI; `softether_reconnect` made transport-aware (no longer hardcoded `use_tcp=1`)
+- [ ] JNI (`jni/softether_jni.c`/`.h`, symbol-export binding): pass transport mode/fallback flag through `nativeConnectWithHub` (or a new `nativeConnectNatT`); expose fd accessors for `VpnService.protect()` — relay UDP fd, transport UDP fd, bridge fd (reuse the `nativeGetRudpSocketFd` pattern at `softether_jni.c:296`)
+
+Kotlin submodule (`SoftEtherClient/src/main/java/vn/unlimit/softether/`):
+- [ ] `model/ConnectionConfig.kt`: add `fallbackToNatT: Boolean = false` (parcelled + written), alongside existing `useTcp`/`useUdp` (line 38-39)
+- [ ] `controller/ConnectionController.kt`: pass the mode in `performConnect`/`attemptReconnect`; protect the new NAT-T/transport/bridge fds next to the existing protect sites (351, 361, 789, 799) and `protectAdditionalSockets` (1021-1033)
+
+App layer (parent repo `app/`):
+- [ ] `models/VPNGateConnection.kt`: `val isUdpOnly get() = seTcpPort <= 0 && seUdpPort > 0` (derivable — no Room schema change); mirror on `models/VPNGateItem.kt` / `models/PaidServer.kt`
+- [ ] `activities/DetailActivity.kt` / `activities/paid/ServerActivity.kt` / `fragment/StatusFragment.kt`: when `isUdpOnly`, build `ConnectionConfig` with `fallbackToNatT=true` (port is a placeholder — the transport targets the server **IP**, rendezvous by IP; use `seUdpPort` or 443)
+- [ ] `dialog/VpnProtocolSelectionDialog.kt`: label the SoftEther UDP card "UDP (NAT-T)" for `isUdpOnly` rows
+
+Testing:
+- [ ] Native loopback: `test_rudp_transport_loopback` — CONNECT → ESTABLISHED → bidirectional data between a client and a minimal transport-server in `test/native_test.c` (mirror `test12RudpV2Loopback` pattern, `NativeConnectionTest#test12RudpV2Loopback`)
+- [ ] NAT-T rendezvous unit test against the live relay (deterministic request → expect `ok`/timeout/`multi_candidates` handling), network-gated
+- [ ] Forced NAT-T connect to the paid server `59.6.114.202` (credentials available) to validate TLS + login over R-UDP end-to-end when a mapping exists
+- [ ] Live UDP-only server connect attempt from the current site list (soft-fail expected if the volunteer server is offline)
+- [ ] On-device instrumentation: new `NativeConnectionTest` cases + full regression suite
+
+Risks / mitigations:
+- R-UDP transport session is the bulk of the work (upstream `RUDP_SESSION` is large); port only the minimal client subset (send/recv FIFO, seq/ack window, retransmit) and reuse the existing V1/V2 crypto paths.
+- Bridge teardown/half-close must terminate the pump thread deterministically on disconnect to avoid leaked fds/threads (fdsan-safe — `udp_fd = -1` pattern, commit `0225498`).
+- Relay provides rendezvous only; if the target server has no live registration (offline volunteer node), the attempt ends after `RUDP_TIMEOUT` with a clear error string (`ERR_CONNECT_FAILED` / "server unreachable via NAT-T").
+- CGNAT servers are transient; phase acceptance does **not** depend on any single live server — primary proof = transport loopback + rendezvous unit test + paid-server forced NAT-T.
+
+References:
+| Topic | Source |
+|-------|--------|
+| NAT-T relay hostname derivation | `RUDPGetRegisterHostNameByIP` `Mayaqua/Network.c:4627`; tag `UDP_NAT_T_SERVER_TAG` `Mayaqua/Network.h:765` |
+| NAT-T rendezvous client | `NewRUDPClientNatT` `Mayaqua/Network.c:5252-5485`; ports `UDP_NAT_T_PORT=5004` / `UDP_NAT_T_PORT_FOR_TCP_1/2=80/443` `Network.h:767-778`; `UDP_NAT_TRAVERSAL_VERSION=1` `Network.h:780`; `RUDP_TIMEOUT=12000` `Network.h:664` |
+| R-UDP transport session | `RUDPNewSession`, `RUDPSendSegmentNow`, `RUDPCheckSignOfRecvPacket`, CONNECT/ACK in `Mayaqua/Network.c` (also summarized in removed Phase 6 analysis above) |
+| Service name | `VPN_RUDP_SVC_NAME="SoftEther_VPN"` `Cedar/Cedar.h:304` |
+| Client 4-way race (TCP / NAT-T / ICMP / DNS) | `ConnectEx4` `Mayaqua/Network.c:16287-16520`; `TcpConnectEx3` `Cedar/Protocol.c:8172` |
+| R-UDP-only mode (no NAT-T) contrast | `ClientConnectGetSocket` `Cedar/Protocol.c:7642-7683` (`PortUDP != 0` → direct only) |
+| Wire captures | `/tmp/opencode/natt_test.pcap` (rendezvous 258 B → 145 B), `/tmp/opencode/natt_paid.pcap` (TCP wins race, no relay traffic) |
+| Backup snapshot | `backup/pre-nat-t-rudp-revert-20260725` (Phase 6 plan section; pre-revert state; vendored upstream source) |
+
 ---
 
 ## 3. Compression Implementation Details
