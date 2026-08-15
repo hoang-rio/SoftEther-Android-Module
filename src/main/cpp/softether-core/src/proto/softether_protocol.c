@@ -1402,6 +1402,63 @@ static int softether_establish_first_additional(softether_connection_t* conn) {
     return result;
 }
 
+// SoftEther Protocol Steps 1+2: send the VPNCONNECT watermark (connect.cgi) to
+// receive the server Hello, create the post-login RUDP acceleration context
+// (UDP mode only), then authenticate via PACK (vpn.cgi). Returns ERR_NONE on
+// success. Does NOT disconnect on failure — the caller is responsible.
+static int softether_protocol_login(softether_connection_t* conn, const char* host,
+                                    const char* username, const char* password,
+                                    int use_tcp) {
+    LOGD("Sending VPNCONNECT watermark (connect.cgi)...");
+    int watermark_result = send_vpnconnect_watermark(conn, host);
+
+    if (watermark_result < 0) {
+        LOGE("VPNCONNECT watermark failed — server may not be SoftEther");
+        return ERR_TLS_HANDSHAKE;
+    }
+
+    if (watermark_result != 1) {
+        LOGW("Watermark sent but no Hello PACK received (result=%d)", watermark_result);
+        // Continue anyway — auth step may still work
+    } else {
+        LOGD("Got server Hello in watermark response (server_random stored)");
+    }
+
+    // Create RUDP context before building login PACK when UDP mode is requested,
+    // so we can include client's keys/cookies in the login PACK for server negotiation.
+    // (Skipped when the connection itself already runs over the NAT-T RUDP
+    // transport — UDP acceleration is pointless and would conflict with the
+    // transport's own UDP channel.)
+    if (!use_tcp && !conn->using_nat_t) {
+        conn->rudp = rudp_create(1);  // 1 = client mode
+        if (conn->rudp == NULL) {
+            LOGW("Failed to create RUDP context (UDP acceleration disabled)");
+        } else {
+            LOGD("RUDP context created (my_port=%u, cookie=0x%08X)",
+                 conn->rudp->my_port, conn->rudp->my_cookie);
+            // Pre-create the UDP socket for the server's address family so the
+            // client port advertised in the login PACK matches the actual socket.
+            if (conn->is_ipv6) {
+                if (rudp_set_udp_family(conn->rudp, AF_INET6) != 0) {
+                    LOGW("Failed to create IPv6 RUDP socket (UDP acceleration disabled)");
+                    rudp_destroy(conn->rudp);
+                    conn->rudp = NULL;
+                } else {
+                    LOGD("RUDP context recreated for IPv6 (my_port=%u)", conn->rudp->my_port);
+                }
+            }
+        }
+    } else {
+        conn->rudp = NULL;
+        LOGD("TCP mode - skipping RUDP initialization");
+    }
+
+    // POST /vpnsvc/vpn.cgi with login PACK.
+    // Server responds with Welcome PACK (error=0 on success).
+    LOGD("Performing PACK-based authentication...");
+    return perform_authentication_http(conn, username, password);
+}
+
 // Main connect function
 int softether_connect(softether_connection_t* conn, const char* host, int port,
                       const char* username, const char* password) {
@@ -1661,58 +1718,28 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         }
     }
 
-    // ---- SoftEther Protocol: Step 1 ----
-    // POST /vpnsvc/connect.cgi with "VPNCONNECT" watermark.
-    // Server responds with Hello PACK containing version + server_random.
-    LOGD("Sending VPNCONNECT watermark (connect.cgi)...");
-    int watermark_result = send_vpnconnect_watermark(conn, host);
-
-    if (watermark_result < 0) {
-        LOGE("VPNCONNECT watermark failed — server may not be SoftEther");
+    // ---- SoftEther Protocol: Steps 1+2 (VPNCONNECT watermark + PACK login) ----
+    // If the direct-TCP login is rejected (e.g. a node that only accepts
+    // NAT-T/UDP-mode clients, or rejects the TCP path while the relay path
+    // works), fall back to the NAT-T transport and re-run the login over it.
+    // The transport-stage fallback above cannot catch this case — the TCP
+    // connect and TLS handshake both succeed; only the login is refused.
+    result = softether_protocol_login(conn, host, username, password, use_tcp);
+    if (result != ERR_NONE && !conn->using_nat_t) {
+        LOGD("Direct login failed (%d); retrying via NAT-T + RUDP fallback", result);
         softether_disconnect(conn);
-        return ERR_TLS_HANDSHAKE;
-    }
-
-    if (watermark_result != 1) {
-        LOGW("Watermark sent but no Hello PACK received (result=%d)", watermark_result);
-        // Continue anyway — auth step may still work
-    } else {
-        LOGD("Got server Hello in watermark response (server_random stored)");
-    }
-
-    // ---- SoftEther Protocol: Step 2 ----
-    // Create RUDP context before building login PACK when UDP mode is requested,
-    // so we can include client's keys/cookies in the login PACK for server negotiation.
-    // (Skipped when the connection itself already runs over the NAT-T RUDP
-    // transport — UDP acceleration is pointless and would conflict with the
-    // transport's own UDP channel.)
-    if (!use_tcp && !conn->using_nat_t) {
-        conn->rudp = rudp_create(1);  // 1 = client mode
-        if (conn->rudp == NULL) {
-            LOGW("Failed to create RUDP context (UDP acceleration disabled)");
-        } else {
-            LOGD("RUDP context created (my_port=%u, cookie=0x%08X)",
-                 conn->rudp->my_port, conn->rudp->my_cookie);
-            // Pre-create the UDP socket for the server's address family so the
-            // client port advertised in the login PACK matches the actual socket.
-            if (conn->is_ipv6) {
-                if (rudp_set_udp_family(conn->rudp, AF_INET6) != 0) {
-                    LOGW("Failed to create IPv6 RUDP socket (UDP acceleration disabled)");
-                    rudp_destroy(conn->rudp);
-                    conn->rudp = NULL;
-                } else {
-                    LOGD("RUDP context recreated for IPv6 (my_port=%u)", conn->rudp->my_port);
-                }
+        result = softether_try_nat_t_connect(conn, host, resolved_ip, port);
+        if (result == ERR_NONE) {
+            result = perform_tls_handshake(conn, connect_host);
+            if (result != ERR_NONE) {
+                LOGE("TLS handshake failed over RUDP transport");
+                softether_disconnect(conn);
+                return result;
             }
+            LOGD("Connected via NAT-T + RUDP transport");
+            result = softether_protocol_login(conn, host, username, password, use_tcp);
         }
-    } else {
-        conn->rudp = NULL;
-        LOGD("TCP mode - skipping RUDP initialization");
     }
-
-    // POST /vpnsvc/vpn.cgi with login PACK.
-    // Server responds with Welcome PACK (error=0 on success).
-    LOGD("Performing PACK-based authentication...");    result = perform_authentication_http(conn, username, password);
 
     if (result != ERR_NONE) {
         LOGE("Authentication failed: %d (%s)", result, softether_error_string(result));
