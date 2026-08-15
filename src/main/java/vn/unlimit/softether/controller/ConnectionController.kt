@@ -367,6 +367,17 @@ class ConnectionController(
             }
         }
 
+        // Protect NAT-T RUDP transport UDP socket (used when the primary
+        // connection runs over the NAT-T fallback; -1 otherwise)
+        val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
+        if (natTUdpFd >= 0) {
+            if (!service.protect(natTUdpFd)) {
+                Log.e(TAG, "Failed to protect NAT-T UDP socket fd=$natTUdpFd")
+            } else {
+                Log.d(TAG, "NAT-T UDP socket fd=$natTUdpFd protected from TUN routing")
+            }
+        }
+
         // Perform DHCP over the SoftEther tunnel to get IP configuration
         Log.d(TAG, "Starting DHCP over SoftEther tunnel...")
         val dhcpResult = client.doDhcp(nativeHandle)
@@ -803,6 +814,16 @@ class ConnectionController(
                 }
             }
 
+            // Protect NAT-T RUDP transport UDP socket during reconnect
+            val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
+            if (natTUdpFd >= 0) {
+                if (!service.protect(natTUdpFd)) {
+                    Log.e(TAG, "Failed to protect NAT-T UDP socket fd=$natTUdpFd during reconnect")
+                } else {
+                    Log.d(TAG, "NAT-T UDP socket fd=$natTUdpFd protected during reconnect")
+                }
+            }
+
             client.externalHandle = nativeHandle
 
             // Perform DHCP over the new tunnel
@@ -1020,6 +1041,7 @@ class ConnectionController(
      */
     private fun protectAdditionalSockets() {
         val allFds = client.getAllSocketFds() ?: return
+        val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
         for (fd in allFds) {
             if (fd >= 0 && fd !in protectedFds) {
                 if (service.protect(fd)) {
@@ -1028,6 +1050,14 @@ class ConnectionController(
                 } else {
                     Log.e(TAG, "Failed to protect additional socket fd=$fd")
                 }
+            }
+        }
+        if (natTUdpFd >= 0 && natTUdpFd !in protectedFds) {
+            if (service.protect(natTUdpFd)) {
+                protectedFds.add(natTUdpFd)
+                Log.d(TAG, "NAT-T UDP socket fd=$natTUdpFd protected from TUN routing")
+            } else {
+                Log.e(TAG, "Failed to protect NAT-T UDP socket fd=$natTUdpFd")
             }
         }
     }

@@ -4,14 +4,17 @@
 #include "softether_socket.h"
 #include <android/log.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-#include <poll.h>
 
 #define TAG "NativeTest"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -1094,5 +1097,467 @@ native_test_result_t test_rudp_v2_loopback(void) {
            duration);
   test_result_init(&result, true, ERR_NONE, msg, duration);
   LOGD("RUDP V2 loopback test PASSED: %s", msg);
+  return result;
+}
+
+// ---- RUDP transport loopback ----
+// A minimal in-process transport *server* (mirrors the client's segment
+// framing in rudp_transport.c: CONNECT -> first valid segment -> ESTABLISHED,
+// SHA1 key derivation, RC4(SHA1(iv||key)) segments, ACK via MAX_ACK).
+static void ts_be32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+  p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+static void ts_be64(uint8_t *p, uint64_t v) {
+  p[0] = (uint8_t)(v >> 56); p[1] = (uint8_t)(v >> 48);
+  p[2] = (uint8_t)(v >> 40); p[3] = (uint8_t)(v >> 32);
+  p[4] = (uint8_t)(v >> 24); p[5] = (uint8_t)(v >> 16);
+  p[6] = (uint8_t)(v >> 8);  p[7] = (uint8_t)v;
+}
+static uint64_t ts_r64(const uint8_t *p) {
+  return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+         ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+         ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+         ((uint64_t)p[6] << 8)  | ((uint64_t)p[7]);
+}
+static uint32_t ts_r32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | ((uint32_t)p[3]);
+}
+
+typedef struct {
+  int fd;
+  int stop;
+  pthread_t thread;
+  struct sockaddr_in client_addr;
+  int client_known;
+  uint8_t key_send[RUDP_T_SHA1_SIZE];
+  uint8_t key_recv[RUDP_T_SHA1_SIZE];
+  uint8_t magic_req[RUDP_T_SHA1_SIZE];
+  uint8_t magic_resp[RUDP_T_SHA1_SIZE];
+  uint8_t next_iv[RUDP_T_SHA1_SIZE];
+  uint64_t next_send_seq;
+  uint64_t last_recv_seq;
+  uint64_t last_client_tick;
+  uint64_t my_tick;
+  uint8_t last_payload[RUDP_T_MAX_SEGMENT_SIZE];
+  uint32_t last_payload_size;
+} ts_server_t;
+
+static void ts_derive_key(const uint8_t *init, uint8_t *out, const char *s) {
+  size_t slen = strlen(s);
+  uint8_t buf[RUDP_T_SHA1_SIZE + 4 + 64];
+  memcpy(buf, init, RUDP_T_SHA1_SIZE);
+  ts_be32(buf + RUDP_T_SHA1_SIZE, (uint32_t)(slen + 1));
+  memcpy(buf + RUDP_T_SHA1_SIZE + 4, s, slen);
+  sha1_hash(buf, RUDP_T_SHA1_SIZE + 4 + (uint32_t)slen, out);
+}
+
+static void ts_derive_keys(ts_server_t *s, const uint8_t *init) {
+  uint8_t key1[RUDP_T_SHA1_SIZE];
+  uint8_t key2[RUDP_T_SHA1_SIZE];
+  uint8_t buf[RUDP_T_SHA1_SIZE * 2 + 4 + 64];
+  size_t slen;
+
+  ts_derive_key(init, key1, "zurukko");
+
+  slen = strlen("yasushineko");
+  memcpy(buf, init, RUDP_T_SHA1_SIZE);
+  memcpy(buf + RUDP_T_SHA1_SIZE, key1, RUDP_T_SHA1_SIZE);
+  ts_be32(buf + RUDP_T_SHA1_SIZE * 2, (uint32_t)(slen + 1));
+  memcpy(buf + RUDP_T_SHA1_SIZE * 2 + 4, "yasushineko", slen);
+  sha1_hash(buf, RUDP_T_SHA1_SIZE * 2 + 4 + (uint32_t)slen, key2);
+
+  // Server: Key_Send = key1, Key_Recv = key2 (client is the opposite)
+  memcpy(s->key_send, key1, RUDP_T_SHA1_SIZE);
+  memcpy(s->key_recv, key2, RUDP_T_SHA1_SIZE);
+
+  ts_derive_key(init, s->magic_req, "Magic_KeepAliveRequest");
+  ts_derive_key(init, s->magic_resp, "Magic_KeepAliveResponse");
+}
+
+static void ts_send_segment(ts_server_t *s, uint64_t seq, const void *data,
+                            uint32_t size) {
+  uint8_t pkt[RUDP_T_MAX_PACKET_SIZE];
+  uint8_t keygen[RUDP_T_SHA1_SIZE * 2];
+  uint8_t key[RUDP_T_SHA1_SIZE];
+  uint8_t sign[RUDP_T_SHA1_SIZE];
+  uint8_t *p;
+  uint32_t current_size, next_iv_pos;
+
+  memset(pkt, 0, sizeof(pkt));
+  memcpy(pkt, s->key_send, RUDP_T_SHA1_SIZE);
+  p = pkt + RUDP_T_SHA1_SIZE;
+
+  memcpy(p, s->next_iv, RUDP_T_SHA1_SIZE);
+  p += RUDP_T_SHA1_SIZE;
+
+  ts_be64(p, get_test_timestamp_ms()); p += 8;   // MyTick
+  ts_be64(p, s->last_client_tick); p += 8;       // YourTick: echo client's tick
+  ts_be64(p, s->last_recv_seq); p += 8;          // MAX_ACK: cumulative ACK
+
+  ts_be32(p, 0); p += 4;                         // NUM_ACK
+
+  ts_be64(p, seq); p += 8;
+
+  if (size > 0 && data != NULL) {
+    memcpy(p, data, size);
+    p += size;
+  }
+
+  *p = 1; p++;                                   // single padding byte, value 1
+  current_size = (uint32_t)(p - pkt);
+
+  memcpy(keygen, s->next_iv, RUDP_T_SHA1_SIZE);
+  memcpy(keygen + RUDP_T_SHA1_SIZE, s->key_send, RUDP_T_SHA1_SIZE);
+  sha1_hash(keygen, sizeof(keygen), key);
+  rc4_crypt(key, RUDP_T_SHA1_SIZE, pkt + RUDP_T_SHA1_SIZE * 2,
+            current_size - RUDP_T_SHA1_SIZE * 2);
+
+  sha1_hash(pkt, current_size, sign);
+  memcpy(pkt, sign, RUDP_T_SHA1_SIZE);
+
+  sendto(s->fd, pkt, current_size, 0, (struct sockaddr *)&s->client_addr,
+         sizeof(s->client_addr));
+
+  next_iv_pos = (uint32_t)(rand() % (current_size - RUDP_T_SHA1_SIZE));
+  memcpy(s->next_iv, pkt + next_iv_pos, RUDP_T_SHA1_SIZE);
+}
+
+static void ts_handle_packet(ts_server_t *s, const uint8_t *buf, uint32_t size,
+                             const struct sockaddr_in *src) {
+  uint8_t pkt[RUDP_T_MAX_PACKET_SIZE];
+  uint8_t sign[RUDP_T_SHA1_SIZE];
+  uint8_t keygen[RUDP_T_SHA1_SIZE * 2];
+  uint8_t key[RUDP_T_SHA1_SIZE];
+  uint8_t *p;
+  uint8_t padlen;
+  uint32_t enc_len, num_ack, payload_size;
+  uint64_t seq;
+
+  if (size < 39) return;
+
+  if (!s->client_known) {
+    memcpy(&s->client_addr, src, sizeof(s->client_addr));
+    s->client_known = 1;
+    ts_derive_keys(s, buf);               // key_init = first 20 bytes
+    generate_random_bytes(s->next_iv, RUDP_T_SHA1_SIZE);
+    s->next_send_seq = 1;
+    s->my_tick = get_test_timestamp_ms();
+    // First valid segment carries a payload: the client only registers
+    // segments with payloads, so the very first segment must not be empty or
+    // the client's receive drain would stall waiting for seq 1.
+    ts_send_segment(s, s->next_send_seq++, "init-payload", 12);
+    LOGD("ts: CONNECT from %s, keys derived, first segment sent",
+         inet_ntoa(src->sin_addr));
+    return;
+  }
+
+  if (size > sizeof(pkt)) size = sizeof(pkt);
+  memcpy(pkt, buf, size);
+
+  memcpy(sign, pkt, RUDP_T_SHA1_SIZE);
+  memcpy(pkt, s->key_recv, RUDP_T_SHA1_SIZE);
+  {
+    uint8_t sign2[RUDP_T_SHA1_SIZE];
+    sha1_hash(pkt, size, sign2);
+    memcpy(pkt, sign, RUDP_T_SHA1_SIZE);
+    if (memcmp(sign, sign2, RUDP_T_SHA1_SIZE) != 0) {
+      return;  // corrupt / raw resend — drop
+    }
+  }
+
+  if (size < RUDP_T_SHA1_SIZE * 2) return;
+  {
+    const uint8_t *iv = pkt + RUDP_T_SHA1_SIZE;
+    uint8_t *enc = pkt + RUDP_T_SHA1_SIZE * 2;
+    enc_len = size - RUDP_T_SHA1_SIZE * 2;
+
+    memcpy(keygen, iv, RUDP_T_SHA1_SIZE);
+    memcpy(keygen + RUDP_T_SHA1_SIZE, s->key_recv, RUDP_T_SHA1_SIZE);
+    sha1_hash(keygen, sizeof(keygen), key);
+    rc4_crypt(key, RUDP_T_SHA1_SIZE, enc, enc_len);
+
+    if (enc_len < 1) return;
+    padlen = enc[enc_len - 1];
+    if (padlen == 0) return;
+    if (enc_len < padlen) return;
+    enc_len -= padlen;
+
+    if (enc_len < 8 + 8 + 8 + 4 + 8) return;
+    p = enc;
+    {
+      uint64_t my_tick = ts_r64(p);
+      p += 8;
+      if (my_tick > s->last_client_tick) s->last_client_tick = my_tick;
+    }
+    p += 8;  // YourTick
+    p += 8;  // MAX_ACK
+    num_ack = ts_r32(p); p += 4;
+    if (num_ack > RUDP_T_MAX_NUM_ACK) return;
+    if (enc_len < 8 + 8 + 8 + 4 + num_ack * 8 + 8) return;
+    p += num_ack * 8;
+    seq = ts_r64(p); p += 8;
+    if (seq == 0) return;
+
+    if (seq > s->last_recv_seq) s->last_recv_seq = seq;
+
+    payload_size = enc_len - (uint32_t)(p - enc);
+    if (payload_size > RUDP_T_MAX_SEGMENT_SIZE) payload_size = 0;
+
+    if (payload_size >= 1) {
+      if (payload_size == RUDP_T_SHA1_SIZE &&
+          memcmp(p, s->magic_req, RUDP_T_SHA1_SIZE) == 0) {
+        ts_send_segment(s, s->next_send_seq++, s->magic_resp,
+                        RUDP_T_SHA1_SIZE);
+      } else {
+        memcpy(s->last_payload, p, payload_size);
+        s->last_payload_size = payload_size;
+      }
+    }
+  }
+}
+
+static void *ts_server_thread(void *param) {
+  ts_server_t *s = (ts_server_t *)param;
+  uint8_t buf[RUDP_T_MAX_PACKET_SIZE];
+
+  while (!s->stop) {
+    struct pollfd pfd;
+    pfd.fd = s->fd;
+    pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, 100);
+    if (pr <= 0) continue;
+    for (;;) {
+      struct sockaddr_in src;
+      socklen_t slen = sizeof(src);
+      memset(&src, 0, sizeof(src));
+      ssize_t n = recvfrom(s->fd, buf, sizeof(buf), 0,
+                           (struct sockaddr *)&src, &slen);
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        break;
+      }
+      if (n == 0) break;
+      ts_handle_packet(s, buf, (uint32_t)n, &src);
+    }
+  }
+  return NULL;
+}
+
+// Read from a stream fd until len bytes arrive or the deadline elapses.
+static int ts_fd_read_until(int fd, uint8_t *buf, uint32_t len,
+                            long timeout_ms) {
+  long deadline = get_test_timestamp_ms() + timeout_ms;
+  uint32_t got = 0;
+  while (got < len && get_test_timestamp_ms() < deadline) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, 50);
+    if (pr > 0) {
+      ssize_t n = read(fd, buf + got, len - got);
+      if (n > 0) got += (uint32_t)n;
+    }
+  }
+  return (int)got;
+}
+
+// Self-contained RUDP transport loopback test. Runs a client transport against
+// a minimal transport-server over 127.0.0.1: CONNECT -> ESTABLISHED,
+// bidirectional bytes, and a corrupt packet dropped/recovered.
+native_test_result_t test_rudp_transport_loopback(void) {
+  native_test_result_t result;
+  long start_time = get_test_timestamp_ms();
+
+  ts_server_t server;
+  memset(&server, 0, sizeof(server));
+  server.fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (server.fd < 0) {
+    test_result_init(&result, false, ERR_UNKNOWN, "server socket failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+  fcntl(server.fd, F_SETFL, O_NONBLOCK);
+  struct sockaddr_in srv;
+  memset(&srv, 0, sizeof(srv));
+  srv.sin_family = AF_INET;
+  srv.sin_addr.s_addr = inet_addr("127.0.0.1");
+  srv.sin_port = 0;
+  if (bind(server.fd, (struct sockaddr *)&srv, sizeof(srv)) != 0) {
+    close(server.fd);
+    test_result_init(&result, false, ERR_UNKNOWN, "server bind failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+  socklen_t srv_len = sizeof(srv);
+  getsockname(server.fd, (struct sockaddr *)&srv, &srv_len);
+
+  if (pthread_create(&server.thread, NULL, ts_server_thread, &server) != 0) {
+    close(server.fd);
+    test_result_init(&result, false, ERR_UNKNOWN, "server thread failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  rudp_transport_t *tr = rudp_transport_create();
+  if (tr == NULL) {
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_UNKNOWN, "transport create failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  rudp_transport_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.server_ip = inet_addr("127.0.0.1");
+  cfg.server_port = ntohs(srv.sin_port);
+  cfg.udp_fd = -1;
+  cfg.connect_timeout_ms = 5000;
+
+  if (rudp_transport_connect(tr, &cfg) != 0) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_TCP_CONNECT,
+                     "transport connect failed (no ESTABLISHED)",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  int app_fd = rudp_transport_get_fd(tr);
+  int udp_fd = rudp_transport_get_udp_fd(tr);
+  if (app_fd < 0 || udp_fd < 0) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_UNKNOWN,
+                     "transport fds not exposed (get_fd/get_udp_fd)",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // The server's CONNECT response carries its initial payload (seq 1)
+  uint8_t rbuf[256];
+  const uint8_t init_payload[] = "init-payload";
+  int rr = ts_fd_read_until(app_fd, rbuf, (uint32_t)sizeof(init_payload) - 1, 3000);
+  if (rr != (int)sizeof(init_payload) - 1 ||
+      memcmp(rbuf, init_payload, sizeof(init_payload) - 1) != 0) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "server initial payload mismatch",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // Client -> server payload
+  uint8_t c2s[32];
+  for (int i = 0; i < (int)sizeof(c2s); i++) c2s[i] = (uint8_t)(0xA0 + i);
+  ssize_t w = write(app_fd, c2s, sizeof(c2s));
+  if (w != (ssize_t)sizeof(c2s)) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "client write to app fd failed",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // Server -> client payload (after the client's data has been acked and the
+  // server has seen the client payload; the client may merge the initial
+  // 8-byte disconnect magic with the 32-byte payload into a single segment,
+  // so match the payload's trailing 32 bytes)
+  long s2s_deadline = get_test_timestamp_ms() + 3000;
+  int c2s_seen = 0;
+  while (!c2s_seen && get_test_timestamp_ms() < s2s_deadline) {
+    if (server.last_payload_size >= (uint32_t)sizeof(c2s) &&
+        memcmp(server.last_payload + (server.last_payload_size - sizeof(c2s)),
+               c2s, sizeof(c2s)) == 0) {
+      c2s_seen = 1;
+    } else {
+      usleep(10000);
+    }
+  }
+  if (!c2s_seen) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "server did not receive client payload",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  uint8_t s2c[24];
+  for (int i = 0; i < (int)sizeof(s2c); i++) s2c[i] = (uint8_t)(0x50 + i);
+  ts_send_segment(&server, server.next_send_seq++, s2c, sizeof(s2c));
+
+  rr = ts_fd_read_until(app_fd, rbuf, sizeof(s2c), 3000);
+  if (rr != (int)sizeof(s2c) || memcmp(rbuf, s2c, sizeof(s2c)) != 0) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "server->client payload mismatch",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  // A corrupt packet must be dropped (no crash, no data corruption)
+  uint8_t corrupt[64];
+  for (int i = 0; i < (int)sizeof(corrupt); i++) {
+    corrupt[i] = (uint8_t)(rand() & 0xFF);
+  }
+  struct sockaddr_in cli;
+  memset(&cli, 0, sizeof(cli));
+  cli.sin_family = AF_INET;
+  cli.sin_addr.s_addr = inet_addr("127.0.0.1");
+  socklen_t cli_len = sizeof(cli);
+  getsockname(udp_fd, (struct sockaddr *)&cli, &cli_len);
+  sendto(udp_fd, corrupt, sizeof(corrupt), 0, (struct sockaddr *)&cli,
+         sizeof(cli));
+  usleep(300000);
+
+  // The connection must survive the corrupt packet: server sends more data
+  uint8_t s2c2[16];
+  for (int i = 0; i < (int)sizeof(s2c2); i++) s2c2[i] = (uint8_t)(0x70 + i);
+  ts_send_segment(&server, server.next_send_seq++, s2c2, sizeof(s2c2));
+  rr = ts_fd_read_until(app_fd, rbuf, sizeof(s2c2), 3000);
+  if (rr != (int)sizeof(s2c2) || memcmp(rbuf, s2c2, sizeof(s2c2)) != 0) {
+    rudp_transport_destroy(tr);
+    server.stop = 1;
+    pthread_join(server.thread, NULL);
+    close(server.fd);
+    test_result_init(&result, false, ERR_DATA_TRANSMISSION,
+                     "session did not recover after corrupt packet",
+                     get_test_timestamp_ms() - start_time);
+    return result;
+  }
+
+  close(app_fd);
+  rudp_transport_destroy(tr);
+  server.stop = 1;
+  pthread_join(server.thread, NULL);
+  close(server.fd);
+
+  long duration = get_test_timestamp_ms() - start_time;
+  char msg[256];
+  snprintf(msg, sizeof(msg),
+           "RUDP transport loopback OK: ESTABLISHED, bidirectional bytes, "
+           "corrupt packet dropped/recovered (%ld ms)",
+           duration);
+  test_result_init(&result, true, ERR_NONE, msg, duration);
+  LOGD("RUDP transport loopback test PASSED: %s", msg);
   return result;
 }

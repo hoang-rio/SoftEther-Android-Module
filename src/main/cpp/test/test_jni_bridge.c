@@ -359,3 +359,13 @@ JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_na
     
     return create_test_result(env, &result);
 }
+
+JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestRudpTransportLoopback(
+    JNIEnv *env, jobject thiz) {
+    
+    LOGD("nativeTestRudpTransportLoopback called");
+    
+    native_test_result_t result = test_rudp_transport_loopback();
+    
+    return create_test_result(env, &result);
+}

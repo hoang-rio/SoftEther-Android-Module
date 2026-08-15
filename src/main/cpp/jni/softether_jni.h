@@ -40,6 +40,11 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetSocketFd(
     JNIEnv *env, jobject thiz, jlong handle);
 
+// NAT-T RUDP transport UDP socket (for VpnService.protect()); -1 when the
+// connection is not running over the NAT-T transport.
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetNatTUdpSocketFd(
+    JNIEnv *env, jobject thiz, jlong handle);
+
 // Multi-connection support
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetMaxConnection(
     JNIEnv *env, jobject thiz, jlong handle, jint maxConnections);
@@ -84,6 +89,12 @@ JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_na
 JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestFullLifecycle(
     JNIEnv *env, jobject thiz, jstring host, jint port,
     jstring username, jstring password, jint timeoutMs);
+
+JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestRudpV2Loopback(
+    JNIEnv *env, jobject thiz);
+
+JNIEXPORT jobject JNICALL Java_vn_unlimit_softether_test_NativeConnectionTest_nativeTestRudpTransportLoopback(
+    JNIEnv *env, jobject thiz);
 
 #ifdef __cplusplus
 }

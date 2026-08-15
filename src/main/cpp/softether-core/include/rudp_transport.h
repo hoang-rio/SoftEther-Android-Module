@@ -67,6 +67,11 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
 // App-facing byte-stream fd (valid after a successful connect). -1 otherwise.
 int rudp_transport_get_fd(rudp_transport_t* t);
 
+// UDP socket used by the transport session (valid after connect returns 0,
+// and during the whole established session). -1 otherwise. The caller must
+// VpnService.protect() this fd so the RUDP/NAT-T traffic bypasses the TUN.
+int rudp_transport_get_udp_fd(rudp_transport_t* t);
+
 // Last error code (RUDP_T_ERR_*).
 int rudp_transport_get_error(rudp_transport_t* t);
 

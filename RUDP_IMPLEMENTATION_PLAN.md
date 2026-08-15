@@ -208,7 +208,7 @@ App layer (`app/`):
 - [x] Add `Ipv6Ula.kt` shared util: per-install ULA (`fd00::<ANDROID_ID hex>`), reuses the native `softether_vpn` pref so all protocols share one address
 - [x] Apply dual-stack IPv6 defaults consistently for OpenVPN and SSTP in `DetailActivity.kt` / `ServerActivity.kt` (ULA + `::/0`; mirror the SoftEther `ConnectionConfig` IPv6 fields)
 
-### Phase 12: NAT-T Transport for UDP-only (CGNAT) Servers (🔄 In Progress — Native Core Done, Validated vs Live Relay)
+### Phase 12: NAT-T Transport for UDP-only (CGNAT) Servers (🔄 In Progress — Native Core + Wiring Done, Tests Landing)
 
 > **Status (2026-08-14):** native core is implemented (`softether_pack.c`, `softether_nat_t.c`, `rudp_transport.c`, bridge + `softether_protocol.c` integration) and the full chain was validated against **live public servers** on a network without UDP filtering:
 > - Real registrar UDP **5004** reachable; shard hostname `x6.xc.dev.servers.nat-traversal.softether-network.net.` resolves to `130.158.6.x`.
@@ -238,21 +238,21 @@ Native core (`src/main/cpp/softether-core/`):
 - [x] R-UDP **transport session** in `src/proto/rudp_transport.c` + `include/rudp_transport.h` (distinct from the existing acceleration context): `rudp_transport_create/connect` with CONNECT_SENT → ESTABLISHED; CONNECT + 200 ms resend; SHA1 key derivation; ACK/ACK2 validation; segment framing/retransmit/window reusing the V1 (RC4/SHA1) and V2 (ChaCha20-Poly1305) crypto in `softether_rudp.c`; byte-stream API `rudp_transport_get_fd` + fifo + keepalive (minimal client subset of upstream `RUDP_SESSION` — `RUDPNewSession`/`RUDPSendSegmentNow`/`RUDPCheckSignOfRecvPacket` in `SoftEtherVPN_Stable/src/Mayaqua/Network.c`); validated vs real public server → ESTABLISHED `rc=0`
 - [x] Socketpair + bridge thread inside `rudp_transport.c`: `socketpair(AF_UNIX, SOCK_STREAM)` with a pump thread moving transport↔fd (`rt_pump_recv_to_pair`/`rt_pump_pair_to_send`); **TLS/HTTP-CONNECT/PACK-login run unchanged** (`SSL_set_fd`, `aes_wrapper.c:303`; teardown stops the bridge thread, fdsan-safe)
 - [x] Transport-mode integration in `src/proto/softether_protocol.c`: `softether_try_nat_t_connect` skips the TCP connect and wires `conn->socket_fd = rudp_transport_get_fd(...)` with `conn->using_nat_t` + `conn->nat_t_transport` (destroyed on disconnect); `softether_reconnect` made transport-aware
-- [ ] JNI (`jni/softether_jni.c`/`.h`, symbol-export binding): pass transport mode/fallback flag through `nativeConnectWithHub` (or a new `nativeConnectNatT`); expose fd accessors for `VpnService.protect()` — relay UDP fd, transport UDP fd, bridge fd (reuse the `nativeGetRudpSocketFd` pattern at `softether_jni.c:296`)
+- [x] JNI (`jni/softether_jni.c`/`.h`, symbol-export binding): new `nativeGetNatTUdpSocketFd` exposing `rudp_transport_get_udp_fd` (the socket the RUDP session runs over) for `VpnService.protect()` — the bridge fd is already covered by `nativeGetSocketFd`/`softether_get_active_socket_fds` during NAT-T, so no new bridge accessor was needed. **Decision: no `fallbackToNatT` flag / no new `nativeConnectNatT` signature** — the fallback is **automatic** in the core (`softether_try_nat_t_connect` is retried by the caller only on `ERR_TCP_CONNECT`; see item 244), so the JNI surface stayed additive-only
 
 Kotlin submodule (`SoftEtherClient/src/main/java/vn/unlimit/softether/`):
-- [ ] `model/ConnectionConfig.kt`: add `fallbackToNatT: Boolean = false` (parcelled + written), alongside existing `useTcp`/`useUdp` (line 38-39)
-- [ ] `controller/ConnectionController.kt`: pass the mode in `performConnect`/`attemptReconnect`; protect the new NAT-T/transport/bridge fds next to the existing protect sites (351, 361, 789, 799) and `protectAdditionalSockets` (1021-1033)
+- [x] `model/ConnectionConfig.kt`: **deliberately no `fallbackToNatT` flag** — the core already falls back to NAT-T automatically whenever the direct TCP/TLS connect fails with `ERR_TCP_CONNECT` (`softether_protocol.c:1644-1648`), so an app-level flag would be dead configuration. The app only needs the fd-protect wiring (next item) and the `isUdpOnly` UI label; the UDP-only connect request itself is a normal `nativeConnectWithHub` (the transport targets the server **IP**, rendezvous by IP)
+- [x] `controller/ConnectionController.kt`: protect the NAT-T transport UDP fd (`nativeGetNatTUdpSocketFd`) at all three sites — `performConnect`/connect, `attemptReconnect`, and `protectAdditionalSockets` (guarded by the `protectedFds` set) — so RUDP/NAT-T traffic bypasses the TUN (without `VpnService.protect()` on this fd the packets loop through the TUN and the transport dies)
 
 App layer (parent repo `app/`):
-- [ ] `models/VPNGateConnection.kt`: `val isUdpOnly get() = seTcpPort <= 0 && seUdpPort > 0` (derivable — no Room schema change); mirror on `models/VPNGateItem.kt` / `models/PaidServer.kt`
-- [ ] `activities/DetailActivity.kt` / `activities/paid/ServerActivity.kt` / `fragment/StatusFragment.kt`: when `isUdpOnly`, build `ConnectionConfig` with `fallbackToNatT=true` (port is a placeholder — the transport targets the server **IP**, rendezvous by IP; use `seUdpPort` or 443)
-- [ ] `dialog/VpnProtocolSelectionDialog.kt`: label the SoftEther UDP card "UDP (NAT-T)" for `isUdpOnly` rows
+- [x] `models/VPNGateConnection.kt`: `val isUdpOnly get() = seTcpPort <= 0 && seUdpPort > 0` (derivable — no Room schema change); mirrored on `models/VPNGateItem.kt` / `models/PaidServer.kt`
+- [x] `activities/DetailActivity.kt` / `activities/paid/ServerActivity.kt` / `fragment/StatusFragment.kt`: when `isUdpOnly`, the connect request uses `seUdpPort` (falling back to `udpPort`) as a placeholder — the transport targets the server **IP**, rendezvous by IP, and the core retries via NAT-T automatically on TCP failure. No app-level mode flag required (see item above)
+- [x] `dialog/VpnProtocolSelectionDialog.kt`: the SoftEther UDP card is labelled "UDP (NAT-T)" for `isUdpOnly` rows (`@string/softether_vpn_udp_natt`, EN + VI)
 
 Testing:
 - [x] NAT-T rendezvous against the live relay — deterministic request, verified `ok=1` + `result_ip`/`result_port` parsing and `nat_t_not_found` for offline nodes (network-gated; ran from a non-filtering network 2026-08-14)
 - [x] Live UDP-only server connect: rendezvous for `211.21.159.81` → relay returned `result_port=11335` → RUDP transport **ESTABLISHED `rc=0`** (ran twice)
-- [ ] Native loopback: `test_rudp_transport_loopback` — CONNECT → ESTABLISHED → bidirectional data between a client and a minimal transport-server in `test/native_test.c` (mirror `test12RudpV2Loopback` pattern, `NativeConnectionTest#test12RudpV2Loopback`)
+- [x] Native loopback: `test_rudp_transport_loopback` in `test/native_test.c` — CONNECT → ESTABLISHED → bidirectional data + keepalive tick echo → corrupt packet dropped and session recovered, exercising `rudp_transport_get_udp_fd`; wired through `nativeTestRudpTransportLoopback` (`test/test_jni_bridge.c`) + `NativeConnectionTest#test13RudpTransportLoopback`. Passes on host (5/5 runs); note the first CONNECT-response segment **must carry a payload** (the client only registers segments with payloads in its receive window — an empty seq-1 stalls the drain)
 - [ ] Forced NAT-T connect to the paid server `59.6.114.202` (credentials available) to validate TLS + login over R-UDP end-to-end when a mapping exists
 - [ ] On-device instrumentation: new `NativeConnectionTest` cases + full regression suite
 

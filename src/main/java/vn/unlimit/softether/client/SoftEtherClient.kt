@@ -283,6 +283,7 @@ class SoftEtherClient {
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
     external fun nativeGetSocketFd(handle: Long): Int
     external fun nativeGetRudpSocketFd(handle: Long): Int
+    external fun nativeGetNatTUdpSocketFd(handle: Long): Int
     external fun nativeDoDhcp(handle: Long): IntArray?
     external fun nativeSetAuthType(handle: Long, authType: Int)
     external fun nativeSetMaxConnection(handle: Long, maxConnections: Int)

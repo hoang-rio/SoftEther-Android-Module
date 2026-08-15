@@ -974,6 +974,11 @@ int rudp_transport_get_fd(rudp_transport_t* t) {
     return t->app_fd;
 }
 
+int rudp_transport_get_udp_fd(rudp_transport_t* t) {
+    if (t == NULL) return -1;
+    return t->udp_fd;
+}
+
 int rudp_transport_get_error(rudp_transport_t* t) {
     if (t == NULL) return RUDP_T_ERR_UNKNOWN;
     return t->error_code;

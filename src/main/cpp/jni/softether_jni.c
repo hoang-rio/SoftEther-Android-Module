@@ -303,6 +303,16 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGe
     return -1;
 }
 
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetNatTUdpSocketFd(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return -1;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    if (conn->using_nat_t && conn->nat_t_transport != NULL) {
+        return rudp_transport_get_udp_fd(conn->nat_t_transport);
+    }
+    return -1;
+}
+
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetOption(
     JNIEnv *env, jobject thiz, jlong handle, jint option, jlong value) {
     LOGD("nativeSetOption called: option=%d, value=%ld", option, (long)value);

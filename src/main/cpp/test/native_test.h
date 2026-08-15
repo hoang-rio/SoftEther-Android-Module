@@ -42,6 +42,7 @@ native_test_result_t test_full_lifecycle(const native_test_config_t* config);
 native_test_result_t test_dhcp(const native_test_config_t* config);
 native_test_result_t test_internet_connectivity(const native_test_config_t* config);
 native_test_result_t test_rudp_v2_loopback(void);
+native_test_result_t test_rudp_transport_loopback(void);
 
 // Utility functions
 void test_result_init(native_test_result_t* result, bool success, int error_code, 
