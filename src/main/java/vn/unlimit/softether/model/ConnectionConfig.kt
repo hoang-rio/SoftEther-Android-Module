@@ -37,6 +37,8 @@ data class ConnectionConfig(
     val isMetered: Boolean = false,
     val useTcp: Boolean = true,
     val useUdp: Boolean = false,
+    val udpPort: Int = 0, // SoftEther UDP port (seUdpPort); enables the direct R-UDP stage
+    val udpOnly: Boolean = false, // seTcpPort <= 0; skips the doomed direct-TCP attempt
     val connectTimeoutMs: Int = 30000,
     val keepAliveIntervalMs: Int = 60000,
     val country: String = "",
@@ -69,6 +71,8 @@ data class ConnectionConfig(
         isMetered = parcel.readByte() != 0.toByte(),
         useTcp = parcel.readByte() != 0.toByte(),
         useUdp = parcel.readByte() != 0.toByte(),
+        udpPort = parcel.readInt(),
+        udpOnly = parcel.readByte() != 0.toByte(),
         connectTimeoutMs = parcel.readInt(),
         keepAliveIntervalMs = parcel.readInt(),
         country = parcel.readString() ?: "",
@@ -101,6 +105,8 @@ data class ConnectionConfig(
         parcel.writeByte(if (isMetered) 1 else 0)
         parcel.writeByte(if (useTcp) 1 else 0)
         parcel.writeByte(if (useUdp) 1 else 0)
+        parcel.writeInt(udpPort)
+        parcel.writeByte(if (udpOnly) 1 else 0)
         parcel.writeInt(connectTimeoutMs)
         parcel.writeInt(keepAliveIntervalMs)
         parcel.writeString(country)

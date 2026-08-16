@@ -337,6 +337,14 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
             // TODO: Implement MTU setting
             LOGD("Set MTU to %ld", (long)value);
             break;
+        case 4: // OPTION_UDP_PORT (seUdpPort) — enables the direct R-UDP stage
+            conn->udp_port = (int)value;
+            LOGD("Set UDP port to %d", conn->udp_port);
+            break;
+        case 5: // OPTION_UDP_ONLY — skip the doomed direct-TCP attempt
+            conn->udp_only = (int)value;
+            LOGD("Set UDP-only to %d", conn->udp_only);
+            break;
         default:
             LOGE("Unknown option: %d", option);
             break;

@@ -135,6 +135,10 @@ typedef struct softether_connection {
     // fails — reaches servers behind NAT/CGNAT via the SoftEther relay).
     rudp_transport_t* nat_t_transport;
     int using_nat_t;  // 1 if the primary connection runs over the transport
+    int udp_port;     // advertised SoftEther UDP port (seUdpPort), 0 if none;
+                      // when >0 a direct R-UDP attempt precedes the NAT-T relay
+    int udp_only;     // 1 if the server advertises no TCP port (seTcpPort <= 0);
+                      // skips the doomed direct-TCP attempt
     uint32_t rudp_server_cookie;
     uint32_t rudp_client_cookie;
     uint8_t rudp_server_key[128];

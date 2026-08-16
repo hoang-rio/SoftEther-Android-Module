@@ -315,6 +315,8 @@ class SoftEtherClient {
         const val OPTION_TIMEOUT = 1
         const val OPTION_KEEPALIVE_INTERVAL = 2
         const val OPTION_MTU = 3
+        const val OPTION_UDP_PORT = 4
+        const val OPTION_UDP_ONLY = 5
         
         // Default hub name for VPNGate servers
         const val DEFAULT_HUB_NAME = "VPN"

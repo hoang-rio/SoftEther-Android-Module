@@ -1528,6 +1528,50 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
     return ERR_NONE;
 }
 
+// Establish the primary connection over a direct R-UDP session to the server's
+// advertised SoftEther UDP port (seUdpPort), without the NAT-T relay. Works
+// for nodes whose UDP port is publicly routable (public IP or port-forward).
+// Mirrors softether_try_nat_t_connect's success handling: conn->socket_fd
+// becomes the transport's byte-stream fd and the transport is stored in
+// conn->nat_t_transport for unified cleanup.
+static int softether_try_direct_udp_connect(softether_connection_t* conn,
+                                            const char* resolved_ip, int port) {
+    struct in_addr ip4;
+
+    if (inet_pton(AF_INET, resolved_ip, &ip4) != 1) {
+        LOGE("Direct R-UDP requires an IPv4 server address (got %s)", resolved_ip);
+        return ERR_TCP_CONNECT;
+    }
+
+    LOGD("Direct R-UDP connect to %s:%d ...", resolved_ip, port);
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        LOGE("Failed to allocate RUDP transport");
+        return ERR_TCP_CONNECT;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = ip4.s_addr;         // network byte order
+    cfg.server_port = (uint16_t)port;   // host byte order
+    cfg.udp_fd = -1;
+    cfg.connect_timeout_ms = (uint32_t)conn->timeout_ms;
+
+    if (rudp_transport_connect(tr, &cfg) != 0) {
+        LOGE("Direct R-UDP connect to %s:%d failed: %d", resolved_ip, port,
+             rudp_transport_get_error(tr));
+        rudp_transport_destroy(tr);
+        return ERR_TCP_CONNECT;
+    }
+
+    conn->nat_t_transport = tr;
+    conn->using_nat_t = 1;
+    conn->socket_fd = rudp_transport_get_fd(tr);
+    LOGD("Direct R-UDP session established to %s:%d (fd=%d)", resolved_ip, port,
+         conn->socket_fd);
+    return ERR_NONE;
+}
+
 // Connect with HubName
 int softether_connect_with_hub(softether_connection_t* conn, const char* host, int port,
                                const char* username, const char* password, const char* hub_name,
@@ -1620,8 +1664,15 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         LOGD("SOFTETHER_FORCE_NAT_T set - skipping TCP, forcing NAT-T fallback");
     }
 
+    // UDP-only servers advertise no TCP port, so the direct-TCP attempt would
+    // always fail (often after a SYN timeout). Skip straight to the transport
+    // fallbacks (direct R-UDP, then NAT-T relay).
+    if (conn->udp_only) {
+        LOGD("UDP-only server (seTcpPort=0) - skipping TCP, trying direct R-UDP / NAT-T");
+    }
+
     // Create TCP socket and connect
-    softether_socket_t* sock = force_nat_t ? NULL : socket_create(SOCKET_TYPE_TCP);
+    softether_socket_t* sock = (force_nat_t || conn->udp_only) ? NULL : socket_create(SOCKET_TYPE_TCP);
     int tcp_ok = 0;
     if (sock != NULL) {
         if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
@@ -1698,23 +1749,44 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         result = ERR_TCP_CONNECT;
     }
 
-    // NAT-T + RUDP fallback: direct TCP (or TLS) failed. Reach the server via
-    // the SoftEther relay + RUDP transport (works behind NAT/CGNAT).
+    // Transport fallbacks: direct TCP (or TLS) failed. First try a direct R-UDP
+    // session to the advertised SoftEther UDP port (seUdpPort) — reaches
+    // UDP-only nodes whose UDP port is publicly routable without any relay.
     if (result != ERR_NONE) {
-        LOGD("Direct TCP/TLS connect failed (%d); trying NAT-T + RUDP fallback", result);
-        result = softether_try_nat_t_connect(conn, host, resolved_ip, port);
-        if (result == ERR_NONE) {
-            // TLS handshake over the RUDP transport (SNI still the real host)
-            result = perform_tls_handshake(conn, connect_host);
-            if (result != ERR_NONE) {
-                LOGE("TLS handshake failed over RUDP transport");
-                softether_disconnect(conn);
+        if (conn->udp_port > 0) {
+            LOGD("Direct TCP/TLS connect failed (%d); trying direct R-UDP to %s:%d",
+                 result, resolved_ip, conn->udp_port);
+            result = softether_try_direct_udp_connect(conn, resolved_ip, conn->udp_port);
+            if (result == ERR_NONE) {
+                // TLS handshake over the R-UDP transport (SNI still the real host)
+                result = perform_tls_handshake(conn, connect_host);
+                if (result != ERR_NONE) {
+                    LOGE("TLS handshake failed over direct R-UDP transport");
+                    softether_disconnect(conn);
+                    return result;
+                }
+                LOGD("Connected via direct R-UDP transport");
+            }
+        }
+
+        // NAT-T + RUDP fallback: direct UDP/TCP (or TLS) failed. Reach the
+        // server via the SoftEther relay + RUDP transport (works behind NAT/CGNAT).
+        if (result != ERR_NONE) {
+            LOGD("Direct UDP/TCP connect failed (%d); trying NAT-T + RUDP fallback", result);
+            result = softether_try_nat_t_connect(conn, host, resolved_ip, port);
+            if (result == ERR_NONE) {
+                // TLS handshake over the RUDP transport (SNI still the real host)
+                result = perform_tls_handshake(conn, connect_host);
+                if (result != ERR_NONE) {
+                    LOGE("TLS handshake failed over RUDP transport");
+                    softether_disconnect(conn);
+                    return result;
+                }
+                LOGD("Connected via NAT-T + RUDP transport");
+            } else {
+                conn->state = STATE_DISCONNECTED;
                 return result;
             }
-            LOGD("Connected via NAT-T + RUDP transport");
-        } else {
-            conn->state = STATE_DISCONNECTED;
-            return result;
         }
     }
 

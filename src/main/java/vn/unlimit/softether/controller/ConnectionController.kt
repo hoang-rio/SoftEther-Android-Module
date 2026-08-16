@@ -263,6 +263,18 @@ class ConnectionController(
         // Set timeout
         client.setTimeout(config.connectTimeoutMs)
 
+        // Enable the direct R-UDP stage (UDP-only servers reachable without relay)
+        if (config.udpPort > 0) {
+            client.nativeSetOption(nativeHandle, SoftEtherClient.OPTION_UDP_PORT, config.udpPort.toLong())
+            Log.d(TAG, "Direct R-UDP stage enabled (udpPort=${config.udpPort})")
+        }
+
+        // UDP-only servers have no TCP port — skip the doomed direct-TCP attempt
+        if (config.udpOnly) {
+            client.nativeSetOption(nativeHandle, SoftEtherClient.OPTION_UDP_ONLY, 1L)
+            Log.d(TAG, "UDP-only server: skipping direct TCP attempt")
+        }
+
         currentState = ConnectionState.TLS_HANDSHAKE
 
         // Connect to server with hub name (includes TLS handshake, protocol handshake, auth, session setup)
