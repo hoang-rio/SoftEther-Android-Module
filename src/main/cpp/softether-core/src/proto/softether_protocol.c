@@ -1720,7 +1720,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         }
         socket_destroy(sock);
     } else {
-        if (!force_nat_t) {
+        if (!force_nat_t && !conn->udp_only) {
             LOGE("Failed to create socket");
         }
     }
@@ -1754,8 +1754,13 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     // UDP-only nodes whose UDP port is publicly routable without any relay.
     if (result != ERR_NONE) {
         if (conn->udp_port > 0) {
-            LOGD("Direct TCP/TLS connect failed (%d); trying direct R-UDP to %s:%d",
-                 result, resolved_ip, conn->udp_port);
+            if (conn->udp_only) {
+                LOGD("TCP skipped (UDP-only server, seTcpPort=0); trying direct R-UDP to %s:%d",
+                     resolved_ip, conn->udp_port);
+            } else {
+                LOGD("Direct TCP/TLS connect failed (%d); trying direct R-UDP to %s:%d",
+                     result, resolved_ip, conn->udp_port);
+            }
             result = softether_try_direct_udp_connect(conn, resolved_ip, conn->udp_port);
             if (result == ERR_NONE) {
                 // TLS handshake over the R-UDP transport (SNI still the real host)
