@@ -1489,7 +1489,7 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
     LOGD("NAT-T rendezvous for %s:%d ...", resolved_ip, port);
     softether_nat_t_result_t nr;
     memset(&nr, 0, sizeof(nr));
-    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, (uint32_t)conn->timeout_ms, &nr) != 0) {
+    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, (uint32_t)conn->timeout_ms, &nr, NULL) != 0) {
         LOGE("NAT-T rendezvous failed: error=%d", nr.error_code);
         return ERR_TCP_CONNECT;
     }
@@ -1516,7 +1516,7 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
     cfg.udp_fd = nr.same_lan ? -1 : nr.udp_fd;
     cfg.connect_timeout_ms = (uint32_t)conn->timeout_ms;
 
-    if (rudp_transport_connect(tr, &cfg) != 0) {
+    if (rudp_transport_connect(tr, &cfg, NULL) != 0) {
         LOGE("RUDP transport connect failed: %d", rudp_transport_get_error(tr));
         rudp_transport_destroy(tr);
         return ERR_TCP_CONNECT;
@@ -1557,7 +1557,7 @@ static int softether_try_direct_udp_connect(softether_connection_t* conn,
     cfg.udp_fd = -1;
     cfg.connect_timeout_ms = (uint32_t)conn->timeout_ms;
 
-    if (rudp_transport_connect(tr, &cfg) != 0) {
+    if (rudp_transport_connect(tr, &cfg, NULL) != 0) {
         LOGE("Direct R-UDP connect to %s:%d failed: %d", resolved_ip, port,
              rudp_transport_get_error(tr));
         rudp_transport_destroy(tr);
@@ -1570,6 +1570,647 @@ static int softether_try_direct_udp_connect(softether_connection_t* conn,
     LOGD("Direct R-UDP session established to %s:%d (fd=%d)", resolved_ip, port,
          conn->socket_fd);
     return ERR_NONE;
+}
+
+// ============================================================================
+// Phase 12B: Parallel transport race
+// ============================================================================
+// Races multiple transports concurrently (matching the official client's
+// ConnectEx4 at Mayaqua/Network.c:16287). Each transport runs in its own
+// thread with a staggered delay. The first to complete a successful TLS
+// handshake claims the result; losing threads cancel and clean up.
+
+// Per-thread context for the parallel transport race.
+typedef struct {
+    int transport_type;             // TRANSPORT_*
+    const char* host;               // original hostname (for NAT-T relay)
+    const char* resolved_ip;        // resolved server IP
+    int port;                       // server TCP port
+    const char* connect_host;       // hostname for TLS SNI
+    uint32_t timeout_ms;            // per-transport connect timeout
+    int udp_port;                   // seUdpPort (for TRANSPORT_RUDP_DIRECT)
+    const volatile int* cancel_flag; // shared cancel flag
+
+    // Output (written by thread, read by main after join)
+    transport_result_t result;
+} transport_thread_ctx_t;
+
+// Staggered delay per transport type (milliseconds).
+static uint32_t transport_delay_ms(int type) {
+    switch (type) {
+        case TRANSPORT_TCP:        return TRANSPORT_DELAY_TCP_MS;
+        case TRANSPORT_RUDP_DIRECT: return TRANSPORT_DELAY_RUDP_MS;
+        case TRANSPORT_NATT:       return TRANSPORT_DELAY_NATT_MS;
+        case TRANSPORT_DNS:        return TRANSPORT_DELAY_DNS_MS;
+        case TRANSPORT_ICMP:       return TRANSPORT_DELAY_ICMP_MS;
+        default:                   return 0;
+    }
+}
+
+static const char* transport_name(int type) {
+    switch (type) {
+        case TRANSPORT_TCP:        return "TCP";
+        case TRANSPORT_RUDP_DIRECT: return "RUDP_DIRECT";
+        case TRANSPORT_NATT:       return "NAT-T";
+        case TRANSPORT_DNS:        return "DNS";
+        case TRANSPORT_ICMP:       return "ICMP";
+        default:                   return "UNKNOWN";
+    }
+}
+
+// Thread function for TCP transport (p1 in official client).
+// Creates a TCP socket, connects, does TLS handshake.
+static void* transport_thread_tcp(void* arg) {
+    transport_thread_ctx_t* ctx = (transport_thread_ctx_t*)arg;
+    transport_result_t* r = &ctx->result;
+    memset(r, 0, sizeof(*r));
+    r->transport_type = TRANSPORT_TCP;
+    r->socket_fd = -1;
+
+    // Staggered delay
+    uint32_t delay = transport_delay_ms(TRANSPORT_TCP);
+    if (delay > 0) {
+        struct timespec ts = { delay / 1000, (delay % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled before start", transport_name(TRANSPORT_TCP));
+        return NULL;
+    }
+
+    LOGD("[%s] attempting connect to %s:%d", transport_name(TRANSPORT_TCP),
+         ctx->connect_host, ctx->port);
+
+    // Create TCP socket
+    softether_socket_t* sock = socket_create(SOCKET_TYPE_TCP);
+    if (sock == NULL) {
+        LOGD("[%s] failed to create socket", transport_name(TRANSPORT_TCP));
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // Connect (with timeout)
+    if (socket_connect_timeout(sock, ctx->connect_host, ctx->port, ctx->timeout_ms) != 0) {
+        LOGD("[%s] connect failed", transport_name(TRANSPORT_TCP));
+        socket_destroy(sock);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    int fd = sock->fd;
+    sock->fd = -1;  // take ownership
+    socket_destroy(sock);
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled after connect", transport_name(TRANSPORT_TCP));
+        close(fd);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // TLS handshake
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL) {
+        LOGE("[%s] failed to create SSL context", transport_name(TRANSPORT_TCP));
+        close(fd);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    if (ssl_connect(ssl_ctx, fd, ctx->connect_host) != 0) {
+        LOGD("[%s] TLS handshake failed", transport_name(TRANSPORT_TCP));
+        ssl_destroy(ssl_ctx);
+        close(fd);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    // Try to claim winner
+    if (__sync_bool_compare_and_swap(&r->finished, 0, 1)) {
+        r->ok = 1;
+        r->socket_fd = fd;
+        r->ssl_ctx = ssl_ctx;
+        r->ssl = ssl_ctx;
+        LOGD("[%s] CONNECTED fd=%d", transport_name(TRANSPORT_TCP), fd);
+    } else {
+        // Lost the race — clean up
+        LOGD("[%s] lost race, cleaning up", transport_name(TRANSPORT_TCP));
+        ssl_destroy(ssl_ctx);
+        close(fd);
+    }
+    return NULL;
+}
+
+// Thread function for direct R-UDP transport.
+// Creates an R-UDP transport session to ip:seUdpPort (no relay).
+static void* transport_thread_rudp_direct(void* arg) {
+    transport_thread_ctx_t* ctx = (transport_thread_ctx_t*)arg;
+    transport_result_t* r = &ctx->result;
+    memset(r, 0, sizeof(*r));
+    r->transport_type = TRANSPORT_RUDP_DIRECT;
+
+    if (ctx->udp_port <= 0) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // Staggered delay
+    uint32_t delay = transport_delay_ms(TRANSPORT_RUDP_DIRECT);
+    if (delay > 0) {
+        struct timespec ts = { delay / 1000, (delay % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled before start", transport_name(TRANSPORT_RUDP_DIRECT));
+        return NULL;
+    }
+
+    struct in_addr ip4;
+    if (inet_pton(AF_INET, ctx->resolved_ip, &ip4) != 1) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    LOGD("[%s] attempting connect to %s:%d", transport_name(TRANSPORT_RUDP_DIRECT),
+         ctx->resolved_ip, ctx->udp_port);
+
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = ip4.s_addr;
+    cfg.server_port = (uint16_t)ctx->udp_port;
+    cfg.udp_fd = -1;
+    cfg.connect_timeout_ms = ctx->timeout_ms;
+
+    if (rudp_transport_connect(tr, &cfg, ctx->cancel_flag) != 0) {
+        LOGD("[%s] R-UDP connect failed", transport_name(TRANSPORT_RUDP_DIRECT));
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    if (*ctx->cancel_flag) {
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // TLS handshake over the R-UDP transport
+    int fd = rudp_transport_get_fd(tr);
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL || ssl_connect(ssl_ctx, fd, ctx->connect_host) != 0) {
+        LOGD("[%s] TLS handshake failed", transport_name(TRANSPORT_RUDP_DIRECT));
+        if (ssl_ctx) ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    // Try to claim winner
+    if (__sync_bool_compare_and_swap(&r->finished, 0, 1)) {
+        r->ok = 1;
+        r->socket_fd = fd;
+        r->ssl_ctx = ssl_ctx;
+        r->ssl = ssl_ctx;
+        r->transport = tr;
+        LOGD("[%s] CONNECTED fd=%d", transport_name(TRANSPORT_RUDP_DIRECT), fd);
+    } else {
+        LOGD("[%s] lost race, cleaning up", transport_name(TRANSPORT_RUDP_DIRECT));
+        ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+    }
+    return NULL;
+}
+
+// Thread function for NAT-T relay transport (p2 in official client).
+// Does NAT-T rendezvous, then R-UDP transport, then TLS.
+static void* transport_thread_natt(void* arg) {
+    transport_thread_ctx_t* ctx = (transport_thread_ctx_t*)arg;
+    transport_result_t* r = &ctx->result;
+    memset(r, 0, sizeof(*r));
+    r->transport_type = TRANSPORT_NATT;
+
+    // Staggered delay
+    uint32_t delay = transport_delay_ms(TRANSPORT_NATT);
+    if (delay > 0) {
+        struct timespec ts = { delay / 1000, (delay % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled before start", transport_name(TRANSPORT_NATT));
+        return NULL;
+    }
+
+    struct in_addr ip4;
+    if (inet_pton(AF_INET, ctx->resolved_ip, &ip4) != 1) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    LOGD("[%s] attempting rendezvous for %s", transport_name(TRANSPORT_NATT),
+         ctx->resolved_ip);
+
+    // NAT-T rendezvous
+    softether_nat_t_result_t nr;
+    memset(&nr, 0, sizeof(nr));
+    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, ctx->timeout_ms, &nr,
+                      ctx->cancel_flag) != 0) {
+        LOGD("[%s] rendezvous failed: error=%d", transport_name(TRANSPORT_NATT),
+             nr.error_code);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    if (*ctx->cancel_flag) {
+        if (nr.udp_fd >= 0) close(nr.udp_fd);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // R-UDP transport session
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        if (nr.udp_fd >= 0) close(nr.udp_fd);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = nr.result_ip;
+    cfg.server_port = nr.result_port;
+    cfg.udp_fd = nr.same_lan ? -1 : nr.udp_fd;
+    cfg.connect_timeout_ms = ctx->timeout_ms;
+
+    if (rudp_transport_connect(tr, &cfg, ctx->cancel_flag) != 0) {
+        LOGD("[%s] R-UDP transport connect failed", transport_name(TRANSPORT_NATT));
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    if (*ctx->cancel_flag) {
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // TLS handshake over the R-UDP transport
+    int fd = rudp_transport_get_fd(tr);
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL || ssl_connect(ssl_ctx, fd, ctx->connect_host) != 0) {
+        LOGD("[%s] TLS handshake failed", transport_name(TRANSPORT_NATT));
+        if (ssl_ctx) ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    // Try to claim winner
+    if (__sync_bool_compare_and_swap(&r->finished, 0, 1)) {
+        r->ok = 1;
+        r->socket_fd = fd;
+        r->ssl_ctx = ssl_ctx;
+        r->ssl = ssl_ctx;
+        r->transport = tr;
+        LOGD("[%s] CONNECTED fd=%d", transport_name(TRANSPORT_NATT), fd);
+    } else {
+        LOGD("[%s] lost race, cleaning up", transport_name(TRANSPORT_NATT));
+        ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+    }
+    return NULL;
+}
+
+// Thread function for DNS transport (over DNS TXT queries to port 53).
+// Matches the official client's p4 = DNS path (Network.c:16228).
+static void* transport_thread_dns(void* arg) {
+    transport_thread_ctx_t* ctx = (transport_thread_ctx_t*)arg;
+    transport_result_t* r = &ctx->result;
+    memset(r, 0, sizeof(*r));
+    r->transport_type = TRANSPORT_DNS;
+
+    // Staggered delay
+    uint32_t delay = transport_delay_ms(TRANSPORT_DNS);
+    if (delay > 0) {
+        struct timespec ts = { delay / 1000, (delay % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled before start", transport_name(TRANSPORT_DNS));
+        return NULL;
+    }
+
+    struct in_addr ip4;
+    if (inet_pton(AF_INET, ctx->resolved_ip, &ip4) != 1) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    LOGD("[%s] attempting connect to %s:53", transport_name(TRANSPORT_DNS),
+         ctx->resolved_ip);
+
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = ip4.s_addr;
+    cfg.server_port = 53;  // DNS standard port
+    cfg.udp_fd = -1;
+    cfg.connect_timeout_ms = ctx->timeout_ms;
+    cfg.transport_mode = RUDP_T_MODE_DNS;
+
+    if (rudp_transport_connect(tr, &cfg, ctx->cancel_flag) != 0) {
+        LOGD("[%s] R-UDP connect failed", transport_name(TRANSPORT_DNS));
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    if (*ctx->cancel_flag) {
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // TLS handshake over the DNS transport
+    int fd = rudp_transport_get_fd(tr);
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL || ssl_connect(ssl_ctx, fd, ctx->connect_host) != 0) {
+        LOGD("[%s] TLS handshake failed", transport_name(TRANSPORT_DNS));
+        if (ssl_ctx) ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    // Try to claim winner
+    if (__sync_bool_compare_and_swap(&r->finished, 0, 1)) {
+        r->ok = 1;
+        r->socket_fd = fd;
+        r->ssl_ctx = ssl_ctx;
+        r->ssl = ssl_ctx;
+        r->transport = tr;
+        LOGD("[%s] CONNECTED fd=%d", transport_name(TRANSPORT_DNS), fd);
+    } else {
+        LOGD("[%s] lost race, cleaning up", transport_name(TRANSPORT_DNS));
+        ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+    }
+    return NULL;
+}
+
+// Thread function for ICMP transport (over ICMP Echo, requires root).
+// Matches the official client's p3 = ICMP path (Network.c:16228).
+static void* transport_thread_icmp(void* arg) {
+    transport_thread_ctx_t* ctx = (transport_thread_ctx_t*)arg;
+    transport_result_t* r = &ctx->result;
+    memset(r, 0, sizeof(*r));
+    r->transport_type = TRANSPORT_ICMP;
+
+    // Staggered delay
+    uint32_t delay = transport_delay_ms(TRANSPORT_ICMP);
+    if (delay > 0) {
+        struct timespec ts = { delay / 1000, (delay % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+
+    if (*ctx->cancel_flag) {
+        LOGD("[%s] cancelled before start", transport_name(TRANSPORT_ICMP));
+        return NULL;
+    }
+
+    struct in_addr ip4;
+    if (inet_pton(AF_INET, ctx->resolved_ip, &ip4) != 1) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    LOGD("[%s] attempting connect to %s (raw ICMP)", transport_name(TRANSPORT_ICMP),
+         ctx->resolved_ip);
+
+    rudp_transport_t* tr = rudp_transport_create();
+    if (tr == NULL) {
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    rudp_transport_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.server_ip = ip4.s_addr;
+    cfg.server_port = 0;  // ICMP has no port
+    cfg.udp_fd = -1;
+    cfg.connect_timeout_ms = ctx->timeout_ms;
+    cfg.transport_mode = RUDP_T_MODE_ICMP;
+
+    if (rudp_transport_connect(tr, &cfg, ctx->cancel_flag) != 0) {
+        LOGD("[%s] R-UDP connect failed (no root?)", transport_name(TRANSPORT_ICMP));
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    if (*ctx->cancel_flag) {
+        rudp_transport_destroy(tr);
+        r->error = ERR_TCP_CONNECT;
+        return NULL;
+    }
+
+    // TLS handshake over the ICMP transport
+    int fd = rudp_transport_get_fd(tr);
+    ssl_context_t* ssl_ctx = ssl_create_client();
+    if (ssl_ctx == NULL || ssl_connect(ssl_ctx, fd, ctx->connect_host) != 0) {
+        LOGD("[%s] TLS handshake failed", transport_name(TRANSPORT_ICMP));
+        if (ssl_ctx) ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+        r->error = ERR_TLS_HANDSHAKE;
+        return NULL;
+    }
+
+    // Try to claim winner
+    if (__sync_bool_compare_and_swap(&r->finished, 0, 1)) {
+        r->ok = 1;
+        r->socket_fd = fd;
+        r->ssl_ctx = ssl_ctx;
+        r->ssl = ssl_ctx;
+        r->transport = tr;
+        LOGD("[%s] CONNECTED fd=%d", transport_name(TRANSPORT_ICMP), fd);
+    } else {
+        LOGD("[%s] lost race, cleaning up", transport_name(TRANSPORT_ICMP));
+        ssl_destroy(ssl_ctx);
+        rudp_transport_destroy(tr);
+    }
+    return NULL;
+}
+
+// Launch the parallel transport race. Returns 0 on success (winner promoted
+// to conn), -1 on failure (all transports failed).
+static int softether_connect_parallel_race(softether_connection_t* conn,
+                                           const char* host, const char* resolved_ip,
+                                           int port, const char* connect_host) {
+    int force_nat_t = (getenv("SOFTETHER_FORCE_NAT_T") != NULL);
+    volatile int cancel_flag = 0;
+
+    // Determine which transports to launch
+    // TCP is always tried sequentially first (for TCP-available servers) or
+    // skipped entirely (for UDP-only). The parallel race only races UDP
+    // transports: R-UDP direct, NAT-T relay, DNS, ICMP.
+    int want_tcp = 0;
+    int want_rudp_direct = (conn->udp_port > 0);
+    int want_natt = 1;  // always try NAT-T (it's the CGNAT path)
+
+    // DNS and ICMP transports: always try (DNS works without root,
+    // ICMP gracefully fails if no CAP_NET_RAW).
+    int want_dns = 1;
+    int want_icmp = 1;
+
+    // Count active transports
+    int num_transports = 0;
+    transport_thread_ctx_t threads[TRANSPORT_ICMP + 1];
+    memset(threads, 0, sizeof(threads));
+
+    // Compute per-transport timeout (race deadline = max(5000, timeout))
+    uint32_t race_timeout_ms = conn->timeout_ms;
+    if (race_timeout_ms < 5000) race_timeout_ms = 5000;
+
+    if (want_tcp) {
+        transport_thread_ctx_t* t = &threads[num_transports];
+        t->transport_type = TRANSPORT_TCP;
+        t->host = host;
+        t->resolved_ip = resolved_ip;
+        t->port = port;
+        t->connect_host = connect_host;
+        t->timeout_ms = race_timeout_ms;
+        t->udp_port = 0;
+        t->cancel_flag = &cancel_flag;
+        num_transports++;
+    }
+    if (want_rudp_direct) {
+        transport_thread_ctx_t* t = &threads[num_transports];
+        t->transport_type = TRANSPORT_RUDP_DIRECT;
+        t->host = host;
+        t->resolved_ip = resolved_ip;
+        t->port = port;
+        t->connect_host = connect_host;
+        t->timeout_ms = race_timeout_ms;
+        t->udp_port = conn->udp_port;
+        t->cancel_flag = &cancel_flag;
+        num_transports++;
+    }
+    if (want_natt) {
+        transport_thread_ctx_t* t = &threads[num_transports];
+        t->transport_type = TRANSPORT_NATT;
+        t->host = host;
+        t->resolved_ip = resolved_ip;
+        t->port = port;
+        t->connect_host = connect_host;
+        t->timeout_ms = race_timeout_ms;
+        t->udp_port = 0;
+        t->cancel_flag = &cancel_flag;
+        num_transports++;
+    }
+    if (want_dns) {
+        transport_thread_ctx_t* t = &threads[num_transports];
+        t->transport_type = TRANSPORT_DNS;
+        t->host = host;
+        t->resolved_ip = resolved_ip;
+        t->port = port;
+        t->connect_host = connect_host;
+        t->timeout_ms = race_timeout_ms;
+        t->udp_port = 0;
+        t->cancel_flag = &cancel_flag;
+        num_transports++;
+    }
+    if (want_icmp) {
+        transport_thread_ctx_t* t = &threads[num_transports];
+        t->transport_type = TRANSPORT_ICMP;
+        t->host = host;
+        t->resolved_ip = resolved_ip;
+        t->port = port;
+        t->connect_host = connect_host;
+        t->timeout_ms = race_timeout_ms;
+        t->udp_port = 0;
+        t->cancel_flag = &cancel_flag;
+        num_transports++;
+    }
+
+    if (num_transports == 0) {
+        LOGE("No transports to attempt");
+        return -1;
+    }
+
+    LOGD("Parallel race: %d transports, race timeout %u ms", num_transports, race_timeout_ms);
+
+    // Launch all transport threads
+    pthread_t thread_ids[TRANSPORT_ICMP + 1];
+    for (int i = 0; i < num_transports; i++) {
+        void* (*func)(void*);
+        switch (threads[i].transport_type) {
+            case TRANSPORT_TCP:        func = transport_thread_tcp; break;
+            case TRANSPORT_RUDP_DIRECT: func = transport_thread_rudp_direct; break;
+            case TRANSPORT_NATT:       func = transport_thread_natt; break;
+            case TRANSPORT_DNS:        func = transport_thread_dns; break;
+            case TRANSPORT_ICMP:       func = transport_thread_icmp; break;
+            default:                   func = NULL; break;
+        }
+        if (func) {
+            pthread_create(&thread_ids[i], NULL, func, &threads[i]);
+        }
+    }
+
+    // Wait for first winner or deadline
+    uint64_t deadline = softether_tick_ms() + race_timeout_ms;
+    transport_result_t* winner = NULL;
+    while (softether_tick_ms() < deadline) {
+        // Check if any thread won
+        for (int i = 0; i < num_transports; i++) {
+            if (threads[i].result.finished && threads[i].result.ok) {
+                winner = &threads[i].result;
+                break;
+            }
+        }
+        if (winner) break;
+        usleep(10000);  // 10ms poll
+    }
+
+    // Cancel all threads
+    __sync_lock_test_and_set(&cancel_flag, 1);
+
+    // Join all threads
+    for (int i = 0; i < num_transports; i++) {
+        pthread_join(thread_ids[i], NULL);
+    }
+
+    if (winner == NULL) {
+        LOGD("Parallel race: all transports failed");
+        return -1;
+    }
+
+    // Promote winner to conn
+    LOGD("Parallel race: %s won (fd=%d)", transport_name(winner->transport_type),
+         winner->socket_fd);
+    conn->socket_fd = winner->socket_fd;
+    conn->ssl_ctx = winner->ssl_ctx;
+    conn->ssl = winner->ssl;
+    if (winner->transport != NULL) {
+        conn->nat_t_transport = winner->transport;
+        conn->using_nat_t = 1;
+    }
+
+    return 0;
 }
 
 // Connect with HubName
@@ -1664,135 +2305,99 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         LOGD("SOFTETHER_FORCE_NAT_T set - skipping TCP, forcing NAT-T fallback");
     }
 
-    // UDP-only servers advertise no TCP port, so the direct-TCP attempt would
-    // always fail (often after a SYN timeout). Skip straight to the transport
-    // fallbacks (direct R-UDP, then NAT-T relay).
     if (conn->udp_only) {
-        LOGD("UDP-only server (seTcpPort=0) - skipping TCP, trying direct R-UDP / NAT-T");
-    }
-
-    // Create TCP socket and connect
-    softether_socket_t* sock = (force_nat_t || conn->udp_only) ? NULL : socket_create(SOCKET_TYPE_TCP);
-    int tcp_ok = 0;
-    if (sock != NULL) {
-        if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
-            // Fallback: retry with the remaining IP version explicitly resolved.
-            char fallback_ip[64] = "";
-            int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
-            if (resolve_hostname_family(host, fallback_family, fallback_ip, sizeof(fallback_ip)) == 0 &&
-                strcmp(fallback_ip, resolved_ip) != 0) {
-                LOGD("Connect via %s failed, retrying via %s: %s",
-                     preferred_ipv6 ? "IPv6" : "IPv4",
-                     preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
-                if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
-                    strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
-                    preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
-                    tcp_ok = 1;
+        // ---- UDP-only servers: parallel transport race (Phase 12B) ----
+        // TCP always fails behind CGNAT — race R-UDP direct + NAT-T relay
+        // concurrently. Matching the official client's ConnectEx4 where the
+        // non-TCP transports run in parallel for unreachable-TCP servers.
+        LOGD("UDP-only server (seTcpPort=0) - parallel race: R-UDP direct + NAT-T");
+        result = softether_connect_parallel_race(conn, host, resolved_ip, port, connect_host);
+    } else {
+        // ---- TCP-available servers: sequential TCP-first (original flow) ----
+        // TCP is the fastest, most reliable path. Only fall back to R-UDP / NAT-T
+        // when TCP+TLS or login fails.
+        softether_socket_t* sock = force_nat_t ? NULL : socket_create(SOCKET_TYPE_TCP);
+        int tcp_ok = 0;
+        if (sock != NULL) {
+            if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
+                // Fallback: retry with the remaining IP version explicitly resolved.
+                char fallback_ip[64] = "";
+                int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
+                if (resolve_hostname_family(host, fallback_family, fallback_ip, sizeof(fallback_ip)) == 0 &&
+                    strcmp(fallback_ip, resolved_ip) != 0) {
+                    LOGD("Connect via %s failed, retrying via %s: %s",
+                         preferred_ipv6 ? "IPv6" : "IPv4",
+                         preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
+                    if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
+                        strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
+                        preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
+                        tcp_ok = 1;
+                    } else {
+                        LOGE("Failed to connect to server (both IP versions)");
+                    }
                 } else {
-                    LOGE("Failed to connect to server (both IP versions)");
+                    LOGE("Failed to connect to server");
                 }
             } else {
-                LOGE("Failed to connect to server");
+                tcp_ok = 1;
             }
+
+            if (tcp_ok) {
+                conn->socket_fd = sock->fd;
+                sock->fd = -1;
+
+                // Sync server bookkeeping to the actually-connected address
+                if (sock->addr_len > 0) {
+                    char actual_ip[64] = "";
+                    const void* src = NULL;
+                    if (sock->addr.ss_family == AF_INET) {
+                        src = &((struct sockaddr_in*)&sock->addr)->sin_addr;
+                    } else if (sock->addr.ss_family == AF_INET6) {
+                        src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
+                    }
+                    if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
+                        strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
+                        preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
+                    }
+                }
+            }
+            socket_destroy(sock);
         } else {
-            tcp_ok = 1;
+            if (!force_nat_t) {
+                LOGE("Failed to create socket");
+            }
         }
 
         if (tcp_ok) {
-            conn->socket_fd = sock->fd;
-            sock->fd = -1;
-
-            // Sync server bookkeeping to the actually-connected address (may
-            // differ from the preferred family when the fallback path was used).
-            if (sock->addr_len > 0) {
-                char actual_ip[64] = "";
-                const void* src = NULL;
-                if (sock->addr.ss_family == AF_INET) {
-                    src = &((struct sockaddr_in*)&sock->addr)->sin_addr;
-                } else if (sock->addr.ss_family == AF_INET6) {
-                    src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
-                }
-                if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
-                    strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
-                    preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
-                }
+            result = perform_tls_handshake(conn, connect_host);
+            if (result != ERR_NONE) {
+                LOGE("TLS handshake failed over TCP");
+                close(conn->socket_fd);
+                conn->socket_fd = -1;
             }
+        } else {
+            result = ERR_TCP_CONNECT;
         }
-        socket_destroy(sock);
-    } else {
-        if (!force_nat_t && !conn->udp_only) {
-            LOGE("Failed to create socket");
+
+        // TCP failed — fall back to parallel UDP transport race: race direct
+        // R-UDP and NAT-T relay concurrently (same as UDP-only path).
+        if (result != ERR_NONE) {
+            LOGD("TCP+TLS failed (%d); falling back to parallel UDP race", result);
+            softether_disconnect(conn);
+            result = softether_connect_parallel_race(conn, host, resolved_ip, port, connect_host);
         }
     }
 
     // Store server info
     strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
     conn->server_port = port;
-    conn->is_ipv6 = preferred_ipv6;
+    conn->is_ipv6 = (strchr(resolved_ip, ':') != NULL);
     if (conn->is_ipv6) {
         strncpy(conn->server_ip_v6, resolved_ip, sizeof(conn->server_ip_v6) - 1);
         LOGD("IPv6 server detected: %s", resolved_ip);
     } else {
         conn->server_ip_v6[0] = '\0';
         LOGD("IPv4 server detected: %s", resolved_ip);
-    }
-
-    if (tcp_ok) {
-        // TLS handshake — SNI uses the original hostname (better for cert checks).
-        result = perform_tls_handshake(conn, connect_host);
-        if (result != ERR_NONE) {
-            LOGE("TLS handshake failed over TCP");
-            close(conn->socket_fd);
-            conn->socket_fd = -1;
-        }
-    } else {
-        result = ERR_TCP_CONNECT;
-    }
-
-    // Transport fallbacks: direct TCP (or TLS) failed. First try a direct R-UDP
-    // session to the advertised SoftEther UDP port (seUdpPort) — reaches
-    // UDP-only nodes whose UDP port is publicly routable without any relay.
-    if (result != ERR_NONE) {
-        if (conn->udp_port > 0) {
-            if (conn->udp_only) {
-                LOGD("TCP skipped (UDP-only server, seTcpPort=0); trying direct R-UDP to %s:%d",
-                     resolved_ip, conn->udp_port);
-            } else {
-                LOGD("Direct TCP/TLS connect failed (%d); trying direct R-UDP to %s:%d",
-                     result, resolved_ip, conn->udp_port);
-            }
-            result = softether_try_direct_udp_connect(conn, resolved_ip, conn->udp_port);
-            if (result == ERR_NONE) {
-                // TLS handshake over the R-UDP transport (SNI still the real host)
-                result = perform_tls_handshake(conn, connect_host);
-                if (result != ERR_NONE) {
-                    LOGE("TLS handshake failed over direct R-UDP transport");
-                    softether_disconnect(conn);
-                    return result;
-                }
-                LOGD("Connected via direct R-UDP transport");
-            }
-        }
-
-        // NAT-T + RUDP fallback: direct UDP/TCP (or TLS) failed. Reach the
-        // server via the SoftEther relay + RUDP transport (works behind NAT/CGNAT).
-        if (result != ERR_NONE) {
-            LOGD("Direct UDP/TCP connect failed (%d); trying NAT-T + RUDP fallback", result);
-            result = softether_try_nat_t_connect(conn, host, resolved_ip, port);
-            if (result == ERR_NONE) {
-                // TLS handshake over the RUDP transport (SNI still the real host)
-                result = perform_tls_handshake(conn, connect_host);
-                if (result != ERR_NONE) {
-                    LOGE("TLS handshake failed over RUDP transport");
-                    softether_disconnect(conn);
-                    return result;
-                }
-                LOGD("Connected via NAT-T + RUDP transport");
-            } else {
-                conn->state = STATE_DISCONNECTED;
-                return result;
-            }
-        }
     }
 
     // ---- SoftEther Protocol: Steps 1+2 (VPNCONNECT watermark + PACK login) ----

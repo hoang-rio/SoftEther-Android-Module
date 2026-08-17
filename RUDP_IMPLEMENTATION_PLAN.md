@@ -208,7 +208,7 @@ App layer (`app/`):
 - [x] Add `Ipv6Ula.kt` shared util: per-install ULA (`fd00::<ANDROID_ID hex>`), reuses the native `softether_vpn` pref so all protocols share one address
 - [x] Apply dual-stack IPv6 defaults consistently for OpenVPN and SSTP in `DetailActivity.kt` / `ServerActivity.kt` (ULA + `::/0`; mirror the SoftEther `ConnectionConfig` IPv6 fields)
 
-### Phase 12: NAT-T Transport for UDP-only (CGNAT) Servers (🔄 In Progress — Native Core + Wiring Done, Tests Landing)
+### Phase 12: NAT-T Transport & Parallel Race for UDP-only (CGNAT) Servers (🔄 In Progress — Sequential stages shipped; Parallel race + ICMP/DNS stages pending)
 
 > **Status (2026-08-14):** native core is implemented (`softether_pack.c`, `softether_nat_t.c`, `rudp_transport.c`, bridge + `softether_protocol.c` integration) and the full chain was validated against **live public servers** on a network without UDP filtering:
 > - Real registrar UDP **5004** reachable; shard hostname `x6.xc.dev.servers.nat-traversal.softether-network.net.` resolves to `130.158.6.x`.
@@ -217,11 +217,194 @@ App layer (`app/`):
 > - The earlier "NAT-T not viable / relay dead" reading (Phase 6 removal above) was an artifact of **ISP UDP filtering on the previous network** (UDP 53/123 only). With UDP 5004 + high ports open the rendezvous → transport chain works end-to-end.
 > - Other probed public IPs (`219.100.37.x`, `125.142.186.87`, …) returned `nat_t_not_found` — offline/unregistered volunteer nodes, not a protocol failure.
 
+> **Status (2026-08-16):** all three sequential connect stages are shipped and validated on the host harness:
+> 1. **Login-stage NAT-T fallback** (2026-08-15): when direct TCP+TLS succeeds but the **PACK login is rejected**, the connection is torn down and retried once through NAT-T. Live case `121.178.234.213`: TCP+TLS ok, login `ERR_NOT_SUPPORTED` (33) → NAT-T rendezvous → TLS → re-login → **CONNECTED**.
+> 2. **Direct R-UDP stage** (2026-08-16): `softether_try_direct_udp_connect()` runs a RUDP transport session straight to `ip:seUdpPort` (no relay), wired ahead of NAT-T in the fallback chain, with its own TLS handshake over the R-UDP transport.
+> 3. **Skip-TCP for UDP-only rows** (2026-08-16): `conn->udp_only` (JNI `OPTION_UDP_ONLY=5`) skips `socket_create` for `seTcpPort<=0` rows; log lines are truthful ("TCP skipped (UDP-only server, seTcpPort=0)…", no spurious "Failed to create socket").
+> - **Live sweeps of the full public list (2026-08-15: 10 UDP-only rows; 2026-08-16: 9 UDP-only rows):** every UDP-only node is CGNAT — direct R-UDP times out on all; the only relay-registered node (`1.52.9.89` VN, "Admin-PC's owner") completes rendezvous → RUDP → TLS → watermark but login fails on every hub (`vpngate`/`vpn`/`vpngate2` absent → err 8; `DEFAULT` rejects `vpn`/`vpn` → err 9). **No UDP-only node in the current public list is connectable by any method** — these rows are effectively dead volunteer listings.
+
+> **Status (2026-08-17):** v2 CSV full sweep (100 servers). With `hub=vpngate`: 21 TCP-connected (all 219.100.37.x JP public servers + laud), 4 auth-failed, 73 connection-failed. NAT-T forced: only 2 servers work — `121.178.234.213` (KR) and `217.138.212.62` (opengw, RO). Both from v1 legacy, removed from current lists. **Hub name is `vpngate` (case-insensitive)** — confirmed; app default is correct. Official client 4.44 Build 9807 also fails against CGNAT servers (error code 1, 10+ retries), confirming dead volunteer nodes.
+
 > **Reference note (2026-08-14):** the backup branch `backup/pre-nat-t-rudp-revert-20260725` does **not** contain a prior NAT-T implementation — its Phase 6 was only "📋 Planned", and the app's own `src/` has zero NAT-T code in either branch. The branch is still the reference snapshot for this phase: its Phase 6 plan section, and the vendored upstream `SoftEtherVPN_Stable/src/Mayaqua/Network.c` which holds the complete R-UDP / NAT-T implementation to port from.
 
-**Goal:** connect to VPN Gate servers whose only reachable transport is R-UDP through the SoftEther NAT-T relay — the "SSL-VPN UDP: Supported / no TCP port" rows (CGNAT, e.g. the Thailand example `vpn642164523.opengw.net` → `27.130.192.217`, reverse-DNS `27-130-192-217.24.nat.asay-cgn01.myaisfibre.com`). Such servers expose **no inbound TCP or direct-UDP port at all** (verified 2026-08-14: 0/13 common TCP listeners and 0/60,531 UDP R-UDP responders on `131.147.172.243`), so the only way to reach them is the relay path the official client already uses.
+**Goal:** connect to VPN Gate servers whose only reachable transport is R-UDP through the SoftEther NAT-T relay, ICMP tunnel, or DNS tunnel — the "SSL-VPN UDP: Supported / no TCP port" rows (CGNAT). Such servers expose **no inbound TCP or direct-UDP port at all**, so the only way to reach them is through the transport methods the official client already uses. The official client (`ConnectEx4` at `Mayaqua/Network.c:16287`) races **4 transports in parallel**: TCP, NAT-T relay, R-UDP over ICMP, R-UDP over DNS — the first to succeed wins. Our app currently tries transports **sequentially**, which is both slower (worst-case = sum of all timeouts) and missing the ICMP/DNS paths that are the key to reaching CGNAT servers.
+
+#### Phase 12A: Sequential stages (✅ Complete)
+The sequential fallback chain (TCP → direct R-UDP → NAT-T → login-fallback-to-NAT-T) is shipped and validated.
 
 **Trigger strategy (chosen 2026-08-14, extended 2026-08-15):** **TCP first, automatic fall back to NAT-T.** Keep the existing direct-TCP connect (with its IPv4/IPv6 fallback); retry once via NAT-T when (a) the direct TCP connect fails with `ERR_TCP_CONNECT` (both families refused/timeout) **or** (b) the direct TCP connect and TLS handshake succeed but the **PACK login is rejected** by the server — some nodes only accept clients over the NAT-T/UDP-mode path (live case: `121.178.234.213` answers TCP 443 + TLS but returns `ERR_NOT_SUPPORTED` (33) at login, while the NAT-T path logs in cleanly). No data-driven gate required — the fallback also rescues partially-firewalled servers that advertise a TCP port. Worst-case extra connect time ≈ existing TCP timeout + `RUDP_TIMEOUT` (12 s).
+
+**Extended (2026-08-16) — UDP-only rows skip TCP and gain a direct R-UDP stage:** rows with `seTcpPort<=0` never attempt direct TCP (doomed — CGNAT nodes ignore SYN and no TCP port is advertised). Their chain is **direct R-UDP to `seUdpPort`** (reaches nodes whose UDP port is publicly routable) → **NAT-T relay**. TCP-reachable servers keep the original TCP-first + login-fallback behavior unchanged. Enabling flag: app passes `udpPort=seUdpPort` + `udpOnly=isUdpOnly`; JNI `OPTION_UDP_PORT=4` / `OPTION_UDP_ONLY=5`.
+
+#### Phase 12B: Parallel transport race (📋 Planned)
+
+**Problem:** The current sequential chain has worst-case connect time = sum of all timeouts (30s TCP + 12s R-UDP + 12s NAT-T = 54s). The official client races all transports in parallel — first to succeed wins — giving worst-case = max(single timeout) ≈ 12-30s. More importantly, ICMP and DNS transports can reach servers that NAT-T cannot (servers not registered with the relay).
+
+**Official client's `ConnectEx4` (Network.c:16287-16520):**
+```
+Thread 1 (p1): TCP direct         — delay 0ms
+Thread 2 (p2): NAT-T relay        — delay 30ms
+Thread 4 (p4): R-UDP over DNS     — delay 100ms
+Thread 3 (p3): R-UDP over ICMP    — delay 200ms
+```
+All 4 run simultaneously. First `Ok` wins. Priority: ICMP/DNS > TCP/NAT-T (lines 16530-16533: `if (p3.Ok || p4.Ok) break`).
+
+**Plan:**
+
+**Step 1: Extract transport attempts into independent, thread-safe tasks**
+Each transport attempt currently mutates `conn->socket_fd`, `conn->ssl`, `conn->nat_t_transport` directly. For parallel execution, each attempt needs its own local state:
+```c
+typedef struct {
+    int transport_type;        // TRANSPORT_TCP, TRANSPORT_RUDP_DIRECT, TRANSPORT_NATT, TRANSPORT_ICMP, TRANSPORT_DNS
+    int socket_fd;             // Won transport's fd (to be promoted into conn)
+    void* ssl_ctx;             // Won transport's SSL context
+    void* ssl;                 // Won transport's SSL
+    rudp_transport_t* transport; // For R-UDP-based transports
+    int error;                 // ERR_NONE on success, error code on failure
+    int finished;              // atomic: 1 when this attempt is done
+    int ok;                    // atomic: 1 on success
+    softether_connection_t* conn; // Back-reference for promotion
+} transport_result_t;
+```
+
+**Step 2: Implement parallel launcher in `softether_connect_with_hub()`**
+Replace the sequential chain with:
+1. Resolve hostname once (before threads).
+2. Determine which transports to launch based on `udp_only`, `udp_port`, `force_nat_t`.
+3. Launch transport threads (each with a staggered delay matching upstream).
+4. Wait for first `ok` with a shared deadline (5-8s).
+5. Promote winning transport's fd/ssl into `conn`.
+6. Cancel losing threads (set shared cancel flag, join).
+7. Run login on the promoted transport.
+
+**Step 3: Thread synchronization**
+- Shared `cancel_flag` (atomic int) — each thread checks before starting/after each blocking op.
+- Winner claims via `__sync_bool_compare_and_swap(&result.finished, 0, 1)` — only one thread wins.
+- Losing threads clean up their own resources (close fd, destroy transport, free SSL).
+- Main thread uses `pthread_cond_timedwait` with a shared deadline.
+
+**Step 4: Cancellation for blocking operations**
+- `nat_t_connect()` is blocking (select loop) — add `cancel_flag` check to the loop.
+- `rudp_transport_connect()` is blocking (cond_wait) — add `cancel_flag` check.
+- `socket_connect_timeout()` / `ssl_connect()` are blocking — use `poll()` with short timeout + cancel check.
+
+**Step 5: Update `softether_reconnect` and login-fallback**
+The login-fallback (retry NAT-T when login rejected over TCP) becomes unnecessary with parallel race — NAT-T is already attempted concurrently. Simplify the reconnect flow.
+
+**Step 6: Remove `SOFTETHER_FORCE_NAT_T` env hack**
+With parallel race, this env var is no longer needed — the race naturally selects the best transport.
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `softether_protocol.c` | Refactor `softether_connect_with_hub()` into parallel launcher; add `transport_result_t`; add cancellation support |
+| `softether_protocol.h` | Add `transport_result_t`, transport type constants |
+| `softether_nat_t.c` | Add `cancel_flag` check to `nat_t_connect()` select loop |
+| `rudp_transport.c` | Add `cancel_flag` check to `rt_worker` connect wait |
+
+#### Phase 12C: R-UDP over DNS transport (📋 Planned)
+
+**How it works (official client, `Network.c:16212-16240`):**
+- Creates a **normal UDP socket** (not raw) bound to an ephemeral port.
+- Sends DNS A-record queries to the target server's **port 53** with R-UDP payload embedded.
+- DNS query format: `[TranId:2][DNS Header:11B][Random 8-char hex label][EDNS0 OPT:10B][Size:2][R-UDP payload]`
+- Total DNS overhead: ~42 bytes per query, ~37 bytes per response.
+- No special privileges required (regular UDP socket).
+
+**Prerequisites:**
+- Target server must have a SoftEther DNS R-UDP listener on port 53.
+- VPN Gate servers may or may not have this enabled (needs verification).
+
+**Plan:**
+
+**Step 1: DNS encapsulation layer**
+New file `src/proto/softether_dns_transport.c` + `include/softether_dns_transport.h`:
+- `dns_rudp_create()`: Create UDP socket, bind ephemeral port.
+- `dns_rudp_connect(ip, port, timeout, cancel_flag)`: Send DNS R-UDP session creation packets, wait for ACK.
+- `dns_rudp_send()`: Wrap R-UDP segment in DNS query format.
+- `dns_rudp_recv()`: Strip DNS headers, extract R-UDP payload.
+- Reuse existing R-UDP session/crypto from `rudp_transport.c` (same CONNECT/ACK/segment protocol, just different underlay).
+
+**Step 2: Wire into parallel race**
+Add `TRANSPORT_DNS` to the parallel launcher with 100ms stagger delay (matching upstream).
+
+**Step 3: VpnService.protect()**
+DNS transport UDP fd needs `protect()` — add JNI accessor similar to `nativeGetNatTUdpSocketFd`.
+
+**Step 4: MSS adjustment**
+DNS adds 8 bytes (UDP header) + 42 bytes (DNS query header) = 50 bytes overhead vs plain UDP. Adjust `rudp_calc_mss` for DNS mode.
+
+**Files to create/modify:**
+| File | Change |
+|------|--------|
+| `src/proto/softether_dns_transport.c` (new) | DNS encapsulation layer for R-UDP |
+| `include/softether_dns_transport.h` (new) | DNS R-UDP API |
+| `src/proto/softether_protocol.c` | Add `TRANSPORT_DNS` to parallel launcher |
+| `jni/softether_jni.c` | Add `nativeGetDnsUdpSocketFd` for VpnService.protect() |
+
+#### Phase 12D: R-UDP over ICMP transport (📋 Planned — requires root/CAP_NET_RAW)
+
+**How it works (official client, `Network.c:16212-16228`):**
+- Creates a **raw socket** (`socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`).
+- Sends ICMP Echo Request packets with R-UDP payload embedded.
+- ICMP packet format: `[ICMP Header:4B][ICMP Echo:4B][SHA1 Hash:20B][R-UDP payload]`
+- Client ICMP ID derived from `SHA1(pid)`, SeqNo random — per-process unique.
+- Periodic Echo Requests every 1-3s as keepalive (NAT mapping maintenance).
+
+**Prerequisites:**
+- **Root access or `CAP_NET_RAW` capability** on Android. Normal apps cannot create raw sockets since Android 6.0+.
+- The server must have ICMP R-UDP listener enabled (may not be the case for VPN Gate servers — `Listener.c:687-691` only starts them when config enables it).
+
+**Android feasibility:**
+- Without root: ICMP transport is **not feasible** on production Android.
+- With root/Magisk: feasible, `VpnService.protect()` not needed (raw socket bypasses TUN).
+- Alternative: could use `VpnService` tun fd to intercept ICMP replies, but this is complex and fragile.
+
+**Plan (root-only initially):**
+
+**Step 1: ICMP encapsulation layer**
+New file `src/proto/softether_icmp_transport.c` + `include/softether_icmp_transport.h`:
+- `icmp_rudp_create()`: Create raw ICMP socket (requires `CAP_NET_RAW`).
+- `icmp_rudp_connect(ip, port, timeout, cancel_flag)`: Send ICMP R-UDP session creation, wait for ACK.
+- `icmp_rudp_send()`: Wrap R-UDP segment in ICMP Echo.
+- `icmp_rudp_recv()`: Strip ICMP/IP headers + SHA1 hash, extract R-UDP payload.
+- `icmp_rudp_keepalive()`: Periodic Echo Requests to maintain NAT mapping.
+
+**Step 2: Wire into parallel race (behind capability check)**
+Add `TRANSPORT_ICMP` to parallel launcher with 200ms stagger delay. Only launch if `CAP_NET_RAW` is available (check via `capget()` or try-create-socket probe).
+
+**Step 3: MSS adjustment**
+ICMP adds 8 bytes (ICMP header + Echo) + 20 bytes (SHA1 hash) = 28 bytes overhead vs plain UDP.
+
+**Files to create/modify:**
+| File | Change |
+|------|--------|
+| `src/proto/softether_icmp_transport.c` (new) | ICMP encapsulation layer for R-UDP |
+| `include/softether_icmp_transport.h` (new) | ICMP R-UDP API |
+| `src/proto/softether_protocol.c` | Add `TRANSPORT_ICMP` to parallel launcher (behind capability check) |
+
+#### Phase 12E: UI cleanup — remove "UDP - NAT-T" label (📋 Planned)
+
+The current `VpnProtocolSelectionDialog` labels the SoftEther UDP card as "UDP (NAT-T)" for `isUdpOnly` rows. With the parallel race and multiple transports, this label is misleading. Replace with a generic "SoftEther UDP" label for all rows.
+
+**Plan:**
+
+**Step 1: Remove NAT-T-specific label**
+In `VpnProtocolSelectionDialog.kt`: remove the `@string/softether_vpn_udp_natt` label. Use the existing `@string/softether_vpn_udp` label for all SoftEther UDP cards (both `isUdpOnly` and regular).
+
+**Step 2: Remove string resources**
+Remove `softether_vpn_udp_natt` from `strings.xml` (EN + VI).
+
+**Step 3: Update DetailActivity.kt**
+Remove the NAT-T-specific label logic for `isUdpOnly` rows.
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `dialog/VpnProtocolSelectionDialog.kt` | Remove NAT-T label branching; use generic "SoftEther UDP" for all |
+| `res/values/strings.xml` | Remove `softether_vpn_udp_natt` |
+| `res/values-vi/strings.xml` | Remove `softether_vpn_udp_natt` |
+| `activities/DetailActivity.kt` | Remove NAT-T label assignment for isUdpOnly |
 
 **Verified protocol facts (2026-08-14, official client 4.44 Build 9807 wire captures + upstream source):**
 - NAT-T relay: hostname `x{sha1(ip)[2]}.x{sha1(ip)[3]}.servers.nat-traversal.softether-network.net.` derived from the **target server IP** (`RUDPGetRegisterHostNameByIP`, `Mayaqua/Network.c:4627`; tag `UDP_NAT_T_SERVER_TAG`, `Network.h:765`), **UDP 5004** (`UDP_NAT_T_PORT`, `Network.h:767`). Relay is alive — it answered a `nat_t_connect_request` with `ok=1` on the wire. (TCP 443/80 to the relay is refused; that is not the relay protocol.)
@@ -230,7 +413,7 @@ App layer (`app/`):
 - Relay reply (145 B PACK): `opcode="nat_t_connect_request"`, `tran_id` (echo), `ok` (bool), and when a mapping exists `result_ip` (str) + `result_port` (int) + `same_lan` (bool); on ambiguity `multi_candidates=1` → `RUDP_ERROR_NAT_T_TWO_OR_MORE`; on miss → not found. Client only proceeds when `ok && result_port != 0` (`NewRUDPClientNatT`, `Network.c:5252-5485`). No `result_ip`/`result_port` in the reply ⇒ keep re-sending until `RUDP_TIMEOUT` (12 s, `Network.h:664`).
 - After rendezvous, a **standard R-UDP transport session** runs against `result_ip:result_port` (relay forwards to the server's registered session), then TLS + the normal SoftEther handshake over the R-UDP byte stream. Transport handshake (from removed Phase 6 analysis, above): 39-byte CONNECT = `Key_Init(20)` + 19 random, resent every `RUDP_RESEND_TIMER`=200 ms while CONNECT_SENT; `key1 = SHA1(init ‖ "zurukko")`, `key2 = SHA1(init ‖ key1 ‖ "yasushineko")`; `Key_Send=key2`, `Key_Recv=key1`; server ACK within ~1.2 s flips ESTABLISHED (`Network.c:2124/3559`); segments are SHA1(Key)-signed + RC4(SHA1(IV‖Key)) (V1) or ChaCha20-Poly1305 (V2) — reuse the existing accel crypto.
 
-**Current-state gaps this phase closes:** the control channel is unconditionally TCP — `softether_connect_with_hub` always runs `socket_connect_timeout` (`softether_protocol.c:1477-1508`), so a UDP-only server fails with `ERR_TCP_CONNECT` before RUDP is ever considered. `use_tcp` only toggles post-login UDP *acceleration*, not transport. `softether_reconnect` hardcodes `use_tcp=1` (`softether_protocol.c:2783`) and must become transport-aware.
+**Current-state (2026-08-17):** `softether_connect_with_hub` runs a **staged transport chain** (sequential) — direct TCP → (when `udp_port>0`) direct R-UDP to `seUdpPort` → NAT-T relay — with TLS over whichever transport wins, then login. `conn->udp_only` skips the doomed direct-TCP attempt for `seTcpPort<=0` rows. When direct TCP+TLS connect and login succeed, nothing changes; when login is rejected, the connection is torn down and retried once through NAT-T (`softether_protocol_login` + `softether_try_nat_t_connect`). `softether_reconnect` is transport-aware via `conn->using_nat_t`. **Next: convert to parallel race (Phase 12B) and add ICMP/DNS transports (Phase 12C/12D).**
 
 Native core (`src/main/cpp/softether-core/`):
 - [x] PACK writer/reader for the rendezvous exchange: new `src/proto/softether_pack.c` + `include/softether_pack.h` — reusable encode/decode matching the SoftEther `Pack.c` wire format (big-endian, bool = INT 0/1); bounds-safe read helpers (negative-index pattern), validated against real server packets + live relay reply
@@ -239,27 +422,42 @@ Native core (`src/main/cpp/softether-core/`):
 - [x] Socketpair + bridge thread inside `rudp_transport.c`: `socketpair(AF_UNIX, SOCK_STREAM)` with a pump thread moving transport↔fd (`rt_pump_recv_to_pair`/`rt_pump_pair_to_send`); **TLS/HTTP-CONNECT/PACK-login run unchanged** (`SSL_set_fd`, `aes_wrapper.c:303`; teardown stops the bridge thread, fdsan-safe)
 - [x] Transport-mode integration in `src/proto/softether_protocol.c`: `softether_try_nat_t_connect` skips the TCP connect and wires `conn->socket_fd = rudp_transport_get_fd(...)` with `conn->using_nat_t` + `conn->nat_t_transport` (destroyed on disconnect); `softether_reconnect` made transport-aware
 - [x] JNI (`jni/softether_jni.c`/`.h`, symbol-export binding): new `nativeGetNatTUdpSocketFd` exposing `rudp_transport_get_udp_fd` (the socket the RUDP session runs over) for `VpnService.protect()` — the bridge fd is already covered by `nativeGetSocketFd`/`softether_get_active_socket_fds` during NAT-T, so no new bridge accessor was needed. **Decision: no `fallbackToNatT` flag / no new `nativeConnectNatT` signature** — the fallback is **automatic** in the core (`softether_try_nat_t_connect` is retried by the caller only on `ERR_TCP_CONNECT`; see item 244), so the JNI surface stayed additive-only
+- [x] **Login-stage NAT-T fallback** (2026-08-15): extracted the login exchange into `softether_protocol_login`; in `softether_connect_with_hub` a rejected login over direct TCP (`result != ERR_NONE` while `!conn->using_nat_t`) now disconnects and retries via `softether_try_nat_t_connect` + TLS + re-login. Validated live: `121.178.234.213` (login err 33 → NAT-T → CONNECTED); regression `219.100.37.224` direct TCP `rc=0`
+- [x] **Direct R-UDP connect stage** (2026-08-16): `softether_try_direct_udp_connect(conn, resolved_ip, port)` — RUDP transport session straight to `ip:seUdpPort` (no relay), mirrors NAT-T success handling (`conn->nat_t_transport`, `conn->using_nat_t=1`, `conn->socket_fd`); TLS over the R-UDP transport before login; failure → NAT-T stage
+- [x] **Skip-TCP for UDP-only rows** (2026-08-16): `conn->udp_only` makes `socket_create` return NULL (same mechanism as the `SOFTETHER_FORCE_NAT_T` hook); JNI `OPTION_UDP_ONLY=5`; truthful log lines ("UDP-only server (seTcpPort=0) - skipping TCP…", "TCP skipped (UDP-only server, seTcpPort=0)…") and the spurious "Failed to create socket" path is suppressed for the skip case
 
 Kotlin submodule (`SoftEtherClient/src/main/java/vn/unlimit/softether/`):
-- [x] `model/ConnectionConfig.kt`: **deliberately no `fallbackToNatT` flag** — the core already falls back to NAT-T automatically whenever the direct TCP/TLS connect fails with `ERR_TCP_CONNECT` (`softether_protocol.c:1644-1648`), so an app-level flag would be dead configuration. The app only needs the fd-protect wiring (next item) and the `isUdpOnly` UI label; the UDP-only connect request itself is a normal `nativeConnectWithHub` (the transport targets the server **IP**, rendezvous by IP)
+- [x] `model/ConnectionConfig.kt`: new `udpPort` (advertised `seUdpPort`; enables the direct R-UDP stage) and `udpOnly` (`seTcpPort<=0`; skips the doomed direct-TCP attempt) fields, both parcelled, forwarded to JNI as `OPTION_UDP_PORT=4` / `OPTION_UDP_ONLY=5` by `ConnectionController.performConnect`. Deliberately **no `fallbackToNatT` flag** — NAT-T is an automatic core fallback (direct TCP/TLS failure **or** login rejection), so an app-level flag would be dead configuration. The app only needs the fd-protect wiring (next item) and the `isUdpOnly` UI label; the UDP-only connect request itself is a normal `nativeConnectWithHub` (the transport targets the server **IP**, rendezvous by IP)
 - [x] `controller/ConnectionController.kt`: protect the NAT-T transport UDP fd (`nativeGetNatTUdpSocketFd`) at all three sites — `performConnect`/connect, `attemptReconnect`, and `protectAdditionalSockets` (guarded by the `protectedFds` set) — so RUDP/NAT-T traffic bypasses the TUN (without `VpnService.protect()` on this fd the packets loop through the TUN and the transport dies)
 
 App layer (parent repo `app/`):
 - [x] `models/VPNGateConnection.kt`: `val isUdpOnly get() = seTcpPort <= 0 && seUdpPort > 0` (derivable — no Room schema change); mirrored on `models/VPNGateItem.kt` / `models/PaidServer.kt`
-- [x] `activities/DetailActivity.kt` / `activities/paid/ServerActivity.kt` / `fragment/StatusFragment.kt`: when `isUdpOnly`, the connect request uses `seUdpPort` (falling back to `udpPort`) as a placeholder — the transport targets the server **IP**, rendezvous by IP, and the core retries via NAT-T automatically on TCP failure. No app-level mode flag required (see item above)
+- [x] `activities/DetailActivity.kt` / `activities/paid/ServerActivity.kt` / `fragment/StatusFragment.kt`: pass `udpPort = seUdpPort` and `udpOnly = isUdpOnly` into `ConnectionConfig`; when `isUdpOnly` the connect request uses `seUdpPort` as the port — the transport targets the server **IP**, rendezvous by IP, direct R-UDP + NAT-T stages run automatically in the core, and TCP is skipped. No app-level mode flag required (see item above)
 - [x] `dialog/VpnProtocolSelectionDialog.kt`: the SoftEther UDP card is labelled "UDP (NAT-T)" for `isUdpOnly` rows (`@string/softether_vpn_udp_natt`, EN + VI)
 
 Testing:
 - [x] NAT-T rendezvous against the live relay — deterministic request, verified `ok=1` + `result_ip`/`result_port` parsing and `nat_t_not_found` for offline nodes (network-gated; ran from a non-filtering network 2026-08-14)
 - [x] Live UDP-only server connect: rendezvous for `211.21.159.81` → relay returned `result_port=11335` → RUDP transport **ESTABLISHED `rc=0`** (ran twice)
 - [x] Native loopback: `test_rudp_transport_loopback` in `test/native_test.c` — CONNECT → ESTABLISHED → bidirectional data + keepalive tick echo → corrupt packet dropped and session recovered, exercising `rudp_transport_get_udp_fd`; wired through `nativeTestRudpTransportLoopback` (`test/test_jni_bridge.c`) + `NativeConnectionTest#test13RudpTransportLoopback`. Passes on host (5/5 runs); note the first CONNECT-response segment **must carry a payload** (the client only registers segments with payloads in its receive window — an empty seq-1 stalls the drain)
+- [x] Login-stage NAT-T fallback (2026-08-15, host harness): `121.178.234.213` direct TCP+TLS → login `ERR_NOT_SUPPORTED` (33) → auto disconnect → NAT-T rendezvous → TLS → re-login → **`rc=0` CONNECTED**; regression `219.100.37.224` direct TCP `rc=0` + RUDP loopback `success=1`
+- [x] Direct R-UDP stage + skip-TCP (2026-08-16, host harness): UDP-only rows log `UDP-only server (seTcpPort=0) - skipping TCP` with no spurious "Failed to create socket"; direct R-UDP to `seUdpPort` timed out on every row (CGNAT), then NAT-T (`nat_t_not_found`). Full-list sweeps (10 rows 2026-08-15, 9 rows 2026-08-16): **no UDP-only node in the public list is connectable** — the sole relay-registered node `1.52.9.89` (VN) is a private server (login err 8/9 on every hub)
 - [ ] Forced NAT-T connect to the paid server `59.6.114.202` (credentials available) to validate TLS + login over R-UDP end-to-end when a mapping exists
+- [ ] Parallel race: verify first-wins with simultaneous TCP + NAT-T + DNS threads
+- [ ] Parallel race: verify cancel_flag stops losing threads cleanly (no leaked fds/threads)
+- [ ] Parallel race: verify timeout — all threads fail, main thread returns error within deadline
+- [ ] DNS transport: session creation over DNS to a server with DNS R-UDP enabled
+- [ ] DNS transport: verify DNS query format matches upstream (42-byte overhead)
+- [ ] ICMP transport: raw socket creation with CAP_NET_RAW (root device)
+- [ ] ICMP transport: session creation over ICMP to a server with ICMP R-UDP enabled
+- [ ] ICMP transport: verify fallback when CAP_NET_RAW unavailable (skip ICMP, don't crash)
+- [ ] UI: verify "SoftEther UDP" label shown for all rows (no "UDP (NAT-T)")
 - [ ] On-device instrumentation: new `NativeConnectionTest` cases + full regression suite
 
 Risks / mitigations:
 - R-UDP transport session is the bulk of the work (upstream `RUDP_SESSION` is large); port only the minimal client subset (send/recv FIFO, seq/ack window, retransmit) and reuse the existing V1/V2 crypto paths.
 - Bridge teardown/half-close must terminate the pump thread deterministically on disconnect to avoid leaked fds/threads (fdsan-safe — `udp_fd = -1` pattern, commit `0225498`).
 - Relay provides rendezvous only; if the target server has no live registration (offline volunteer node), the attempt ends after `RUDP_TIMEOUT` with a clear error string (`ERR_CONNECT_FAILED` / "server unreachable via NAT-T").
+- A relay-registered UDP-only node may still be a **private (auth-required) server** — `1.52.9.89` completes rendezvous→RUDP→TLS→watermark but rejects every hub/user combination (err 8/9). No client-side workaround; surfaced as a clean login error, and the row is effectively unusable.
 - CGNAT servers are transient; phase acceptance does **not** depend on any single live server — primary proof = transport loopback + rendezvous unit test + paid-server forced NAT-T.
 
 References:
@@ -273,6 +471,13 @@ References:
 | R-UDP-only mode (no NAT-T) contrast | `ClientConnectGetSocket` `Cedar/Protocol.c:7642-7683` (`PortUDP != 0` → direct only) |
 | Wire captures | `/tmp/opencode/natt_test.pcap` (rendezvous 258 B → 145 B), `/tmp/opencode/natt_paid.pcap` (TCP wins race, no relay traffic) |
 | Backup snapshot | `backup/pre-nat-t-rudp-revert-20260725` (Phase 6 plan section; pre-revert state; vendored upstream source) |
+| ConnectEx4 4-way race | `ConnectEx4` `Mayaqua/Network.c:16287-16520`; thread params `CONNECT_TCP_RUDP_PARAM` `Network.h:910-934`; priority ICMP/DNS over TCP/NAT-T (lines 16530-16533) |
+| ICMP R-UDP transport | `ConnectThreadForOverDnsOrIcmp` `Network.c:16212`; `NewRUDPClientDirect` with `MAKE_SPECIAL_PORT(IPPROTO_ICMPV4)`; raw socket `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` at `Network.c:12837`; ICMP packet format: header(4) + echo(4) + SHA1(20) + payload at `Network.c:4432-4472` |
+| DNS R-UDP transport | Same thread with `RUDP_PROTOCOL_DNS`; normal UDP socket to port 53; DNS query: TranId(2) + header(11) + random_label(8) + EDNS0(10) + size(2) + payload at `Network.c:4474-4504`; 42-byte overhead |
+| ICMP keepalive | Random-sized Echo Requests every 1-3s (`RUDP_CLIENT_ECHO_REQUEST_SEND_INTERVAL_MIN/MAX`) at `Network.c:2794-2812` |
+| DNS transaction ID | `se->Dns_TranId` saved from first packet; reused for all session packets (`Network.c:2139,2912,3996`) |
+| ICMP/DNS MSS overhead | ICMP: +28 bytes; DNS: +50 bytes (`RUDPCalcBestMssForBulk` `Network.c:1554-1568`) |
+| ICMP/DNS server enablement | `Listener.c:687-695` — only started when server config enables it; may not be active on all VPN Gate servers |
 
 ---
 
@@ -986,6 +1191,14 @@ Install outputs to `jniLibs/{armeabi-v7a,arm64-v8a,x86,x86_64}/` as `libssl.a` +
 | OpenSSL 3.x cipher provider missing | OpenSSL Upgrade | AES/MD5/SHA1/ChaCha20 use default provider (auto-loaded); RC4/DES/Blowfish need legacy provider if switched to EVP |
 | Prebuilt lib rebuild breaks link | OpenSSL Upgrade | Rebuild all 4 ABIs from 3.5.7 source with NDK; verify `libssl.a`/`libcrypto.a` symbols with `strings` |
 | OpenSSL 4.0 breaking changes | OpenSSL Upgrade | Avoid 4.0 (major version); stay on 3.5 LTS until code is audited for 4.0 API changes |
+| Parallel race thread leak | Parallel Race | Losing threads must clean up fds/transports/SSL; use cancel_flag + pthread_join to ensure termination |
+| Parallel race deadlock | Parallel Race | Avoid holding locks across thread boundaries; use atomic CAS for winner claim |
+| Blocking ops not cancellable | Parallel Race | `nat_t_connect()` select loop and `rudp_transport_connect()` cond_wait must check cancel_flag |
+| DNS R-UDP not enabled on server | DNS Transport | Server may not have DNS R-UDP listener on port 53; connection attempt will timeout — graceful degradation |
+| ICMP requires root/CAP_NET_RAW | ICMP Transport | Production Android apps cannot create raw sockets; ICMP transport only available on rooted devices |
+| ICMP R-UDP not enabled on server | ICMP Transport | Server may not have ICMP R-UDP listener; connection attempt will timeout — graceful degradation |
+| ICMP Echo Reply filtered by gateway | ICMP Transport | Some CGNAT gateways drop non-standard ICMP; transport may not work even when server is listening |
+| "UDP (NAT-T)" label removal | UI | Users familiar with the old label may be confused; generic "SoftEther UDP" is more accurate |
 
 ---
 

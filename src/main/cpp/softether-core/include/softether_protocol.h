@@ -66,6 +66,41 @@ typedef enum {
     STATE_DISCONNECTING
 } softether_state_t;
 
+// Transport type identifiers for the parallel connect race (Phase 12B).
+// Mirrors the official client's ConnectEx4 4-way race:
+//   p1 = TCP direct, p2 = NAT-T relay, p3 = ICMP, p4 = DNS.
+// We add RUDP_DIRECT (direct R-UDP to seUdpPort) between TCP and NAT-T.
+#define TRANSPORT_TCP           0
+#define TRANSPORT_RUDP_DIRECT   1
+#define TRANSPORT_NATT          2
+#define TRANSPORT_DNS           3
+#define TRANSPORT_ICMP          4
+#define NUM_TRANSPORTS          5
+
+// Staggered delays before each transport attempt (milliseconds).
+// Matches the official client's ConnectEx4 delays (Network.c:16487-16493).
+#define TRANSPORT_DELAY_TCP_MS      0
+#define TRANSPORT_DELAY_RUDP_MS     0
+#define TRANSPORT_DELAY_NATT_MS    30
+#define TRANSPORT_DELAY_DNS_MS    100
+#define TRANSPORT_DELAY_ICMP_MS   200
+
+// Maximum time to wait for any transport to succeed (the "give up" deadline).
+// Shorter than the sequential sum because parallel attempts run concurrently.
+#define TRANSPORT_RACE_TIMEOUT_MS  15000
+
+// Result from a single transport attempt in the parallel race.
+typedef struct {
+    int transport_type;         // TRANSPORT_*
+    int socket_fd;              // Won transport's fd (promoted into conn on win)
+    void* ssl_ctx;              // ssl_context_t* (won transport)
+    void* ssl;                  // ssl_context_t* (won transport)
+    rudp_transport_t* transport; // For R-UDP-based transports (NATT/DNS/ICMP/RUDP_DIRECT)
+    int error;                  // ERR_NONE on success, error code on failure
+    int finished;               // atomic: 1 when this attempt completed
+    int ok;                     // atomic: 1 on success (only set by winner)
+} transport_result_t;
+
 // Receive queue for multi-block messages
 #define RECV_QUEUE_SIZE 64
 #define MAX_QUEUED_FRAME 1600

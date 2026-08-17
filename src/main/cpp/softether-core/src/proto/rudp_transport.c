@@ -13,6 +13,8 @@
 #include <poll.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <android/log.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -164,6 +166,10 @@ struct rudp_transport {
     pthread_cond_t cond;
     int result_ready;
     int result_ok;
+    int transport_mode;          // RUDP_T_MODE_*
+    uint16_t dns_tran_id;        // DNS transaction ID (for DNS mode)
+    uint8_t client_icmp_id[2];   // ICMP identifier (for ICMP mode)
+    uint8_t client_icmp_seq[2];  // ICMP sequence number (for ICMP mode)
     rt_session_t se;
 };
 
@@ -173,10 +179,131 @@ static void rt_send_udp(rudp_transport_t* t, const uint8_t* data, uint32_t size)
     dst.sin_family = AF_INET;
     dst.sin_port = htons(t->se.your_port);
     dst.sin_addr.s_addr = t->se.your_ip;
-    ssize_t n = sendto(t->udp_fd, data, size, 0,
-                       (struct sockaddr*)&dst, sizeof(dst));
-    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        LOGD("rt: sendto failed: %s", strerror(errno));
+
+    if (t->transport_mode == RUDP_T_MODE_DNS) {
+        // Wrap in DNS TXT query (36-byte header)
+        uint8_t pkt[RUDP_T_MAX_PACKET_SIZE + 64];
+        uint8_t hex_str[9];
+        uint8_t rand_data[4];
+        uint32_t offset = 0;
+
+        // Transaction ID
+        uint16_t tran_id = t->dns_tran_id;
+        pkt[offset++] = (uint8_t)(tran_id >> 8);
+        pkt[offset++] = (uint8_t)(tran_id & 0xFF);
+
+        // DNS query header (11 bytes)
+        static const uint8_t dns_qhdr[] = {
+            0x01, 0x00,   // Flags: standard query (RD=1)
+            0x00, 0x01,   // QDCOUNT = 1
+            0x00, 0x00,   // ANCOUNT = 0
+            0x00, 0x00,   // NSCOUNT = 0
+            0x00, 0x01,   // ARCOUNT = 1 (EDNS0 OPT)
+            0x08,         // Label length = 8
+        };
+        memcpy(pkt + offset, dns_qhdr, sizeof(dns_qhdr));
+        offset += sizeof(dns_qhdr);
+
+        // 8 random hex characters (the label)
+        generate_random_bytes(rand_data, 4);
+        for (int i = 0; i < 4; i++) {
+            static const char hex[] = "0123456789abcdef";
+            hex_str[i * 2]     = hex[(rand_data[i] >> 4) & 0x0F];
+            hex_str[i * 2 + 1] = hex[rand_data[i] & 0x0F];
+        }
+        memcpy(pkt + offset, hex_str, 8);
+        offset += 8;
+
+        // Root label + QTYPE TXT + QCLASS IN
+        static const uint8_t dns_qtail[] = {
+            0x00,         // Root label
+            0x00, 0x30,   // QTYPE = TXT (48)
+            0x00, 0x01,   // QCLASS = IN
+            // EDNS0 OPT record
+            0x00,         // Root label
+            0x29,         // Type = OPT (41)
+            0x10, 0x00,   // UDP payload size: 4096
+            0x00, 0x00,   // Extended RCODE / Version
+            0x80, 0x00,   // DO flag set, Z=0
+        };
+        memcpy(pkt + offset, dns_qtail, sizeof(dns_qtail));
+        offset += sizeof(dns_qtail);
+
+        // EDNS0 RDATA length (big-endian)
+        pkt[offset++] = (uint8_t)(size >> 8);
+        pkt[offset++] = (uint8_t)(size & 0xFF);
+
+        // R-UDP payload
+        memcpy(pkt + offset, data, size);
+        offset += size;
+
+        ssize_t n = sendto(t->udp_fd, pkt, offset, 0,
+                           (struct sockaddr*)&dst, sizeof(dst));
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGD("rt: DNS sendto failed: %s", strerror(errno));
+        }
+    } else if (t->transport_mode == RUDP_T_MODE_ICMP) {
+        // Wrap in ICMP Echo Request (28-byte overhead: 4 header + 4 echo + 20 SHA1)
+        uint8_t pkt[RUDP_T_MAX_PACKET_SIZE + 64];
+        uint32_t offset = 0;
+
+        // ICMP Header (4 bytes)
+        pkt[offset++] = 8;  // Type: Echo Request
+        pkt[offset++] = 0;  // Code
+        pkt[offset++] = 0;  // Checksum (placeholder)
+        pkt[offset++] = 0;
+
+        // ICMP Echo (4 bytes)
+        pkt[offset++] = t->client_icmp_id[0];
+        pkt[offset++] = t->client_icmp_id[1];
+        pkt[offset++] = t->client_icmp_seq[0];
+        pkt[offset++] = t->client_icmp_seq[1];
+
+        // SHA1 hash of the R-UDP payload
+        uint8_t hash_val[RUDP_T_SHA1_SIZE];
+        sha1_hash(data, size, hash_val);
+        memcpy(pkt + offset, hash_val, RUDP_T_SHA1_SIZE);
+        offset += RUDP_T_SHA1_SIZE;
+
+        // R-UDP payload
+        memcpy(pkt + offset, data, size);
+        offset += size;
+
+        // Compute ICMP checksum
+        uint32_t sum = 0;
+        for (uint32_t i = 0; i < offset; i += 2) {
+            uint16_t word = (uint16_t)(pkt[i] << 8 | (i + 1 < offset ? pkt[i + 1] : 0));
+            sum += word;
+        }
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        uint16_t cksum = (uint16_t)(~sum & 0xFFFF);
+        pkt[2] = (uint8_t)(cksum >> 8);
+        pkt[3] = (uint8_t)(cksum & 0xFF);
+
+        ssize_t n = sendto(t->udp_fd, pkt, offset, 0,
+                           (struct sockaddr*)&dst, sizeof(dst));
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGD("rt: ICMP sendto failed: %s", strerror(errno));
+        }
+    } else {
+        // Plain UDP (original path)
+        ssize_t n = sendto(t->udp_fd, data, size, 0,
+                           (struct sockaddr*)&dst, sizeof(dst));
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGD("rt: sendto failed: %s", strerror(errno));
+        }
+    }
+
+    if (size >= 1) {
+        t->se.last_sent_tick = rt_tick64();
+    }
+
+    // Next IV: random 20 bytes (for non-DNS/ICMP modes, use raw data)
+    if (t->transport_mode == RUDP_T_MODE_UDP) {
+        uint32_t next_iv_pos = (uint32_t)(rand() % (size > RUDP_T_SHA1_SIZE ? size - RUDP_T_SHA1_SIZE : 1));
+        memcpy(t->se.next_iv, data + next_iv_pos, RUDP_T_SHA1_SIZE);
+    } else {
+        generate_random_bytes(t->se.next_iv, RUDP_T_SHA1_SIZE);
     }
 }
 
@@ -724,8 +851,45 @@ static void* rt_worker(void* param) {
                 break;
             }
             if (n == 0) break;
+
+            // Strip transport-specific framing before passing to R-UDP handler
+            const uint8_t* payload = buf;
+            uint32_t payload_size = (uint32_t)n;
+
+            if (t->transport_mode == RUDP_T_MODE_DNS) {
+                // DNS response: strip 42-byte header
+                if (payload_size > 42) {
+                    // Save the DNS transaction ID from the response
+                    t->dns_tran_id = (uint16_t)((buf[0] << 8) | buf[1]);
+                    payload = buf + 42;
+                    payload_size -= 42;
+                } else {
+                    continue; // Too short to be a valid DNS response
+                }
+            } else if (t->transport_mode == RUDP_T_MODE_ICMP) {
+                // ICMP Echo: parse raw IP+ICMP, strip 28-byte ICMP overhead
+                // Raw socket delivers IP header + ICMP header + data
+                uint32_t ip_header_size = 0;
+                if (payload_size >= 20 && (buf[0] >> 4) == 4) {
+                    ip_header_size = (buf[0] & 0x0F) * 4;
+                }
+                uint32_t icmp_offset = ip_header_size;
+                if (payload_size >= icmp_offset + 28) {
+                    uint8_t type = buf[icmp_offset];
+                    // Accept Echo Response (0) or Echo Request (8)
+                    if (type == 0 || type == 8) {
+                        payload = buf + icmp_offset + 8 + RUDP_T_SHA1_SIZE; // skip ICMP header(4)+Echo(4)+SHA1(20)
+                        payload_size -= (icmp_offset + 8 + RUDP_T_SHA1_SIZE);
+                    } else {
+                        continue; // Not an Echo packet
+                    }
+                } else {
+                    continue; // Too short
+                }
+            }
+
             rt_handle_udp_packet(t, src.sin_addr.s_addr, ntohs(src.sin_port),
-                                 buf, (uint32_t)n);
+                                 payload, payload_size);
         }
 
         if (se->status != RT_STATUS_DISCONNECTED) {
@@ -836,7 +1000,8 @@ static int rt_set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* cfg) {
+int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* cfg,
+                           const volatile int* cancel_flag) {
     rt_session_t* se;
     int fds[2] = {-1, -1};
     int udp_fd = -1;
@@ -854,11 +1019,30 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
     timeout_ms = cfg->connect_timeout_ms != 0 ? cfg->connect_timeout_ms
                                               : RUDP_T_TIMEOUT_MS;
     t->connect_timeout_ms = timeout_ms;
+    t->transport_mode = cfg->transport_mode;
 
-    // UDP socket
+    // Create the appropriate socket for the transport mode
     if (cfg->udp_fd >= 0) {
         udp_fd = cfg->udp_fd;
+    } else if (t->transport_mode == RUDP_T_MODE_ICMP) {
+        // ICMP: raw socket (requires root / CAP_NET_RAW on Android)
+        udp_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (udp_fd < 0) {
+            LOGE("rt: SOCK_RAW IPPROTO_ICMP failed: %s (no root?)", strerror(errno));
+            t->error_code = RUDP_T_ERR_UNKNOWN;
+            return -1;
+        }
+        // Generate random ICMP ID and sequence number
+        uint16_t my_icmp_id = (uint16_t)(rand() % 65535 + 1);
+        uint16_t my_icmp_seq = (uint16_t)(rand() % 65535 + 1);
+        t->client_icmp_id[0] = (uint8_t)(my_icmp_id >> 8);
+        t->client_icmp_id[1] = (uint8_t)(my_icmp_id & 0xFF);
+        t->client_icmp_seq[0] = (uint8_t)(my_icmp_seq >> 8);
+        t->client_icmp_seq[1] = (uint8_t)(my_icmp_seq & 0xFF);
+        // ICMP uses "port" 0 (the echo ID) as the server port for addressing
+        t->se.your_port = 0;  // ICMP has no port; addressed by IP only
     } else {
+        // UDP (plain or DNS): regular datagram socket
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (udp_fd < 0) {
             t->error_code = RUDP_T_ERR_UNKNOWN;
@@ -873,6 +1057,10 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
             close(udp_fd);
             t->error_code = RUDP_T_ERR_UNKNOWN;
             return -1;
+        }
+        // DNS mode: generate random transaction ID
+        if (t->transport_mode == RUDP_T_MODE_DNS) {
+            t->dns_tran_id = (uint16_t)(rand() % 65535 + 1);
         }
     }
     if (rt_set_nonblocking(udp_fd) != 0) {
@@ -936,6 +1124,13 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
     deadline = rt_tick64() + timeout_ms + 1000;
     pthread_mutex_lock(&t->lock);
     while (!t->result_ready) {
+        // Check cancel flag (parallel race: another transport won)
+        if (cancel_flag && *cancel_flag) {
+            LOGD("rudp_transport: cancelled by parallel race");
+            pthread_mutex_unlock(&t->lock);
+            t->error_code = RUDP_T_ERR_TIMEOUT;
+            goto fail;
+        }
         ts.tv_sec = (time_t)(deadline / 1000);
         ts.tv_nsec = (long)(deadline % 1000) * 1000000L;
         if (pthread_cond_timedwait(&t->cond, &t->lock, &ts) != 0) {

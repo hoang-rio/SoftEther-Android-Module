@@ -43,8 +43,11 @@ int nat_t_build_hostname(uint32_t server_ip_net, char* dst, size_t dst_size);
 // public UDP address. On success returns 0 and fills result (result->udp_fd
 // is a valid, bound UDP socket unless same_lan is set). On failure returns
 // -1 and sets result->error_code.
+// cancel_flag: if non-NULL and *cancel_flag becomes non-zero, the function
+// returns early with NAT_T_ERR_NO_RESPONSE. Used by the parallel connect race.
 int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
-                  uint32_t timeout_ms, softether_nat_t_result_t* result);
+                  uint32_t timeout_ms, softether_nat_t_result_t* result,
+                  const volatile int* cancel_flag);
 
 #ifdef __cplusplus
 }

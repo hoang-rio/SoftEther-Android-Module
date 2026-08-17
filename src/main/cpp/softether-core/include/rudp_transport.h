@@ -43,6 +43,11 @@ extern "C" {
 #define RUDP_T_ERR_UNKNOWN          1
 #define RUDP_T_ERR_TIMEOUT          2
 
+// Transport modes: how R-UDP segments are framed on the wire.
+#define RUDP_T_MODE_UDP             0   // Plain UDP datagrams (original)
+#define RUDP_T_MODE_DNS             1   // DNS TXT queries/responses to port 53
+#define RUDP_T_MODE_ICMP            2   // ICMP Echo (requires root/CAP_NET_RAW)
+
 typedef struct rudp_transport rudp_transport_t;
 
 typedef struct {
@@ -50,6 +55,7 @@ typedef struct {
     uint16_t server_port;        // host byte order
     int udp_fd;                  // bound UDP socket to reuse (from nat_t), or -1
     uint32_t connect_timeout_ms; // 0 => RUDP_T_TIMEOUT_MS
+    int transport_mode;          // RUDP_T_MODE_* (default: UDP)
 } rudp_transport_config_t;
 
 // Create an empty transport object.
@@ -62,7 +68,10 @@ void rudp_transport_destroy(rudp_transport_t* t);
 // Connect over RUDP. Blocks until the session is established (first valid
 // segment received from the server) or fails. Returns 0 on success.
 // On success the app-facing fd is available via rudp_transport_get_fd().
-int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* cfg);
+// cancel_flag: if non-NULL and *cancel_flag becomes non-zero, the connect
+// returns early with RUDP_T_ERR_TIMEOUT. Used by the parallel connect race.
+int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* cfg,
+                           const volatile int* cancel_flag);
 
 // App-facing byte-stream fd (valid after a successful connect). -1 otherwise.
 int rudp_transport_get_fd(rudp_transport_t* t);

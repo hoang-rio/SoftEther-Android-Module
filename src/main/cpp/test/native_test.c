@@ -1417,7 +1417,7 @@ native_test_result_t test_rudp_transport_loopback(void) {
   cfg.udp_fd = -1;
   cfg.connect_timeout_ms = 5000;
 
-  if (rudp_transport_connect(tr, &cfg) != 0) {
+  if (rudp_transport_connect(tr, &cfg, NULL) != 0) {
     rudp_transport_destroy(tr);
     server.stop = 1;
     pthread_join(server.thread, NULL);

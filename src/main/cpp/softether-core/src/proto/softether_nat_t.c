@@ -185,7 +185,8 @@ static int nat_t_parse_response(const uint8_t* buf, uint32_t len, uint64_t tran_
 }
 
 int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
-                  uint32_t timeout_ms, softether_nat_t_result_t* result) {
+                  uint32_t timeout_ms, softether_nat_t_result_t* result,
+                  const volatile int* cancel_flag) {
     if (result == NULL) {
         return -1;
     }
@@ -247,6 +248,13 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
     while (1) {
         uint64_t now = nat_t_tick_ms();
         if (now >= giveup_tick) {
+            result->error_code = NAT_T_ERR_NO_RESPONSE;
+            break;
+        }
+
+        // Check cancel flag (parallel race: another transport won)
+        if (cancel_flag && *cancel_flag) {
+            LOGD("nat_t: cancelled by parallel race");
             result->error_code = NAT_T_ERR_NO_RESPONSE;
             break;
         }
