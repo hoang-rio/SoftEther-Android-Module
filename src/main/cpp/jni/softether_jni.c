@@ -3,11 +3,19 @@
 #include <android/log.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
 
 #define TAG "SoftEtherJNI"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    (void)reserved;
+    signal(SIGPIPE, SIG_IGN);
+    LOGD("JNI_OnLoad: SIGPIPE ignored");
+    return JNI_VERSION_1_6;
+}
 
 // JNI Implementation for SoftEtherClient
 

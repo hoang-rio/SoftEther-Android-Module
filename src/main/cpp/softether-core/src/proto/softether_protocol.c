@@ -1409,6 +1409,16 @@ static int softether_establish_first_additional(softether_connection_t* conn) {
 static int softether_protocol_login(softether_connection_t* conn, const char* host,
                                     const char* username, const char* password,
                                     int use_tcp) {
+    // Set a receive timeout on the primary socket so the HTTP exchange cannot
+    // block forever if the server hangs or closes the connection abruptly.
+    {
+        int auth_timeout_ms = conn->timeout_ms > 0 ? conn->timeout_ms : 30000;
+        struct timeval tv;
+        tv.tv_sec = auth_timeout_ms / 1000;
+        tv.tv_usec = (auth_timeout_ms % 1000) * 1000;
+        setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     LOGD("Sending VPNCONNECT watermark (connect.cgi)...");
     int watermark_result = send_vpnconnect_watermark(conn, host);
 

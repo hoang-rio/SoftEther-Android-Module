@@ -406,22 +406,35 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     if (ctx == NULL || ctx->ssl == NULL || !ctx->connected) {
         return -1;
     }
-    
+
     // Check if there's pending data in the SSL buffer first
     int pending = SSL_pending(ctx->ssl);
     if (pending > 0 && pending % 500 == 0) {
         LOGD("SSL has %d bytes pending in buffer", pending);
     }
-    
-    int result = SSL_read(ctx->ssl, buffer, (int)len);
-    if (result < 0) {
-        int ssl_error = SSL_get_error(ctx->ssl, result);
-        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
-            unsigned long err_detail = ERR_get_error();
-            LOGE("SSL read error: %d, detail: %lu (%s)", ssl_error, err_detail,
-                 err_detail ? ERR_error_string(err_detail, NULL) : "none");
+
+    int result;
+    int retries = 0;
+    const int max_retries = 5;
+
+    do {
+        result = SSL_read(ctx->ssl, buffer, (int)len);
+        if (result > 0 || result == 0) {
+            break;
         }
-    } else if (result == 0) {
+        int ssl_error = SSL_get_error(ctx->ssl, result);
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            retries++;
+            LOGD("SSL read retry %d/%d (ssl_error=%d)", retries, max_retries, ssl_error);
+            continue;
+        }
+        unsigned long err_detail = ERR_get_error();
+        LOGE("SSL read error: %d, detail: %lu (%s)", ssl_error, err_detail,
+             err_detail ? ERR_error_string(err_detail, NULL) : "none");
+        break;
+    } while (retries < max_retries);
+
+    if (result == 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
         unsigned long err_detail = ERR_get_error();
         if (ssl_error == SSL_ERROR_ZERO_RETURN) {
