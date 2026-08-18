@@ -1542,46 +1542,6 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
 // advertised SoftEther UDP port (seUdpPort), without the NAT-T relay. Works
 // for nodes whose UDP port is publicly routable (public IP or port-forward).
 // Mirrors softether_try_nat_t_connect's success handling: conn->socket_fd
-// becomes the transport's byte-stream fd and the transport is stored in
-// conn->nat_t_transport for unified cleanup.
-static int softether_try_direct_udp_connect(softether_connection_t* conn,
-                                            const char* resolved_ip, int port) {
-    struct in_addr ip4;
-
-    if (inet_pton(AF_INET, resolved_ip, &ip4) != 1) {
-        LOGE("Direct R-UDP requires an IPv4 server address (got %s)", resolved_ip);
-        return ERR_TCP_CONNECT;
-    }
-
-    LOGD("Direct R-UDP connect to %s:%d ...", resolved_ip, port);
-    rudp_transport_t* tr = rudp_transport_create();
-    if (tr == NULL) {
-        LOGE("Failed to allocate RUDP transport");
-        return ERR_TCP_CONNECT;
-    }
-
-    rudp_transport_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.server_ip = ip4.s_addr;         // network byte order
-    cfg.server_port = (uint16_t)port;   // host byte order
-    cfg.udp_fd = -1;
-    cfg.connect_timeout_ms = (uint32_t)conn->timeout_ms;
-
-    if (rudp_transport_connect(tr, &cfg, NULL) != 0) {
-        LOGE("Direct R-UDP connect to %s:%d failed: %d", resolved_ip, port,
-             rudp_transport_get_error(tr));
-        rudp_transport_destroy(tr);
-        return ERR_TCP_CONNECT;
-    }
-
-    conn->nat_t_transport = tr;
-    conn->using_nat_t = 1;
-    conn->socket_fd = rudp_transport_get_fd(tr);
-    LOGD("Direct R-UDP session established to %s:%d (fd=%d)", resolved_ip, port,
-         conn->socket_fd);
-    return ERR_NONE;
-}
-
 // ============================================================================
 // Phase 12B: Parallel transport race
 // ============================================================================
@@ -2071,7 +2031,6 @@ static void* transport_thread_icmp(void* arg) {
 static int softether_connect_parallel_race(softether_connection_t* conn,
                                            const char* host, const char* resolved_ip,
                                            int port, const char* connect_host) {
-    int force_nat_t = (getenv("SOFTETHER_FORCE_NAT_T") != NULL);
     volatile int cancel_flag = 0;
 
     // Determine which transports to launch
