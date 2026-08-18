@@ -2599,6 +2599,16 @@ void softether_disconnect(softether_connection_t* conn) {
     // In real SoftEther, disconnect is simply closing the connection.
     // No special disconnect packet exists in the block protocol.
 
+    // Close primary fd FIRST so that any in-flight SSL_read returns with
+    // SSL_ERROR_SYSCALL instead of crashing on freed SSL internals.
+    if (conn->socket_fd >= 0) {
+        LOGD("Closing primary socket fd");
+        int saved_fd = conn->socket_fd;
+        conn->socket_fd = -1;
+        __sync_synchronize();
+        close(saved_fd);
+    }
+
     // Shutdown SSL only if it was initialized
     if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
         LOGD("Shutting down SSL");
@@ -2606,13 +2616,6 @@ void softether_disconnect(softether_connection_t* conn) {
         ssl_destroy((ssl_context_t*)conn->ssl_ctx);
         conn->ssl = NULL;
         conn->ssl_ctx = NULL;
-    }
-
-    // Close socket
-    if (conn->socket_fd >= 0) {
-        LOGD("Closing socket");
-        close(conn->socket_fd);
-        conn->socket_fd = -1;
     }
 
     // Destroy the NAT-T + RUDP transport if the connection used the fallback.
@@ -2780,12 +2783,14 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
             ts->late_count = 0;
             ts->last_recv = 0;
             __sync_synchronize();
+            // Close fd FIRST so any in-flight SSL_read/SSL_write returns error
+            // instead of crashing on freed SSL internals
+            if (saved_fd >= 0) {
+                close(saved_fd);
+            }
             if (saved_ssl_ctx != NULL) {
                 ssl_shutdown((ssl_context_t*)saved_ssl_ctx);
                 ssl_destroy((ssl_context_t*)saved_ssl_ctx);
-            }
-            if (saved_fd >= 0) {
-                close(saved_fd);
             }
             conn->num_additional--;
         }
@@ -3130,13 +3135,18 @@ void softether_close_additional(softether_connection_t* conn) {
         conn->additional_connecting = 0;
     }
 
-    // Phase 1: mark all slots inactive and NULL out pointers first.
+    // Phase 1: save fds, then mark all slots inactive and NULL out pointers.
     // This ensures concurrent readers (fill_recv_queue, select_send_socket)
     // see active=0 and ssl=NULL before we destroy anything.
+    int saved_fds[MAX_SE_CONNECTIONS];
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
-        if (!ts->active) continue;
+        if (!ts->active) {
+            saved_fds[i] = -1;
+            continue;
+        }
         LOGD("Closing additional connection [%d] fd=%d (marking inactive)", i, ts->socket_fd);
+        saved_fds[i] = ts->socket_fd;
         ts->active = 0;
         ts->ssl = NULL;
         ts->socket_fd = -1;
@@ -3145,7 +3155,15 @@ void softether_close_additional(softether_connection_t* conn) {
     }
     __sync_synchronize();  // full memory barrier: ensure all threads see the above stores
 
-    // Phase 2: now safely destroy SSL and close fds (no other thread references them)
+    // Phase 2: close fds FIRST so that any in-flight SSL_read returns with
+    // SSL_ERROR_SYSCALL instead of crashing on freed SSL internals.
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        if (saved_fds[i] >= 0) {
+            close(saved_fds[i]);
+        }
+    }
+    // Phase 3: now safely destroy SSL contexts (no thread can be blocked in
+    // SSL_read on these anymore because the underlying fd is closed)
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
         if (ts->ssl_ctx != NULL) {

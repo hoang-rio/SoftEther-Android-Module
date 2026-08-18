@@ -842,31 +842,46 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         int sel_is_additional = tcp_info[ssl_pending_idx].is_additional;
         int sel_add_idx = tcp_info[ssl_pending_idx].additional_idx;
 
-        // Revalidate: check that the SSL pointer is still valid (not freed by disconnect)
+        // Revalidate: check that the SSL pointer is still valid (not freed by disconnect).
+        // This guards against concurrent softether_disconnect / softether_close_additional
+        // destroying the SSL context between our poll() wake-up and the upcoming SSL_read.
         if (sel_ssl == NULL) {
             LOGW("fill_recv_queue: SSL became NULL for fd=%d, skipping", sel_fd);
             return 0;
         }
-        if (sel_is_additional && sel_add_idx >= 0) {
+        if (!sel_is_additional) {
+            // Primary socket: verify conn->ssl wasn't swapped out by disconnect
+            if (conn->ssl != sel_ssl || conn->socket_fd != sel_fd) {
+                LOGW("fill_recv_queue: primary socket ssl/fd mismatch, skipping");
+                return 0;
+            }
+        } else if (sel_add_idx >= 0) {
             softether_tcp_sock_t* check_ts = &conn->additional[sel_add_idx];
             if (!check_ts->active || check_ts->ssl != sel_ssl) {
                 LOGW("fill_recv_queue: additional socket [%d] ssl mismatch, skipping", sel_add_idx);
                 return 0;
             }
         }
+        if (conn->state == STATE_DISCONNECTING) {
+            LOGW("fill_recv_queue: state DISCONNECTING after poll, skipping");
+            return -1;
+        }
         __sync_synchronize();  // load-acquire before using sel_ssl
 
         // Helper macro to close and deactivate a failed additional socket.
         // Mark inactive BEFORE destroying to prevent use-after-free by other threads.
+        // Close fd FIRST so any in-flight SSL_write returns error instead of crashing.
         // Returns 0 to keep connection alive, or propagates -1 for primary socket failures
         #define CLOSE_FAILED_ADDITIONAL_SOCKET() do { \
             if (sel_is_additional && sel_add_idx >= 0) { \
                 LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd); \
                 softether_tcp_sock_t* _ts = &conn->additional[sel_add_idx]; \
+                int _saved_fd = _ts->socket_fd; \
                 _ts->active = 0; \
                 _ts->ssl = NULL; \
                 _ts->socket_fd = -1; \
                 __sync_synchronize(); \
+                if (_saved_fd >= 0) close(_saved_fd); \
                 if (_ts->ssl_ctx != NULL) { \
                     ssl_shutdown((ssl_context_t*)_ts->ssl_ctx); \
                     ssl_destroy((ssl_context_t*)_ts->ssl_ctx); \
