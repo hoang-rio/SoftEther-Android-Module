@@ -418,6 +418,10 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     const int max_retries = 5;
 
     do {
+        if (!ctx->connected) {
+            LOGE("SSL read: connection lost");
+            return -1;
+        }
         result = SSL_read(ctx->ssl, buffer, (int)len);
         if (result > 0 || result == 0) {
             break;
@@ -426,6 +430,11 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
         if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
             retries++;
             LOGD("SSL read retry %d/%d (ssl_error=%d)", retries, max_retries, ssl_error);
+            continue;
+        }
+        if (ssl_error == SSL_ERROR_SYSCALL && (errno == EINTR || errno == EAGAIN)) {
+            retries++;
+            LOGD("SSL read retry %d/%d (syscall errno=%d)", retries, max_retries, errno);
             continue;
         }
         unsigned long err_detail = ERR_get_error();

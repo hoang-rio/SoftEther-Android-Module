@@ -136,10 +136,13 @@ static int raw_read_all_fd(int fd, uint8_t* buf, int len) {
     int total = 0;
     while (total < len) {
         int ret = (int)recv(fd, buf + total, len - total, 0);
-        if (ret <= 0) {
-            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 continue;
             }
+            return -1;
+        }
+        if (ret == 0) {
             return -1;
         }
         total += ret;
