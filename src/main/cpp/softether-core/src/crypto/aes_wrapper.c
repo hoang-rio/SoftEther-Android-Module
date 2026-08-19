@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <android/log.h>
 
 #define TAG "SoftEtherCrypto"
@@ -32,6 +33,35 @@ struct ssl_context {
     BIO* bio;
     int connected;
 };
+
+// Shared SSL_CTX — created once, reused by all ssl_context_t instances.
+// SSL_CTX is thread-safe for sharing; only SSL objects are per-connection.
+static SSL_CTX* g_shared_ssl_ctx = NULL;
+static pthread_once_t g_ssl_ctx_once = PTHREAD_ONCE_INIT;
+
+static void ssl_init_shared_ctx(void) {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+
+    const SSL_METHOD* method = TLS_client_method();
+    g_shared_ssl_ctx = SSL_CTX_new(method);
+    if (g_shared_ssl_ctx == NULL) {
+        LOGE("Failed to create shared SSL context");
+        return;
+    }
+
+    // Restrict to TLS 1.2 max — VPNGate servers reject TLS 1.3 ClientHellos with RST
+    SSL_CTX_set_min_proto_version(g_shared_ssl_ctx, TLS1_VERSION);
+    SSL_CTX_set_max_proto_version(g_shared_ssl_ctx, TLS1_2_VERSION);
+
+    // Auto-retry for renegotiation transparency
+    SSL_CTX_set_mode(g_shared_ssl_ctx, SSL_MODE_AUTO_RETRY);
+
+    // Disable verification for VPN connections (self-signed certs are common)
+    SSL_CTX_set_verify(g_shared_ssl_ctx, SSL_VERIFY_NONE, NULL);
+
+    LOGD("Shared SSL context created");
+}
 
 aes_context_t* aes_create(int mode, const uint8_t* key, size_t key_len, 
                           const uint8_t* iv, size_t iv_len) {
@@ -266,31 +296,20 @@ ssl_context_t* ssl_create_client(void) {
         LOGE("Failed to allocate SSL context");
         return NULL;
     }
-    
-    // Initialize OpenSSL
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-    
-    const SSL_METHOD* method = TLS_client_method();
-    ctx->ctx = SSL_CTX_new(method);
-    
-    if (ctx->ctx == NULL) {
-        LOGE("Failed to create SSL context");
+
+    // Ensure shared SSL_CTX is initialized (once, thread-safe)
+    pthread_once(&g_ssl_ctx_once, ssl_init_shared_ctx);
+    if (g_shared_ssl_ctx == NULL) {
+        LOGE("Shared SSL context not available");
         free(ctx);
         return NULL;
     }
-    
-    // Restrict to TLS 1.2 max — VPNGate servers reject TLS 1.3 ClientHellos with RST
-    SSL_CTX_set_min_proto_version(ctx->ctx, TLS1_VERSION);
-    SSL_CTX_set_max_proto_version(ctx->ctx, TLS1_2_VERSION);
 
-    // Auto-retry for renegotiation transparency
-    SSL_CTX_set_mode(ctx->ctx, SSL_MODE_AUTO_RETRY);
+    // Increment refcount so the shared ctx survives until all users release it
+    SSL_CTX_up_ref(g_shared_ssl_ctx);
+    ctx->ctx = g_shared_ssl_ctx;
 
-    // Disable verification for VPN connections (self-signed certs are common)
-    SSL_CTX_set_verify(ctx->ctx, SSL_VERIFY_NONE, NULL);
-    
-    LOGD("SSL client context created");
+    LOGD("SSL client context created (shared)");
     return ctx;
 }
 
