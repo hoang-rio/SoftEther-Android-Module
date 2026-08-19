@@ -151,11 +151,17 @@ static int raw_read_all_fd(int fd, uint8_t* buf, int len) {
 }
 
 // Read `len` bytes from a specific socket (SSL or raw).
+// Thread-safe: acquires write_mutex for SSL reads to serialize against
+// concurrent SSL_write from the send thread (BoringSSL SSL objects are not
+// thread-safe for concurrent read+write on the same SSL*).
 static int data_read_all_sock(softether_connection_t* conn,
                               void* ssl, int socket_fd,
                               uint8_t* buf, int len) {
     if (conn->use_ssl_data) {
-        return ssl_read_all_ctx((ssl_context_t*)ssl, buf, len);
+        pthread_mutex_lock(&conn->write_mutex);
+        int ret = ssl_read_all_ctx((ssl_context_t*)ssl, buf, len);
+        pthread_mutex_unlock(&conn->write_mutex);
+        return ret;
     } else {
         return raw_read_all_fd(socket_fd, buf, len);
     }
@@ -199,9 +205,14 @@ static int data_write_all_sock(softether_connection_t* conn,
 }
 
 // Read `len` bytes using the appropriate channel (SSL or raw TCP)
+// Thread-safe: acquires write_mutex for SSL reads to serialize against
+// concurrent SSL_write from the send thread.
 static int data_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
     if (conn->use_ssl_data) {
-        return ssl_read_all(conn, buf, len);
+        pthread_mutex_lock(&conn->write_mutex);
+        int ret = ssl_read_all(conn, buf, len);
+        pthread_mutex_unlock(&conn->write_mutex);
+        return ret;
     } else {
         return raw_read_all(conn, buf, len);
     }
