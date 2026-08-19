@@ -7,7 +7,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <netinet/tcp.h>
 #include <android/log.h>
@@ -229,19 +229,14 @@ static int try_connect_addr(softether_socket_t* sock, struct addrinfo* ai,
     int result = connect(sock->fd, (struct sockaddr*)&sock->addr, sock->addr_len);
 
     if (result < 0 && errno == EINPROGRESS) {
-        // Connection in progress, wait for it
-        fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(sock->fd, &fdset);
+        struct pollfd pfd;
+        pfd.fd = sock->fd;
+        pfd.events = POLLOUT;
 
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        result = select(sock->fd + 1, NULL, &fdset, NULL, &tv);
+        result = poll(&pfd, 1, timeout_ms);
 
         if (result < 0) {
-            LOGE("Select failed: %s", strerror(errno));
+            LOGE("Poll failed: %s", strerror(errno));
             return -1;
         } else if (result == 0) {
             LOGE("Connection timeout");
@@ -369,17 +364,13 @@ int socket_send_all(softether_socket_t* sock, const uint8_t* data, size_t len, i
     size_t total_sent = 0;
     
     while (total_sent < len) {
-        fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(sock->fd, &fdset);
-        
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        
-        int result = select(sock->fd + 1, NULL, &fdset, NULL, &tv);
+        struct pollfd pfd;
+        pfd.fd = sock->fd;
+        pfd.events = POLLOUT;
+
+        int result = poll(&pfd, 1, timeout_ms);
         if (result < 0) {
-            LOGE("Select failed: %s", strerror(errno));
+            LOGE("Poll failed: %s", strerror(errno));
             return -1;
         } else if (result == 0) {
             LOGE("Send timeout");
@@ -414,17 +405,13 @@ int socket_recv_all(softether_socket_t* sock, uint8_t* buffer, size_t len, int t
     size_t total_received = 0;
     
     while (total_received < len) {
-        fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(sock->fd, &fdset);
-        
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        
-        int result = select(sock->fd + 1, &fdset, NULL, NULL, &tv);
+        struct pollfd pfd;
+        pfd.fd = sock->fd;
+        pfd.events = POLLIN;
+
+        int result = poll(&pfd, 1, timeout_ms);
         if (result < 0) {
-            LOGE("Select failed: %s", strerror(errno));
+            LOGE("Poll failed: %s", strerror(errno));
             return -1;
         } else if (result == 0) {
             LOGE("Receive timeout");

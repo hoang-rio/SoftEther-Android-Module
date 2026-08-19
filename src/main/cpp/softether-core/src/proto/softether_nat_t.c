@@ -10,7 +10,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <android/log.h>
 
@@ -262,11 +262,10 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
         // Drain any pending response packets.
         int have_pending = 1;
         while (have_pending) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-            struct timeval tv = {0, 0};
-            int s = select(fd + 1, &rfds, NULL, NULL, &tv);
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            int s = poll(&pfd, 1, 0);
             if (s <= 0) {
                 have_pending = 0;
                 break;
@@ -344,13 +343,10 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
                 wait_ms = d;
             }
         }
-        struct timeval tv;
-        tv.tv_sec = (time_t)(wait_ms / 1000);
-        tv.tv_usec = (suseconds_t)((wait_ms % 1000) * 1000);
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        select(fd + 1, &rfds, NULL, NULL, &tv);
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        poll(&pfd, 1, (int)wait_ms);
     }
 
     if (fd_valid && fd >= 0) {
