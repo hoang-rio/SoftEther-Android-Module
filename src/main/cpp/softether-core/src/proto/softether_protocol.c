@@ -925,12 +925,6 @@ softether_connection_t* softether_create(void) {
     // Set default hub name
     strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
 
-    // Initialize callbacks to NULL
-    conn->on_connect = NULL;
-    conn->on_disconnect = NULL;
-    conn->on_data = NULL;
-    conn->on_error = NULL;
-
     // Initialize write mutex for thread-safe SSL writes
     pthread_mutex_init(&conn->write_mutex, NULL);
 
@@ -2513,11 +2507,6 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         // The caller (DHCP, receive loop) will handle missing S2C gracefully.
     }
 
-    // Call connect callback if set
-    if (conn->on_connect != NULL) {
-        conn->on_connect(conn);
-    }
-
     return ERR_NONE;
 }
 
@@ -2621,10 +2610,6 @@ void softether_disconnect(softether_connection_t* conn) {
 
     LOGD("Disconnected");
 
-    // Call disconnect callback if set
-    if (conn->on_disconnect != NULL) {
-        conn->on_disconnect(conn);
-    }
 }
 
 // Ethernet header constants
