@@ -2190,7 +2190,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                                const char* client_os_name, const char* client_os_version, const char* client_os_product_id,
                                const char* client_host_name, const char* client_ip_address, int client_port,
                                const char* server_host_name, const char* server_ip_address, int server_port) {
-    int result;
+    int result = ERR_UNKNOWN;
     if (conn == NULL || host == NULL || username == NULL || password == NULL) {
         return ERR_UNKNOWN;
     }
@@ -2354,6 +2354,12 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
             LOGD("TCP+TLS failed (%d); falling back to parallel UDP race", result);
             softether_disconnect(conn);
             result = softether_connect_parallel_race(conn, host, resolved_ip, port, connect_host);
+            if (result == ERR_NONE && (conn->socket_fd < 0 || conn->ssl == NULL)) {
+                LOGE("Parallel race returned success but fd=%d ssl=%p is invalid",
+                     conn->socket_fd, conn->ssl);
+                softether_disconnect(conn);
+                result = ERR_TCP_CONNECT;
+            }
         }
     }
 
@@ -2485,12 +2491,18 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
     
     // Set appropriate timeout for data operations
-    int data_timeout_ms = 5000;
-    struct timeval tv;
-    tv.tv_sec = data_timeout_ms / 1000;
-    tv.tv_usec = (data_timeout_ms % 1000) * 1000;
-    setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    LOGD("Socket timeout set to %d ms for data operations", data_timeout_ms);
+    if (conn->socket_fd >= 0) {
+        int data_timeout_ms = 5000;
+        struct timeval tv;
+        tv.tv_sec = data_timeout_ms / 1000;
+        tv.tv_usec = (data_timeout_ms % 1000) * 1000;
+        setsockopt(conn->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        LOGD("Socket timeout set to %d ms for data operations", data_timeout_ms);
+    } else {
+        LOGE("No valid socket after connection setup");
+        softether_disconnect(conn);
+        return ERR_TCP_CONNECT;
+    }
 
     // Half-connection: establish first additional connection synchronously before returning.
     // Server sets primary to C2S on its side after login, so we need at least one S2C
