@@ -111,7 +111,7 @@ object ClientInfoFactory {
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
                     if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress
+                        return addr.hostAddress ?: "0.0.0.0"
                     }
                 }
             }
@@ -133,7 +133,7 @@ object ClientInfoFactory {
                         !addr.isLinkLocalAddress &&
                         addr is java.net.Inet6Address
                     ) {
-                        return addr.hostAddress
+                        return addr.hostAddress ?: "::"
                     }
                 }
             }

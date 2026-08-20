@@ -143,6 +143,7 @@ class SoftEtherVpnService : VpnService() {
     private var pendingStateUpdate: (() -> Unit)? = null
     private var currentSessionName: String? = null
 
+    @Suppress("DEPRECATION")
     private val networkReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ConnectivityManager.CONNECTIVITY_ACTION) {
@@ -205,9 +206,11 @@ class SoftEtherVpnService : VpnService() {
                 // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
                 // to support different activities without hardcoding keys here
                 try {
-                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
-                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
-                    putExtra(startKey, startValue)
+                    val startKey = notificationTargetActivity?.getField("TYPE_START")?.get(null)?.toString()
+                    val startValue = notificationTargetActivity?.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
+                    if (startKey != null && startValue != null) {
+                        putExtra(startKey, startValue)
+                    }
                 } catch (e: Exception) {
                     // Silent this exception
                 }
@@ -432,9 +435,11 @@ class SoftEtherVpnService : VpnService() {
                 // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
                 // Similar to OpenVPNService.getContentIntent()
                 try {
-                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
-                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
-                    putExtra(startKey, startValue)
+                    val startKey = notificationTargetActivity?.getField("TYPE_START")?.get(null)?.toString()
+                    val startValue = notificationTargetActivity?.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
+                    if (startKey != null && startValue != null) {
+                        putExtra(startKey, startValue)
+                    }
                 } catch (e: Exception) {
                     // Silent this exception
                 }
@@ -596,9 +601,11 @@ class SoftEtherVpnService : VpnService() {
                 // to support different activities without hardcoding keys here
                 // Similar to OpenVPNService.getContentIntent()
                 try {
-                    val startKey = notificationTargetActivity!!.getField("TYPE_START").get(null).toString()
-                    val startValue = notificationTargetActivity!!.getField("TYPE_FROM_NOTIFY").get(null).toString().toInt()
-                    putExtra(startKey, startValue)
+                    val startKey = notificationTargetActivity?.getField("TYPE_START")?.get(null)?.toString()
+                    val startValue = notificationTargetActivity?.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
+                    if (startKey != null && startValue != null) {
+                        putExtra(startKey, startValue)
+                    }
                 } catch (e: Exception) {
                     // Silent this exception
                 }
@@ -816,6 +823,7 @@ class SoftEtherVpnService : VpnService() {
         )
     }
 
+    @Suppress("DEPRECATION")
     private fun registerNetworkReceiver() {
         val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
         registerReceiver(networkReceiver, filter)

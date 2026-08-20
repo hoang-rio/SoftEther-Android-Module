@@ -192,7 +192,7 @@ class ConnectionController(
                             !addr.isLinkLocalAddress &&
                             (addr is java.net.Inet4Address || addr is java.net.Inet6Address)
                         ) {
-                            clientIp = addr.hostAddress
+                            clientIp = addr.hostAddress ?: "0.0.0.0"
                             break
                         }
                     }
@@ -286,7 +286,7 @@ class ConnectionController(
                 vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
                 vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
                 vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
-                else -> 0
+                vn.unlimit.softether.model.AuthMethod.AUTO -> 0
             }
             client.nativeSetAuthType(nativeHandle, authTypeInt)
         }
@@ -768,7 +768,7 @@ class ConnectionController(
                     vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
                     vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
                     vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
-                    else -> 0
+                    vn.unlimit.softether.model.AuthMethod.AUTO -> 0
                 }
                 client.nativeSetAuthType(nativeHandle, authTypeInt)
             }

@@ -82,7 +82,7 @@ class SoftEtherClient {
                 vn.unlimit.softether.model.AuthMethod.ANONYMOUS -> 0
                 vn.unlimit.softether.model.AuthMethod.PASSWORD -> 1
                 vn.unlimit.softether.model.AuthMethod.PLAIN_PASSWORD -> 2
-                else -> 0
+                vn.unlimit.softether.model.AuthMethod.AUTO -> 0
             }
             nativeSetAuthType(nativeHandle, authTypeInt)
         }
