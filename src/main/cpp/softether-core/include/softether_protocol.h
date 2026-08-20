@@ -279,6 +279,10 @@ int softether_get_num_connections(softether_connection_t* conn);
 int softether_get_active_socket_fds(softether_connection_t* conn, int* fds, int max_fds);
 void softether_additional_thread_wait(softether_connection_t* conn);
 
+// Force-close sockets without mutex — used to interrupt a blocking connect
+// held by softether_connect_with_hub so softether_destroy can proceed.
+void softether_force_close_socket(softether_connection_t* conn);
+
 // Reconnection support
 void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled);
 int softether_reconnect(softether_connection_t* conn);

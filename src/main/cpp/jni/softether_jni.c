@@ -407,3 +407,10 @@ JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nat
     (*env)->SetIntArrayRegion(env, arr, 0, 7, values);
     return arr;
 }
+
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeForceCloseSocket(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    softether_force_close_socket(conn);
+}

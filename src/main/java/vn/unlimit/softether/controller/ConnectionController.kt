@@ -538,10 +538,23 @@ class ConnectionController(
         }
         vpnInterface = null
 
-        // Free native handle without sending a graceful disconnect packet
+        // Force-close sockets to interrupt any blocking nativeConnectWithHub
+        // that may be holding connect_mutex.  This makes softether_connect_with_hub
+        // return with an error so softether_destroy can proceed without deadlock.
         val handle = nativeHandle
         nativeHandle = 0
         if (handle != 0L) {
+            try {
+                client.nativeForceCloseSocket(handle)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error force-closing socket", e)
+            }
+            // Brief yield so the blocking connect can notice the socket closure
+            // and release connect_mutex before we call nativeDestroy.
+            try {
+                Thread.sleep(200)
+            } catch (_: InterruptedException) {}
+
             try {
                 client.nativeDestroy(handle)
             } catch (e: Exception) {

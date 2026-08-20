@@ -289,6 +289,7 @@ class SoftEtherClient {
     external fun nativeSetMaxConnection(handle: Long, maxConnections: Int)
     external fun nativeGetNumConnections(handle: Long): Int
     external fun nativeGetAllSocketFds(handle: Long): IntArray?
+    external fun nativeForceCloseSocket(handle: Long)
 
     /**
      * Perform DHCP over SoftEther tunnel to get IP configuration

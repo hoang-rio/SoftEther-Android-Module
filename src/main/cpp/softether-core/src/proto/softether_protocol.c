@@ -998,6 +998,34 @@ void softether_destroy(softether_connection_t* conn) {
     LOGD("Connection destroyed");
 }
 
+// Force-close the primary socket fd without acquiring connect_mutex.
+// This interrupts any blocking SSL_read/SSL_write in softether_connect_with_hub,
+// causing it to return an error and release the mutex.  Must be called BEFORE
+// softether_destroy() when the connect thread may be stuck holding connect_mutex.
+void softether_force_close_socket(softether_connection_t* conn) {
+    if (conn == NULL) return;
+
+    // Close primary TCP socket
+    int fd = conn->socket_fd;
+    if (fd >= 0) {
+        conn->socket_fd = -1;
+        __sync_synchronize();
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        LOGD("Force-closed primary socket fd=%d", fd);
+    }
+
+    // Close NAT-T UDP socket if present
+    if (conn->nat_t_transport != NULL) {
+        int udp_fd = rudp_transport_get_fd(conn->nat_t_transport);
+        if (udp_fd >= 0) {
+            shutdown(udp_fd, SHUT_RDWR);
+            close(udp_fd);
+            LOGD("Force-closed NAT-T UDP fd=%d", udp_fd);
+        }
+    }
+}
+
 // Get current state
 softether_state_t softether_get_state(softether_connection_t* conn) {
     if (conn == NULL) {
