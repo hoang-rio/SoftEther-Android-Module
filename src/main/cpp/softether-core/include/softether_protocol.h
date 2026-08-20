@@ -202,6 +202,7 @@ typedef struct softether_connection {
     int is_ipv6;              // 1 if the connection is over IPv6
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
+    pthread_mutex_t connect_mutex;  // serializes connect/disconnect (recursive; connect calls disconnect internally)
     // Multi-connection support
     softether_tcp_sock_t additional[MAX_SE_CONNECTIONS];  // additional TCP sockets (index 0 unused; primary is in socket_fd/ssl)
     int num_additional;          // number of active additional connections

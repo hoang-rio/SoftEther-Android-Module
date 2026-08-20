@@ -928,6 +928,16 @@ softether_connection_t* softether_create(void) {
     // Initialize write mutex for thread-safe SSL writes
     pthread_mutex_init(&conn->write_mutex, NULL);
 
+    // Initialize connect mutex (recursive: softether_connect_with_hub calls
+    // softether_disconnect internally on error paths)
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&conn->connect_mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
+
     // Initialize multi-connection fields
     conn->num_additional = 0;
     conn->max_connection = 4;  // Target: request 4 connections in login PACK
@@ -982,6 +992,7 @@ void softether_destroy(softether_connection_t* conn) {
 
     // Destroy write mutex
     pthread_mutex_destroy(&conn->write_mutex);
+    pthread_mutex_destroy(&conn->connect_mutex);
 
     free(conn);
     LOGD("Connection destroyed");
@@ -2545,10 +2556,16 @@ void softether_disconnect(softether_connection_t* conn) {
         return;
     }
 
+    // Serialize with softether_connect_with_hub to prevent freeing SSL while
+    // the connect path is using it.  Recursive: softether_connect_with_hub
+    // calls softether_disconnect internally on error paths.
+    pthread_mutex_lock(&conn->connect_mutex);
+
     // Save the current state before changing it
     softether_state_t prev_state = conn->state;
-    
+
     if (prev_state == STATE_DISCONNECTED || prev_state == STATE_DISCONNECTING) {
+        pthread_mutex_unlock(&conn->connect_mutex);
         return;
     }
 
@@ -2610,6 +2627,7 @@ void softether_disconnect(softether_connection_t* conn) {
 
     LOGD("Disconnected");
 
+    pthread_mutex_unlock(&conn->connect_mutex);
 }
 
 // Ethernet header constants
