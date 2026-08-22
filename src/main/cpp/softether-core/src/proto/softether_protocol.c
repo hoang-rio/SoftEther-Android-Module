@@ -1005,23 +1005,27 @@ void softether_destroy(softether_connection_t* conn) {
 void softether_force_close_socket(softether_connection_t* conn) {
     if (conn == NULL) return;
 
-    // Close primary TCP socket
+    // Interrupt the primary TCP socket.  shutdown() causes any blocking
+    // SSL_read/SSL_write to return with an error, which lets the connect
+    // thread unwind and release connect_mutex.  We intentionally do NOT
+    // close() the fd or clear conn->socket_fd here — the connect thread
+    // still holds the SSL context that references this fd.  Closing it
+    // creates a window where BoringSSL dereferences a stale fd and
+    // clearing socket_fd would prevent softether_disconnect() from
+    // closing it later (fd leak).  The connect thread will close the fd
+    // properly via softether_disconnect().
     int fd = conn->socket_fd;
     if (fd >= 0) {
-        conn->socket_fd = -1;
-        __sync_synchronize();
         shutdown(fd, SHUT_RDWR);
-        close(fd);
-        LOGD("Force-closed primary socket fd=%d", fd);
+        LOGD("Force-interrupted primary socket fd=%d", fd);
     }
 
-    // Close NAT-T UDP socket if present
+    // Interrupt NAT-T UDP socket if present
     if (conn->nat_t_transport != NULL) {
         int udp_fd = rudp_transport_get_fd(conn->nat_t_transport);
         if (udp_fd >= 0) {
             shutdown(udp_fd, SHUT_RDWR);
-            close(udp_fd);
-            LOGD("Force-closed NAT-T UDP fd=%d", udp_fd);
+            LOGD("Force-interrupted NAT-T UDP fd=%d", udp_fd);
         }
     }
 }
