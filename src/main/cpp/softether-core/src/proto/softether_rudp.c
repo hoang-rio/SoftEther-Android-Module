@@ -355,6 +355,11 @@ void rudp_set_version(rudp_context_t* ctx, int version) {
     ctx->version = (version >= 2 && ctx->v2_cipher_inited) ? 2 : 1;
 }
 
+void rudp_set_compress(rudp_context_t* ctx, int enable) {
+    if (ctx == NULL) return;
+    ctx->use_compress = enable ? 1 : 0;
+}
+
 void rudp_set_fast_detect(rudp_context_t* ctx, int fast) {
     if (ctx == NULL) return;
     // Store in mss field (reusing as flags) — actual fast detect is handled by
@@ -647,13 +652,15 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
 
     ctx->now = tick64();
 
-    // Attempt zlib compression on payload
+    // Attempt zlib compression only when session compression was negotiated
+    // (Phase 13B: off by default — payloads are TLS-encrypted, incompressible).
+    // RX side still honours RUDP_FLAG_COMPRESSED for peers that compress.
     const uint8_t* send_data = data;
     uint32_t send_size = data_size;
     uint8_t compress_buf[RUDP_MAX_PAYLOAD_SIZE + 256];
     uint8_t send_flag = flag;
 
-    if (data_size > 1) {
+    if (ctx->use_compress && data_size > 1) {
         uint32_t comp_len = sizeof(compress_buf);
         if (compress_data(data, data_size, compress_buf, &comp_len) == 0) {
             send_data = compress_buf;

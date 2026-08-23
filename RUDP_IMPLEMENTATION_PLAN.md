@@ -119,7 +119,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | Phase | Description | Priority | Status |
 |-------|-------------|----------|--------|
 | 13A | Compile-time gate for hot-path logs | P0 | ✅ Done |
-| 13B | Disable session compression | P0 | ⬜ Not started |
+| 13B | Disable session compression | P0 | ✅ Done |
 | 13C | Zero-alloc send path | P0 | ⬜ Not started |
 | 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
@@ -133,12 +133,13 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Acceptance: zero `__android_log_print` calls on the steady-state data path (verify with logcat during iperf).
 - Implemented: `LOGT` macro added to `packet_handler.c`, `softether_protocol.c`, `softether_rudp.c`, `aes_wrapper.c`; ~25 per-packet/steady-state sites converted; CMake option `SE_TRACE_PACKETS` (OFF by default). Warnings/errors and rare anomaly logs unchanged.
 
-#### 13B — Session compression (P0)
+#### 13B — Session compression (P0) — DONE
 
 - Send `use_compress=0` in login PACK (`softether_protocol.c:645`) or make it config-driven (default off).
 - Keep the decompress fallback paths intact for servers that force compression.
 - Skip the zlib compress attempt in `rudp_send` unconditionally when session compression is off (`softether_rudp.c:649-656`).
 - Acceptance: `server_use_compress==0` in logs against VPN Gate server; CPU time per MB (simple `perf`/`simpleperf` smoke) measurably lower.
+- Implemented: login PACK advertises `use_compress=0`; new `rudp_context_t.use_compress` (default 0) + `rudp_set_compress()`, synced from the Welcome PACK so RUDP only compresses when the session negotiates it; TCP paths already gate on `server_use_compress`. Decompress fallbacks kept (TCP magic/session-header heuristics, RUDP `RUDP_FLAG_COMPRESSED`). Live acceptance (`server_use_compress==0`, CPU/MB) to be confirmed in next benchmark run.
 
 #### 13C — Zero-alloc send path (P0)
 

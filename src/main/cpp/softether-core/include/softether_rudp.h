@@ -109,6 +109,10 @@ typedef struct {
     uint32_t mss;
     uint32_t max_udp_packet_size;
 
+    // Session compression negotiated in the login PACK (Phase 13B).
+    // 0 (default): rudp_send sends payloads as-is.
+    int use_compress;
+
     // Receive queue (decoded blocks from UDP)
     rudp_queued_block_t recv_queue[RUDP_RECV_QUEUE_SIZE];
     int recv_queue_head;
@@ -153,6 +157,7 @@ int rudp_recv(rudp_context_t* ctx, uint8_t* buffer, uint32_t* len, uint32_t max_
 // Utility
 void rudp_set_version(rudp_context_t* ctx, int version);
 void rudp_set_fast_detect(rudp_context_t* ctx, int fast);
+void rudp_set_compress(rudp_context_t* ctx, int enable);
 int rudp_get_udp_fd(rudp_context_t* ctx);
 int rudp_is_active(rudp_context_t* ctx);
 

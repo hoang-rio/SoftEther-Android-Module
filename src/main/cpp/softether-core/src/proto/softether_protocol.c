@@ -648,7 +648,9 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     pack_add_int(&p, "protocol", rudp ? 1 : 0);   // 0 = TCP, 1 = UDP
     pack_add_int(&p, "max_connection", 4);  // Request 4 connections for multi-connection throughput
     pack_add_int(&p, "use_encrypt", 1);
-    pack_add_int(&p, "use_compress", 1);
+    // Phase 13B: advertise no session compression. VPN Gate traffic is
+    // TLS-encrypted and incompressible; zlib per block only burns CPU.
+    pack_add_int(&p, "use_compress", 0);
     pack_add_int(&p, "half_connection", 1);  // Half-connection: primary becomes C2S, additional sockets get S2C/C2S
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
@@ -1340,6 +1342,11 @@ static int perform_authentication_http(softether_connection_t* conn,
              conn->server_use_encrypt, conn->server_use_fast_rc4);
     }
     LOGD("Server use_compress=%u", conn->server_use_compress);
+    // Phase 13B: mirror the negotiated compression state into the RUDP context
+    // so rudp_send only compresses when the session actually uses compression.
+    if (conn->rudp != NULL) {
+        rudp_set_compress(conn->rudp, conn->server_use_compress ? 1 : 0);
+    }
     // Parse RUDP (UDP acceleration) server response from Welcome PACK
     {
         uint32_t use_udp = 0;
