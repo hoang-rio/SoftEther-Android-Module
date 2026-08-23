@@ -98,3 +98,88 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | OpenVPN listener (server) | `SoftEtherVPN_Stable/src/Cedar/Interop_OpenVPN.c:2760` |
 | R-UDP listener (server) | `SoftEtherVPN_Stable/src/Cedar/Server.c:11107` (port 0, random) |
 | NAT-T error codes | `softether_nat_t.h` (0=OK, 5=TWO_OR_MORE, 6=NOT_FOUND) |
+
+---
+
+## Throughput Optimization Plan (Phase 13)
+
+**Benchmark finding (2026-08-23):** Throughput ranks OpenVPN UDP > OpenVPN TCP ≈ MS-SSTP > SoftEther TCP > SoftEther RUDP. Root causes are implementation overheads in the client data path, not the SoftEther protocol itself.
+
+**Root causes (ranked by impact):**
+
+1. **Per-packet formatted logging in release builds.** `LOGD` is an unconditional `__android_log_print(ANDROID_LOG_DEBUG, ...)`; CMakeLists.txt sets only `-O2`, no log stripping. Hot path pays ~4 log writes per TX packet (`packet_handler.c:57-73,347`, `softether_protocol.c:3047`) and several per RX message (`packet_handler.c:915-1041`), plus one per RUDP datagram each way (`softether_rudp.c:524,795`).
+2. **Session-level zlib negotiated ON.** Login PACK sends `use_compress=1` (`softether_protocol.c:645`); VPN Gate servers accept it → every block deflate/inflate-attempted per packet on already-encrypted, incompressible traffic (`packet_handler.c:273-286,437-482,979-1013`; `softether_rudp.c:651` for RUDP).
+3. **Heap churn and copies per packet.** TX: `malloc`+memcpy of whole block per packet (`packet_handler.c:291`) plus Ethernet-frame copy (`softether_protocol.c:2706`). RX: `malloc` per block → queue copy → output copy stripping Eth header (`softether_protocol.c:2886`) → Kotlin `copyOf` (`ConnectionController.kt:666`) → two JNI copies. ~5 copies + 2+ mallocs per ~1.4 KB.
+4. **RUDP has no reliability or recovery.** Pure lossy `sendto()` with no seq/ACK/retransmit/congestion control; silent drops when queues overflow (`softether_rudp.c:517`) and blocks >1600 B skipped (`packet_handler.c:1023`). Advertises `support_udp_recovery=1` but implements no fallback → inner TCP collapses on loss. This explains RUDP ranking last.
+5. **Loop granularity.** One IP packet per JNI crossing both directions; `delay(1ms)` spin when idle (`ConnectionController.kt:47`); RUDP RX drains at most one block per poll cycle.
+6. Minor: mutex take/release around every 4-byte header read (`packet_handler.c:157-168`); RUDP MSS ~1355 vs ~1460 TCP payload; no explicit SO_RCVBUF/SO_SNDBUF sizing on the UDP socket.
+
+### Phases
+
+| Phase | Description | Priority | Status |
+|-------|-------------|----------|--------|
+| 13A | Compile-time gate for hot-path logs | P0 | ⬜ Not started |
+| 13B | Disable session compression | P0 | ⬜ Not started |
+| 13C | Zero-alloc send path | P0 | ⬜ Not started |
+| 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
+| 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
+| 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
+| 13G | Benchmark harness + acceptance criteria | P0 | ⬜ Not started |
+
+#### 13A — Hot-path logging (P0)
+
+- Add a compile-time switch, e.g. `SE_TRACE_PACKETS` (default off), wrapping every per-packet `LOGD` in: `ssl_write_all` hexdump/progress (`packet_handler.c:57,73`), "Sent N data block(s)" (:347), "Sent data block via TCP/RUDP" (`softether_protocol.c:3033,3047`), all `fill_recv_queue` per-message logs (`packet_handler.c:915,947,985,1003,1034,1041`), keepalive logs, and RUDP per-datagram logs (`softether_rudp.c:95,231,262,510,524,692-706,791-795`).
+- Keep connect/handshake/error logs unconditional.
+- Acceptance: zero `__android_log_print` calls on the steady-state data path (verify with logcat during iperf).
+
+#### 13B — Session compression (P0)
+
+- Send `use_compress=0` in login PACK (`softether_protocol.c:645`) or make it config-driven (default off).
+- Keep the decompress fallback paths intact for servers that force compression.
+- Skip the zlib compress attempt in `rudp_send` unconditionally when session compression is off (`softether_rudp.c:649-656`).
+- Acceptance: `server_use_compress==0` in logs against VPN Gate server; CPU time per MB (simple `perf`/`simpleperf` smoke) measurably lower.
+
+#### 13C — Zero-alloc send path (P0)
+
+- Preallocate one `uint8_t send_block[8 + ETH_HEADER_SIZE + 65535]` in `softether_connection_t`.
+- Build Ethernet frame directly into `send_block + 8` (removes `build_ethernet_frame` stack copy, `softether_protocol.c:2706`) then write header in place; single SSL_write per packet (`packet_handler.c:243-349`).
+- Remove per-packet `malloc/free` of `buf`/`comp_buf`.
+- Lock `write_mutex` once around build+write instead of per-chunk revalidation.
+- Acceptance: no heap allocations in `softether_send_packet` steady state (instrument with malloc hook or review), throughput ≥ +20% TX vs baseline.
+
+#### 13D — Receive-path copy elimination + batching (P1)
+
+- Read blocks straight into `entry->data` (queue slot) via a resize-free path: replace `tmp_block` malloc+copy with direct `data_read_all_sock(... entry->data ...)` where possible; decompress directly into the slot (`packet_handler.c:964-1022`).
+- Raise `MAX_QUEUED_FRAME` to ≥ 2048 so jumbo-ish server blocks are never silently skipped (`softether_protocol.h:106`, drop path `packet_handler.c:1023`); log-and-count skips instead of silence.
+- New JNI API `nativeReceiveBatch(handle, buffer, maxLength, int[] lengths, int maxPackets)` returning multiple frames per crossing; drain entire `recv_queue` / rudp queue per call. Keep single-packet API as compat shim.
+- Acceptance: ≤ 2 memcpys per RX packet end-to-end; batch API moves ≥ 8 packets/call under load.
+
+#### 13E — Java loop fixes (P1)
+
+- Replace `result == 0 → delay(1ms)` with blocking behavior: expose socket fd(s) already available (`nativeGetSocketFd`) and add a blocking receive variant with timeout, or poll inside native (`ConnectionController.kt:47,682`).
+- Write to TUN without `copyOf`: add `TunTerminal.write(buffer, len)` writing a slice (`ConnectionController.kt:666`, `TunTerminal.kt:74-85`).
+- Use the batch receive API from 13D; write frames back-to-back.
+- Move traffic-snapshot publishing fully behind its 1 s throttle (already throttled — ensure no per-packet work remains).
+- Acceptance: idle-loop wakeups < 20/s; no per-packet allocations on Kotlin side.
+
+#### 13F — RUDP reliability/recovery + tuning (P1)
+
+- Implement upstream-style **UDP recovery**: track per-direction tick gaps / queue-overflow counters in `rudp_process_inner` (`softether_rudp.c:412-529`); after N losses in window M, set `fatal_error`-like flag → `softether_send_data`/`fill_recv_queue` route data over TCP while RUDP keeps only keepalives; periodically re-probe RUDP (e.g. every 30 s).
+- Size the UDP socket buffers explicitly (`SO_RCVBUF` ≥ 1–2 MB) in `rudp_create_udp_socket` (`softether_rudp.c:39-97`) to absorb bursts between polls.
+- Optional (P2): true reliable layer (seq + ACK + retransmit with small window) mirroring NAT-T R-UDP semantics; evaluate only if recovery alone doesn't close the gap.
+- Acceptance: under 2% random UDP loss (tc/netem), RUDP throughput within 30% of SoftEther TCP and no stall; 0% silent IP-packet drops counted at queue boundaries.
+
+#### 13G — Benchmark harness (P0, do first)
+
+- Controlled setup: local SoftEther server (see `/server-setup`) + `iperf3` over each protocol; record Mbps + CPU% (simpleperf) + battery-neutral runs.
+- Baseline matrix before any change; re-run after each phase. Compare against OpenVPN TCP/UDP on same link.
+- Add permanent counters exposed via `nativeGetStats`: packets/bytes in-out, queue-full drops, skip-drops, compress ratio, log-suppression counter.
+- Acceptance: final matrix shows SoftEther TCP ≥ 80% of SSTP/OpenVPN TCP; SoftEther RUDP ≥ SoftEther TCP on clean links and degrades gracefully under loss.
+
+### Execution order & risk
+
+1. **13G** (harness/baseline) → **13A** → **13B**: trivial risk, immediate measurable gains.
+2. **13C** → **13D** → **13E**: medium risk (touch thread-safety invariants around `write_mutex`, disconnect races). Preserve existing fd/SSL capture patterns (`__sync_synchronize` barriers) when restructuring.
+3. **13F**: highest complexity; ship recovery-based fallback before attempting a full ACK layer.
+
+All phases are client-side only — no server changes required.
