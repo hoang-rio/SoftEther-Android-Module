@@ -82,6 +82,14 @@ target_compile_options(softether PRIVATE
     -fPIC
 )
 
+# Phase 13A: per-packet data-path trace logging. Off by default — a formatted
+# logd write per packet dominates mobile throughput. Enable for data-path
+# debugging (e.g. -DSE_TRACE_PACKETS=ON via externalNativeBuild arguments).
+option(SE_TRACE_PACKETS "Enable per-packet trace logging" OFF)
+if(SE_TRACE_PACKETS)
+    add_compile_definitions(SE_TRACE_PACKETS=1)
+endif()
+
 # Debug/Release specific flags
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(softether PRIVATE -g -O0)

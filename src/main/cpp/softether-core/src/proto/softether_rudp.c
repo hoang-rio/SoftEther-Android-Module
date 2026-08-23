@@ -18,6 +18,13 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
+#ifdef SE_TRACE_PACKETS
+#define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define LOGT(...) ((void)0)
+#endif
+
 // Get current timestamp in milliseconds
 static uint64_t tick64(void) {
     struct timespec ts;
@@ -521,7 +528,7 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
             entry->len = queue_len;
             ctx->recv_queue_tail = (ctx->recv_queue_tail + 1) % RUDP_RECV_QUEUE_SIZE;
             ctx->recv_queue_count++;
-            LOGD("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
+            LOGT("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
                  (flag & RUDP_FLAG_COMPRESSED) ? 1 : 0);
         }
     }
@@ -792,7 +799,7 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
         return -1;
     }
 
-    LOGD("rudp_send: %u bytes -> %u bytes (flag=0x%02X)", data_size, size, send_flag);
+    LOGT("rudp_send: %u bytes -> %u bytes (flag=0x%02X)", data_size, size, send_flag);
     return (int)size;
 }
 

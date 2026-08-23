@@ -17,11 +17,17 @@
 #include <errno.h>
 #include <sys/time.h>
 
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
-
 #define TAG "SoftEtherProtocol"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
+#ifdef SE_TRACE_PACKETS
+#define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define LOGT(...) ((void)0)
+#endif
 
 // PACK serialization types
 // VPNGate server PACK element types (from Pack.h VALUE_* constants)
@@ -3030,7 +3036,7 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         if (rudp_is_send_ready(conn->rudp, check_keepalive)) {
             int r = rudp_send(conn->rudp, data, data_len, 0);
             if (r > 0) {
-                LOGD("Sent data block via RUDP: %u bytes", data_len);
+                LOGT("Sent data block via RUDP: %u bytes", data_len);
                 return (int)data_len;
             }
             LOGW("RUDP send failed (%d), falling back to TCP", r);
@@ -3044,7 +3050,7 @@ int softether_send_data(softether_connection_t* conn, const uint8_t* data, uint3
         return -1;
     }
 
-    LOGD("Sent data block via TCP: %u bytes", data_len);
+    LOGT("Sent data block via TCP: %u bytes", data_len);
     return result;
 }
 
@@ -3120,7 +3126,7 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
         int result = softether_receive_packet(conn, command, buffer, &payload_len, max_len);
 
         if (result < 0) {
-            LOGD("No data available from server (timeout or error)");
+            LOGT("No data available from server (timeout or error)");
             *received_len = 0;
             *command = 0;
             return 0;
@@ -3130,7 +3136,7 @@ int softether_receive_data(softether_connection_t* conn, uint8_t* buffer, uint32
 
         if (*command == CMD_KEEPALIVE) {
             softether_send_keepalive(conn);
-            LOGD("Received keepalive, sent response");
+            LOGT("Received keepalive, sent response");
             *received_len = 0;
         }
     }

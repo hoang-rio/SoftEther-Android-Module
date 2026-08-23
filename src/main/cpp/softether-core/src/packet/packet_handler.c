@@ -31,6 +31,15 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// Per-packet trace logging (Phase 13A). A formatted logd write per packet
+// dominates mobile throughput, so these are compiled out unless
+// SE_TRACE_PACKETS is defined (CMake option).
+#ifdef SE_TRACE_PACKETS
+#define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define LOGT(...) ((void)0)
+#endif
+
 #define KEEP_ALIVE_MAGIC 0xFFFFFFFF
 #define MAX_BLOCK_SIZE   (1600 * 1600)  // same as SoftEther MAX_PACKET_SIZE safety
 #define COMPRESS_MAGIC   0xDEADBEEFCAFEFACELL
@@ -54,7 +63,7 @@ static int ssl_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
 // Write exactly `len` bytes to the SSL connection. Returns 0 on success, -1 on error.
 static int ssl_write_all(softether_connection_t* conn, const uint8_t* buf, int len) {
     int total = 0;
-    LOGD("ssl_write_all: writing %d bytes (first 8: %02X %02X %02X %02X %02X %02X %02X %02X)",
+    LOGT("ssl_write_all: writing %d bytes (first 8: %02X %02X %02X %02X %02X %02X %02X %02X)",
          len,
          len > 0 ? buf[0] : 0, len > 1 ? buf[1] : 0,
          len > 2 ? buf[2] : 0, len > 3 ? buf[3] : 0,
@@ -70,7 +79,7 @@ static int ssl_write_all(softether_connection_t* conn, const uint8_t* buf, int l
             LOGE("ssl_write_all: ssl_write returned %d (wrote %d/%d)", ret, total, len);
             return -1;
         }
-        LOGD("ssl_write_all: ssl_write returned %d (progress %d/%d)", ret, total + ret, len);
+        LOGT("ssl_write_all: ssl_write returned %d (progress %d/%d)", ret, total + ret, len);
         total += ret;
     }
     return 0;
@@ -344,7 +353,7 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     }
 
     pthread_mutex_unlock(&conn->write_mutex);
-    LOGD("Sent 1 data block (%u bytes, compressed=%d)", payload_len, (send_len < payload_len) ? 1 : 0);
+    LOGT("Sent 1 data block (%u bytes, compressed=%d)", payload_len, (send_len < payload_len) ? 1 : 0);
     return (int)total_size;
 }
 
@@ -390,7 +399,7 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         }
         *command = CMD_KEEPALIVE;
         if (payload_len) *payload_len = 0;
-        LOGD("Received keepalive (%u bytes)", ka_size);
+        LOGT("Received keepalive (%u bytes)", ka_size);
         return (int)(8 + ka_size);
     }
 
@@ -401,7 +410,7 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
         return 4;
     }
 
-    LOGD("Receiving %u data block(s)", block_count);
+    LOGT("Receiving %u data block(s)", block_count);
 
     int total_read = 4;
     int first_block_stored = 0;
@@ -444,7 +453,7 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                         first_block_stored = 1;
                         total_read += (int)block_size;
                         compressed_ok = 1;
-                        LOGD("receive_packet: session-decompressed block %u: %u -> %u bytes",
+                        LOGT("receive_packet: session-decompressed block %u: %u -> %u bytes",
                              i, block_size, raw_len);
                         continue;
                     }
@@ -463,13 +472,13 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                                 first_block_stored = 1;
                                 total_read += (int)block_size;
                                 compressed_ok = 1;
-                                LOGD("receive_packet: magic-decompressed block %u: %u -> %u bytes",
+                                LOGT("receive_packet: magic-decompressed block %u: %u -> %u bytes",
                                      i, block_size - 8, raw_len);
                                 continue;
                             }
                         }
                     }
-                    LOGD("receive_packet: block %u not compressed (%u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X)",
+                    LOGT("receive_packet: block %u not compressed (%u bytes, first8: %02X %02X %02X %02X %02X %02X %02X %02X)",
                          i, block_size,
                          block_size > 0 ? tmp_block[0] : 0,
                          block_size > 1 ? tmp_block[1] : 0,
@@ -506,7 +515,7 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
     }
 
     *command = CMD_DATA;
-    LOGD("Received %u block(s), first block %u bytes, total %d bytes",
+    LOGT("Received %u block(s), first block %u bytes, total %d bytes",
          block_count, payload_len ? *payload_len : 0, total_read);
     return total_read;
 }
@@ -557,7 +566,7 @@ static int softether_send_keepalive_sock(softether_connection_t* conn,
         LOGE("Failed to send keepalive");
         return -1;
     }
-    LOGD("Sent keepalive (%u bytes payload)", ka_size);
+    LOGT("Sent keepalive (%u bytes payload)", ka_size);
     return (int)total_size;
 }
 
@@ -678,7 +687,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             entry->len = copy_len;
             conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
             conn->recv_queue_count++;
-            LOGD("fill_recv_queue: queued %u bytes from RUDP (buffered)", copy_len);
+            LOGT("fill_recv_queue: queued %u bytes from RUDP (buffered)", copy_len);
             return 1;
         }
     }
@@ -820,7 +829,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                         entry->len = copy_len;
                         conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
                         conn->recv_queue_count++;
-                        LOGD("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
+                        LOGT("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
                         return 1;
                     }
                 }
@@ -912,7 +921,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             conn->additional[sel_add_idx].last_recv = softether_tick_ms();
         }
 
-        LOGD("fill_recv_queue: reading from %s socket fd=%d",
+        LOGT("fill_recv_queue: reading from %s socket fd=%d",
              sel_is_additional ? "additional" : "primary", sel_fd);
 
         // Read block count (or keepalive magic)
@@ -935,7 +944,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                     CLOSE_FAILED_ADDITIONAL_SOCKET();
                 }
             }
-            LOGD("fill_recv_queue: keepalive (%u bytes) from fd=%d", ka_size, sel_fd);
+            LOGT("fill_recv_queue: keepalive (%u bytes) from fd=%d", ka_size, sel_fd);
             softether_send_keepalive(conn);
             return 0;
         }
@@ -944,7 +953,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             return 0; // Empty message
         }
 
-        LOGD("fill_recv_queue: reading %u block(s) from fd=%d", block_count, sel_fd);
+        LOGT("fill_recv_queue: reading %u block(s) from fd=%d", block_count, sel_fd);
 
         for (uint32_t i = 0; i < block_count; i++) {
             uint32_t block_size = 0;
@@ -982,7 +991,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                     if (uncompress_data(tmp_block, block_size,
                                         entry->data, &raw_len) == 0) {
                         entry->len = raw_len;
-                        LOGD("fill_recv_queue: session-decompressed block %u: %u -> %u bytes", i, block_size, raw_len);
+                        LOGT("fill_recv_queue: session-decompressed block %u: %u -> %u bytes", i, block_size, raw_len);
                         free(tmp_block);
                         conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
                         conn->recv_queue_count++;
@@ -1000,7 +1009,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                             if (uncompress_data(tmp_block + 8, block_size - 8,
                                                 entry->data, &raw_len) == 0) {
                                 entry->len = raw_len;
-                                LOGD("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes",
+                                LOGT("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes",
                                      i, block_size - 8, raw_len);
                                 free(tmp_block);
                                 conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
@@ -1038,6 +1047,6 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
 
     #undef CLOSE_FAILED_ADDITIONAL_SOCKET
 
-    LOGD("fill_recv_queue: queued %d frames total", conn->recv_queue_count);
+    LOGT("fill_recv_queue: queued %d frames total", conn->recv_queue_count);
     return (conn->recv_queue_count > 0) ? 1 : 0;
 }

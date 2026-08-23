@@ -16,6 +16,13 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
+#ifdef SE_TRACE_PACKETS
+#define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define LOGT(...) ((void)0)
+#endif
+
 // AES context structure
 struct aes_context {
     EVP_CIPHER_CTX* encrypt_ctx;
@@ -429,7 +436,7 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     // Check if there's pending data in the SSL buffer first
     int pending = SSL_pending(ctx->ssl);
     if (pending > 0 && pending % 500 == 0) {
-        LOGD("SSL has %d bytes pending in buffer", pending);
+        LOGT("SSL has %d bytes pending in buffer", pending);
     }
 
     int result;

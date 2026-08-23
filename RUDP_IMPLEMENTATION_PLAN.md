@@ -118,7 +118,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 
 | Phase | Description | Priority | Status |
 |-------|-------------|----------|--------|
-| 13A | Compile-time gate for hot-path logs | P0 | ⬜ Not started |
+| 13A | Compile-time gate for hot-path logs | P0 | ✅ Done |
 | 13B | Disable session compression | P0 | ⬜ Not started |
 | 13C | Zero-alloc send path | P0 | ⬜ Not started |
 | 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
@@ -126,11 +126,12 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
 | 13G | Benchmark harness + acceptance criteria | P0 | ⬜ Not started |
 
-#### 13A — Hot-path logging (P0)
+#### 13A — Hot-path logging (P0) — DONE
 
 - Add a compile-time switch, e.g. `SE_TRACE_PACKETS` (default off), wrapping every per-packet `LOGD` in: `ssl_write_all` hexdump/progress (`packet_handler.c:57,73`), "Sent N data block(s)" (:347), "Sent data block via TCP/RUDP" (`softether_protocol.c:3033,3047`), all `fill_recv_queue` per-message logs (`packet_handler.c:915,947,985,1003,1034,1041`), keepalive logs, and RUDP per-datagram logs (`softether_rudp.c:95,231,262,510,524,692-706,791-795`).
 - Keep connect/handshake/error logs unconditional.
 - Acceptance: zero `__android_log_print` calls on the steady-state data path (verify with logcat during iperf).
+- Implemented: `LOGT` macro added to `packet_handler.c`, `softether_protocol.c`, `softether_rudp.c`, `aes_wrapper.c`; ~25 per-packet/steady-state sites converted; CMake option `SE_TRACE_PACKETS` (OFF by default). Warnings/errors and rare anomaly logs unchanged.
 
 #### 13B — Session compression (P0)
 
