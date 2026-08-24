@@ -17,7 +17,6 @@ import vn.unlimit.softether.SoftEtherVpnService
 import vn.unlimit.softether.SoftEtherTrafficSnapshot
 import vn.unlimit.softether.client.SoftEtherClient
 import vn.unlimit.softether.client.protocol.KeepAliveManager
-import vn.unlimit.softether.client.protocol.PacketHandler
 import vn.unlimit.softether.model.ClientInfo
 import vn.unlimit.softether.model.ConnectionConfig
 import vn.unlimit.softether.model.ConnectionState
@@ -44,7 +43,6 @@ class ConnectionController(
         private const val TAG = "ConnectionController"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 3000L
-        private const val DATA_LOOP_DELAY_MS = 1L
         private const val STATS_INTERVAL_MS = 1000L
         private const val RX_BATCH_MAX_PACKETS = 32  // Phase 13D: frames per receiveBatch call
     }
@@ -598,15 +596,37 @@ class ConnectionController(
         // Store reference to tunTerminal so we can stop it cleanly
         this.tunTerminal = TunTerminal(tunInterface, scope)
         val terminal = this.tunTerminal!!
-        
-        val packetHandler = PacketHandler(client)
+
         val keepAliveManager = KeepAliveManager(client)
 
-        // Start TUN interface reading
+        // Start TUN interface reading.
+        // Phase 13E: packets are sent directly from the TUN read loop as
+        // (buffer, offset, length) slices — no per-packet copy, no queue,
+        // no dedicated send coroutine. A slow VPN link now applies natural
+        // backpressure to the TUN read instead of growing a queue. Native
+        // softether_send serializes concurrent writers via its write mutex,
+        // so sending here alongside keepalives is safe.
         terminal.start(
-            onPacket = { packet ->
+            onPacket = { buffer, offset, length ->
                 // Packet from TUN (local system) -> send to VPN
-                packetHandler.queuePacket(packet)
+                try {
+                    val result = client.send(buffer, offset, length)
+                    if (result > 0) {
+                        bytesSent.addAndGet(result.toLong())
+                        packetsSent.incrementAndGet()
+                        maybePublishTrafficSnapshot()
+                    } else if (result < 0 && isConnected() && !isCancelled.get()) {
+                        Log.w(TAG, "Send failed: $result")
+                        scope.launch { attemptReconnect() }
+                    }
+                } catch (e: Exception) {
+                    if (!isCancelled.get()) {
+                        Log.e(TAG, "Send error", e)
+                        if (isConnected()) {
+                            scope.launch { attemptReconnect() }
+                        }
+                    }
+                }
             },
             onError = { error ->
                 Log.e(TAG, "TUN interface error", error)
@@ -618,41 +638,6 @@ class ConnectionController(
                 }
             }
         )
-
-        // Send loop: TUN -> VPN
-        scope.launch {
-            val sendBuffer = ByteArray(65535)
-            while (isConnected() && !isCancelled.get()) {
-                try {
-                    val packet = packetHandler.pollSendQueue()
-                    if (packet != null) {
-                        val result = client.send(packet)
-                        if (result > 0) {
-                            bytesSent.addAndGet(result.toLong())
-                            packetsSent.incrementAndGet()
-                            maybePublishTrafficSnapshot()
-                        } else if (result < 0) {
-                            Log.w(TAG, "Send failed: $result")
-                            if (isConnected()) {
-                                scope.launch { attemptReconnect() }
-                                break
-                            }
-                        }
-                    } else {
-                        // No packets to send, brief delay
-                        delay(DATA_LOOP_DELAY_MS)
-                    }
-                } catch (e: CancellationException) {
-                    break
-                } catch (e: Exception) {
-                    Log.e(TAG, "Send loop error", e)
-                    if (isConnected()) {
-                        scope.launch { attemptReconnect() }
-                    }
-                    break
-                }
-            }
-        }
 
         // Receive loop: VPN -> TUN
         scope.launch {
@@ -686,9 +671,11 @@ class ConnectionController(
                             }
                         }
                         total == 0 -> {
-                            // Keepalive or no data, brief delay
+                            // Keepalive or no data. Phase 13E: no Kotlin-side
+                            // delay — native receive blocks up to 100ms in
+                            // poll() when idle, so this loop only wakes ~10x/s
+                            // at idle and instantly when data arrives.
                             keepAliveManager.recordReceived()
-                            delay(DATA_LOOP_DELAY_MS)
                         }
                         else -> {
                             // Error receiving

@@ -28,13 +28,16 @@ class TunTerminal(
     private val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
     private val isRunning = AtomicBoolean(false)
 
-    private var onPacketReceived: ((ByteArray) -> Unit)? = null
+    private var onPacketReceived: ((ByteArray, Int, Int) -> Unit)? = null
     private var onError: ((Exception) -> Unit)? = null
 
     /**
-     * Start reading from TUN interface
+     * Start reading from TUN interface.
+     * [onPacket] receives (buffer, offset, length) slices of an internal
+     * scratch buffer that is reused for the next packet — consumers must
+     * not retain the slice beyond the callback (Phase 13E: zero-copy).
      */
-    fun start(onPacket: (ByteArray) -> Unit, onError: (Exception) -> Unit) {
+    fun start(onPacket: (ByteArray, Int, Int) -> Unit, onError: (Exception) -> Unit) {
         if (isRunning.getAndSet(true)) {
             Log.w(TAG, "TUN terminal already running")
             return
@@ -116,9 +119,8 @@ class TunTerminal(
 
                 when {
                     length > 0 -> {
-                        // Got a packet
-                        val packet = buffer.copyOf(length)
-                        onPacketReceived?.invoke(packet)
+                        // Got a packet — pass the slice directly, no copy
+                        onPacketReceived?.invoke(buffer, 0, length)
                     }
                     length < 0 -> {
                         // EOF - connection closed

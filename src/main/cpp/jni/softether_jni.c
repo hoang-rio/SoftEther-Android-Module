@@ -227,6 +227,39 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
     return result;
 }
 
+// Phase 13E: send a slice of the Java buffer without any copy on the
+// Kotlin side (TUN read loop passes its scratch buffer + offset directly).
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSendSlice(
+    JNIEnv *env, jobject thiz, jlong handle, jbyteArray data, jint offset, jint length) {
+    if (handle == 0) {
+        LOGE("Invalid handle");
+        return -1;
+    }
+    if (offset < 0 || length < 0) {
+        LOGE("Invalid offset/length");
+        return -1;
+    }
+
+    jsize array_len = (*env)->GetArrayLength(env, data);
+    if ((jlong)offset + length > array_len) {
+        LOGE("Slice out of bounds: offset=%d len=%d array=%d", offset, length, array_len);
+        return -1;
+    }
+
+    jbyte* data_bytes = (*env)->GetByteArrayElements(env, data, NULL);
+    if (data_bytes == NULL) {
+        LOGE("Failed to get data bytes");
+        return -1;
+    }
+
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    int result = softether_send(conn, (const uint8_t*)data_bytes + offset, (size_t)length);
+
+    (*env)->ReleaseByteArrayElements(env, data, data_bytes, JNI_ABORT);
+
+    return result;
+}
+
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeReceive(
     JNIEnv *env, jobject thiz, jlong handle, jbyteArray buffer, jint maxLength) {
     if (handle == 0) {

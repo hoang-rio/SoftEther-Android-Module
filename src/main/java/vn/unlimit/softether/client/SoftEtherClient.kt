@@ -189,6 +189,18 @@ class SoftEtherClient {
     }
 
     /**
+     * Send a slice of [buffer] through the VPN tunnel without copying
+     * (Phase 13E: lets the TUN read loop pass its scratch buffer directly).
+     *
+     * @return Number of bytes sent, or -1 on error
+     */
+    fun send(buffer: ByteArray, offset: Int, length: Int): Int {
+        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+        if (handle == 0L) return -1
+        return nativeSendSlice(handle, buffer, offset, length)
+    }
+
+    /**
      * Receive data from the VPN tunnel
      *
      * @param buffer Buffer to store received data
@@ -293,6 +305,7 @@ class SoftEtherClient {
     external fun nativeDisconnect(handle: Long)
     external fun nativeGetState(handle: Long): Int
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
+    external fun nativeSendSlice(handle: Long, data: ByteArray, offset: Int, length: Int): Int
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeReceiveBatch(handle: Long, buffer: ByteArray, maxLength: Int, lengths: IntArray, maxPackets: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)

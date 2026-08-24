@@ -823,7 +823,10 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
 
     if (ssl_pending_idx < 0) {
         // No SSL-buffered data — poll all sockets
-        int poll_timeout_ms = (conn->rudp && conn->rudp_enabled) ? 100 : 50;
+        // 100ms idle wait in both paths: poll wakes immediately on data, so
+        // this only bounds how often an idle connection wakes the Java RX
+        // loop (Phase 13E: < 10 wakeups/s at idle).
+        int poll_timeout_ms = 100;
         int poll_ret = poll(fds, nfds, poll_timeout_ms);
 
         if (poll_ret == 0) {

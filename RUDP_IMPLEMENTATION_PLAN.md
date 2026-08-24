@@ -122,7 +122,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13B | Disable session compression | P0 | ✅ Done |
 | 13C | Zero-alloc send path | P0 | ✅ Done |
 | 13D | Receive-path copy elimination + batching | P1 | ✅ Done |
-| 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
+| 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ✅ Done |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
 | 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial |
 
@@ -159,13 +159,15 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Implemented: uncompressed sessions (default since 13B) now read straight into the queue slot (SSL → slot, zero temps); compressed sessions keep the tmp+decompress path. `MAX_QUEUED_FRAME` 1600 → 2048 + new `conn->rx_skipped_blocks` counter logged on drops. New `softether_receive_batch()` drains the whole queue per call (`receive_raw` = shim); JNI `nativeReceiveBatch` + Kotlin `receiveBatch()`; `TunTerminal.write(buffer, offset, len)` slice write; RX loop in ConnectionController consumes batches with no `copyOf`.
 - Measured (host loopback, 1400 B flood): batch drain 822 pps vs 660 best single-frame (+25%), RX CPU 0.135 s. Batch depth averaged only ~1.0 frame/call (max 5) because the local server sends ≈1 frame per protocol message — the ≥8/call acceptance depends on server-side message batching and should be re-checked against a real VPN Gate server on device. End-to-end copies per packet now 2 (SSL → slot → output/TUN).
 
-#### 13E — Java loop fixes (P1)
+#### 13E — Java loop fixes (P1) — DONE
 
 - Replace `result == 0 → delay(1ms)` with blocking behavior: expose socket fd(s) already available (`nativeGetSocketFd`) and add a blocking receive variant with timeout, or poll inside native (`ConnectionController.kt:47,682`).
 - Write to TUN without `copyOf`: add `TunTerminal.write(buffer, len)` writing a slice (`ConnectionController.kt:666`, `TunTerminal.kt:74-85`).
 - Use the batch receive API from 13D; write frames back-to-back.
 - Move traffic-snapshot publishing fully behind its 1 s throttle (already throttled — ensure no per-packet work remains).
 - Acceptance: idle-loop wakeups < 20/s; no per-packet allocations on Kotlin side.
+- Implemented: native `fill_recv_queue` poll idle timeout unified at 100 ms for TCP and RUDP paths — poll wakes immediately on data, so this only bounds idle wakeups to ~10/s; the Kotlin RX loop's `delay(1ms)` on `total == 0` removed entirely. TUN read loop now invokes the consumer with `(buffer, offset, length)` slices of its scratch buffer (no `copyOf`), and sends go **directly from the TUN read thread** via new `SoftEtherClient.send(buffer, offset, length)` → JNI `nativeSendSlice` → `softether_send` (write-mutex serialized) — the queue + dedicated send coroutine are gone; slow-link backpressure now blocks the TUN read instead of growing a queue. Traffic-snapshot publishing verified already throttled to 1 s.
+- Measured: idle connection CPU over 3 s ≈ 0 (blocked in poll); paired flood run TX 110 Mbps / batched RX 20.5 Mbps–1807 pps (best recorded on host loopback). Per-packet Kotlin allocations: zero both directions (RX: reused batch buffer since 13D; TX: slice send).
 
 #### 13F — RUDP reliability/recovery + tuning (P1)
 
