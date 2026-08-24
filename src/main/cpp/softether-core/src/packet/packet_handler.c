@@ -246,9 +246,59 @@ static int read_uint32(softether_connection_t* conn, uint32_t* out) {
 }
 
 
+// Transmit a fully built block ([block_count][block_size][payload]) over the
+// best TCP socket. No copies, no allocation (Phase 13C hot path).
+// Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
+int softether_transmit_block(softether_connection_t* conn,
+                             const uint8_t* block, uint32_t block_len) {
+    if (conn == NULL || block == NULL || block_len < 8) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&conn->write_mutex);
+
+    // Recheck state and SSL inside mutex (disconnect may have freed them)
+    if (conn->state == STATE_DISCONNECTING || conn->ssl == NULL) {
+        pthread_mutex_unlock(&conn->write_mutex);
+        return -1;
+    }
+
+    // Select best socket for multi-connection send
+    int send_idx = softether_select_send_socket(conn);
+    void* send_ssl = (send_idx == 0) ? conn->ssl : conn->additional[send_idx - 1].ssl;
+    int send_fd = (send_idx == 0) ? conn->socket_fd : conn->additional[send_idx - 1].socket_fd;
+    __sync_synchronize();  // load-acquire: ensure ssl/fd reads are ordered
+
+    // Revalidate: if using additional, verify it's still active
+    if (send_idx > 0) {
+        softether_tcp_sock_t* ts = &conn->additional[send_idx - 1];
+        if (!ts->active || send_ssl == NULL) {
+            pthread_mutex_unlock(&conn->write_mutex);
+            return -1;
+        }
+        if (data_write_all_sock(conn, send_ssl, send_fd, block, (int)block_len) != 0) {
+            pthread_mutex_unlock(&conn->write_mutex);
+            LOGE("Failed to send data block");
+            return -1;
+        }
+    } else {
+        if (data_write_all(conn, block, (int)block_len) != 0) {
+            pthread_mutex_unlock(&conn->write_mutex);
+            LOGE("Failed to send data block");
+            return -1;
+        }
+    }
+
+    pthread_mutex_unlock(&conn->write_mutex);
+    return 0;
+}
+
 // Send one data block (Ethernet frame) using the real SoftEther block format.
 // Format: [block_count=1][block_size][block_data]
 // Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
+// Phase 13C: builds into the preallocated conn->send_block scratch — no heap
+// allocation in steady state. The zlib branch only runs when session
+// compression was negotiated (off by default since Phase 13B).
 int softether_send_packet(softether_connection_t* conn, uint16_t command,
                           const uint8_t* payload, uint32_t payload_len) {
     if (conn == NULL) {
@@ -294,16 +344,16 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         }
     }
 
-    // Build entire data block as single buffer (matching reference ConnectionSend)
+    // Build entire data block in the preallocated staging buffer
     // Format: [block_count=1(4)][block_size(4)][block_data(send_len)]
     uint32_t total_size = 4 + 4 + send_len;
-    uint8_t* buf = (uint8_t*)malloc(total_size);
-    if (buf == NULL) {
-        LOGE("Failed to allocate send buffer");
+    if (conn->send_block == NULL || total_size > conn->send_block_cap) {
+        LOGE("No preallocated send buffer (need %u bytes)", total_size);
         free(comp_buf);
         pthread_mutex_unlock(&conn->write_mutex);
         return -1;
     }
+    uint8_t* buf = conn->send_block;
 
     // block_count = 1 in big-endian
     buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
@@ -327,7 +377,6 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
     if (send_idx > 0) {
         softether_tcp_sock_t* ts = &conn->additional[send_idx - 1];
         if (!ts->active || send_ssl == NULL) {
-            free(buf);
             free(comp_buf);
             pthread_mutex_unlock(&conn->write_mutex);
             return -1;
@@ -343,16 +392,15 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
         ret = data_write_all(conn, buf, (int)total_size);
     }
 
-    free(buf);
     free(comp_buf);
+
+    pthread_mutex_unlock(&conn->write_mutex);
 
     if (ret != 0) {
         LOGE("Failed to send data block");
-        pthread_mutex_unlock(&conn->write_mutex);
         return -1;
     }
 
-    pthread_mutex_unlock(&conn->write_mutex);
     LOGT("Sent 1 data block (%u bytes, compressed=%d)", payload_len, (send_len < payload_len) ? 1 : 0);
     return (int)total_size;
 }

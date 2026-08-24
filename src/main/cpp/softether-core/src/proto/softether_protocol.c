@@ -29,6 +29,12 @@
 #define LOGT(...) ((void)0)
 #endif
 
+// Ethernet header constants (L2 tunnel framing)
+#define ETH_HEADER_SIZE     14
+#define ETH_TYPE_IPV4       0x0800
+#define ETH_TYPE_IPV6       0x86DD
+#define ETH_TYPE_ARP        0x0806
+
 // PACK serialization types
 // VPNGate server PACK element types (from Pack.h VALUE_* constants)
 #define PACK_TYPE_INT      0    // VALUE_INT
@@ -958,6 +964,15 @@ softether_connection_t* softether_create(void) {
     conn->additional_connect_slot = -1;
     conn->additional_connect_result = -1;
 
+    // Phase 13C: preallocate the TX staging buffer once per connection so the
+    // data path does zero heap allocations. Survives disconnect/reconnect.
+    conn->send_block_cap = 8 + ETH_HEADER_SIZE + 65535;
+    conn->send_block = (uint8_t*)malloc(conn->send_block_cap);
+    if (conn->send_block == NULL) {
+        LOGE("Failed to allocate send block buffer");
+        conn->send_block_cap = 0;
+    }
+
     LOGD("Connection created");
     return conn;
 }
@@ -1001,6 +1016,11 @@ void softether_destroy(softether_connection_t* conn) {
     // Destroy write mutex
     pthread_mutex_destroy(&conn->write_mutex);
     pthread_mutex_destroy(&conn->connect_mutex);
+
+    // Release the Phase 13C TX staging buffer
+    free(conn->send_block);
+    conn->send_block = NULL;
+    conn->send_block_cap = 0;
 
     free(conn);
     LOGD("Connection destroyed");
@@ -2675,29 +2695,37 @@ void softether_disconnect(softether_connection_t* conn) {
     pthread_mutex_unlock(&conn->connect_mutex);
 }
 
-// Ethernet header constants
-#define ETH_HEADER_SIZE     14
-#define ETH_TYPE_IPV4       0x0800
-#define ETH_TYPE_IPV6       0x86DD
-#define ETH_TYPE_ARP        0x0806
+// Phase 13C hot path: send an already-built block. RUDP carries the Ethernet
+// frame payload directly; TCP transmits the whole block buffer as-is with a
+// single write. `block`/`block_total` describe the full "[header][frame]"
+// staging buffer; `frame`/`frame_len` point at the frame inside it.
+static int softether_send_data_block(softether_connection_t* conn,
+                                     const uint8_t* block, uint32_t block_total,
+                                     const uint8_t* frame, uint32_t frame_len) {
+    // Try RUDP if active
+    if (conn->rudp && conn->rudp_enabled) {
+        rudp_poll(conn->rudp);
 
-// Build an Ethernet frame around an IP packet
-static int build_ethernet_frame(uint8_t* frame, size_t max_frame_len,
-                                const uint8_t* ip_packet, size_t ip_len,
-                                const uint8_t* src_mac,
-                                const uint8_t* dst_mac) {
-    if (ip_len + ETH_HEADER_SIZE > max_frame_len) return -1;
-    memcpy(frame, dst_mac, 6);  // dst MAC
-    memcpy(frame + 6, src_mac, 6);  // src MAC
-    // Determine EtherType from IP version
-    uint16_t ethertype = ETH_TYPE_IPV4;
-    if (ip_len > 0 && ((ip_packet[0] >> 4) & 0x0F) == 6) {
-        ethertype = ETH_TYPE_IPV6;
+        // Use check_keepalive=0 for initial data (DHCP), check_keepalive=1 for VPN data
+        int check_keepalive = conn->session_established ? 1 : 0;
+        if (rudp_is_send_ready(conn->rudp, check_keepalive)) {
+            int r = rudp_send(conn->rudp, frame, frame_len, 0);
+            if (r > 0) {
+                LOGT("Sent data block via RUDP: %u bytes", frame_len);
+                return (int)frame_len;
+            }
+            LOGW("RUDP send failed (%d), falling back to TCP", r);
+        }
     }
-    frame[12] = (ethertype >> 8) & 0xFF;
-    frame[13] = ethertype & 0xFF;
-    memcpy(frame + ETH_HEADER_SIZE, ip_packet, ip_len);
-    return (int)(ETH_HEADER_SIZE + ip_len);
+
+    // Fall back to TCP
+    int result = softether_transmit_block(conn, block, block_total);
+    if (result != 0) {
+        return -1;
+    }
+
+    LOGT("Sent data block via TCP: %u bytes", frame_len);
+    return (int)frame_len;
 }
 
 // Send data — wraps IP packet in Ethernet frame for SoftEther L2 tunnel
@@ -2711,20 +2739,39 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
         return -1;
     }
 
+    if (conn->send_block == NULL || len > conn->send_block_cap - 8 - ETH_HEADER_SIZE) {
+        LOGE("No send buffer or packet too large (%zu bytes)", len);
+        return -1;
+    }
+
     // Use gateway MAC if resolved, otherwise broadcast
     const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     const uint8_t* dst_mac = conn->gateway_mac_resolved ? conn->gateway_mac : broadcast_mac;
 
-    // Wrap IP packet in Ethernet frame
-    uint8_t frame[ETH_HEADER_SIZE + 65535];
-    int frame_len = build_ethernet_frame(frame, sizeof(frame), data, len, conn->client_mac, dst_mac);
-    if (frame_len < 0) {
-        LOGE("Failed to build Ethernet frame");
-        return -1;
-    }
+    // Phase 13C: build "[block_count=1][block_size][eth hdr][ip packet]"
+    // directly in the preallocated staging buffer — no stack frame copy and
+    // the IP payload is copied exactly once (from the TUN read buffer).
+    // Safe outside write_mutex: VPN data blocks have a single producer thread,
+    // and keepalive writes use their own scratch space.
+    uint32_t frame_len = ETH_HEADER_SIZE + (uint32_t)len;
+    uint32_t total_size = 8 + frame_len;
+    uint8_t* blk = conn->send_block;
 
-    // Send as a single data block using real SoftEther format (with RUDP if active)
-    int sent = softether_send_data(conn, frame, (uint32_t)frame_len);
+    blk[0] = 0; blk[1] = 0; blk[2] = 0; blk[3] = 1;  // block_count = 1
+    blk[4] = (uint8_t)(frame_len >> 24);
+    blk[5] = (uint8_t)(frame_len >> 16);
+    blk[6] = (uint8_t)(frame_len >> 8);
+    blk[7] = (uint8_t)(frame_len & 0xFF);
+
+    uint8_t* eth = blk + 8;
+    memcpy(eth, dst_mac, 6);
+    memcpy(eth + 6, conn->client_mac, 6);
+    uint16_t ethertype = ((data[0] >> 4) & 0x0F) == 6 ? ETH_TYPE_IPV6 : ETH_TYPE_IPV4;
+    eth[12] = (uint8_t)(ethertype >> 8);
+    eth[13] = (uint8_t)(ethertype & 0xFF);
+    memcpy(eth + ETH_HEADER_SIZE, data, len);
+
+    int sent = softether_send_data_block(conn, blk, total_size, eth, frame_len);
     if (sent < 0) {
         LOGE("Failed to send data block");
         return -1;

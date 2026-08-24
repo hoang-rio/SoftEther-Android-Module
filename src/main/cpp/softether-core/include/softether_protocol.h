@@ -218,6 +218,12 @@ typedef struct softether_connection {
     int additional_connect_result; // result from background thread (0=success, -1=fail)
     int send_rr_idx;              // round-robin index for send socket selection
     uint64_t next_tcp_keepalive_time;  // monotonic timestamp for next periodic TCP keepalive sweep (ms)
+    // Phase 13C: preallocated TX staging buffer laid out as
+    // "[block_count(4)][block_size(4)][ethernet frame]". Written by the single
+    // producer thread outside write_mutex, transmitted under it. Allocated in
+    // softether_create(), freed in softether_destroy().
+    uint8_t* send_block;
+    uint32_t send_block_cap;
 } softether_connection_t;
 
 // Function prototypes
@@ -254,6 +260,10 @@ int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_
 // Protocol operations
 int softether_send_packet(softether_connection_t* conn, uint16_t command,
                           const uint8_t* payload, uint32_t payload_len);
+// Phase 13C: transmit a fully built block ([block_count][block_size][payload])
+// over the best TCP socket. No copies, no allocation. 0 on success, -1 on error.
+int softether_transmit_block(softether_connection_t* conn,
+                             const uint8_t* block, uint32_t block_len);
 int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                              uint8_t* payload, uint32_t* payload_len, uint32_t max_payload);
 

@@ -120,7 +120,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 |-------|-------------|----------|--------|
 | 13A | Compile-time gate for hot-path logs | P0 | ✅ Done |
 | 13B | Disable session compression | P0 | ✅ Done |
-| 13C | Zero-alloc send path | P0 | ⬜ Not started |
+| 13C | Zero-alloc send path | P0 | ✅ Done |
 | 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
@@ -141,13 +141,14 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Acceptance: `server_use_compress==0` in logs against VPN Gate server; CPU time per MB (simple `perf`/`simpleperf` smoke) measurably lower.
 - Implemented: login PACK advertises `use_compress=0`; new `rudp_context_t.use_compress` (default 0) + `rudp_set_compress()`, synced from the Welcome PACK so RUDP only compresses when the session negotiates it; TCP paths already gate on `server_use_compress`. Decompress fallbacks kept (TCP magic/session-header heuristics, RUDP `RUDP_FLAG_COMPRESSED`). Live acceptance (`server_use_compress==0`, CPU/MB) to be confirmed in next benchmark run.
 
-#### 13C — Zero-alloc send path (P0)
+#### 13C — Zero-alloc send path (P0) — DONE
 
 - Preallocate one `uint8_t send_block[8 + ETH_HEADER_SIZE + 65535]` in `softether_connection_t`.
 - Build Ethernet frame directly into `send_block + 8` (removes `build_ethernet_frame` stack copy, `softether_protocol.c:2706`) then write header in place; single SSL_write per packet (`packet_handler.c:243-349`).
 - Remove per-packet `malloc/free` of `buf`/`comp_buf`.
 - Lock `write_mutex` once around build+write instead of per-chunk revalidation.
 - Acceptance: no heap allocations in `softether_send_packet` steady state (instrument with malloc hook or review), throughput ≥ +20% TX vs baseline.
+- Implemented: `send_block` staging buffer allocated once in `softether_create()` (freed in `softether_destroy()`, survives reconnects). `softether_send` now assembles `[block hdr][eth hdr][ip]` directly into it (payload copied exactly once, no 64 KB stack frame) and sends via new `softether_send_data_block`: RUDP carries the frame pointer, TCP transmits the prebuilt block via new `softether_transmit_block` (mutex + socket selection + single write, zero copies). `softether_send_packet` (DHCP/ARP raw path) builds into the same scratch under `write_mutex`; only the negotiated-compression fallback branch still allocates.
 
 #### 13D — Receive-path copy elimination + batching (P1)
 
