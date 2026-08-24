@@ -201,6 +201,20 @@ class SoftEtherClient {
     }
 
     /**
+     * Receive multiple packets in one call (Phase 13D).
+     *
+     * @param buffer Buffer to store received frames contiguously
+     * @param lengths Output array; lengths[0..n-1] receive per-frame sizes,
+     *                remaining entries are zeroed. Size caps the batch.
+     * @return Total bytes written into buffer (0 = nothing available), or -1 on error
+     */
+    fun receiveBatch(buffer: ByteArray, lengths: IntArray): Int {
+        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+        if (handle == 0L) return -1
+        return nativeReceiveBatch(handle, buffer, buffer.size, lengths, lengths.size)
+    }
+
+    /**
      * Check if currently connected
      */
     fun isConnected(): Boolean = isConnected.get()
@@ -280,6 +294,7 @@ class SoftEtherClient {
     external fun nativeGetState(handle: Long): Int
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
+    external fun nativeReceiveBatch(handle: Long, buffer: ByteArray, maxLength: Int, lengths: IntArray, maxPackets: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
     external fun nativeGetSocketFd(handle: Long): Int
     external fun nativeGetRudpSocketFd(handle: Long): Int

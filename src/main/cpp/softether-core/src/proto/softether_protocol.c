@@ -2998,6 +2998,41 @@ int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t m
     return (int)entry->len;
 }
 
+// Phase 13D: drain up to max_packets queued frames into one contiguous buffer.
+// One JNI crossing moves many frames; each frame costs exactly one memcpy
+// (slot -> output buffer) on top of the SSL read.
+int softether_receive_batch(softether_connection_t* conn,
+                            uint8_t* buffer, uint32_t max_len,
+                            uint32_t* lengths, uint32_t max_packets,
+                            uint32_t* out_count) {
+    if (conn == NULL || buffer == NULL || out_count == NULL) return -1;
+    *out_count = 0;
+    if (max_len == 0 || max_packets == 0 || lengths == NULL) return 0;
+    if (conn->state != STATE_CONNECTED) return -1;
+
+    // Fill the queue from the wire when empty
+    if (conn->recv_queue_count <= 0) {
+        int rc = softether_fill_recv_queue(conn);
+        if (rc < 0) return -1;
+    }
+
+    uint32_t total = 0;
+    uint32_t count = 0;
+    while (count < max_packets && conn->recv_queue_count > 0) {
+        queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
+        if (total + entry->len > max_len) break;
+        memcpy(buffer + total, entry->data, entry->len);
+        lengths[count] = entry->len;
+        total += entry->len;
+        count++;
+        conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count--;
+    }
+    for (uint32_t i = count; i < max_packets; i++) lengths[i] = 0;
+    *out_count = count;
+    return (int)total;
+}
+
 // ARP resolution — resolves gateway MAC address after DHCP
 int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_host) {
     if (conn == NULL || conn->state != STATE_CONNECTED) return -1;

@@ -103,7 +103,7 @@ typedef struct {
 
 // Receive queue for multi-block messages
 #define RECV_QUEUE_SIZE 64
-#define MAX_QUEUED_FRAME 1600
+#define MAX_QUEUED_FRAME 2048  // Phase 13D: was 1600 — larger server frames were silently dropped
 
 typedef struct {
     uint8_t data[MAX_QUEUED_FRAME];
@@ -163,6 +163,7 @@ typedef struct softether_connection {
     int recv_queue_head;       // read position
     int recv_queue_tail;       // write position
     int recv_queue_count;      // number of queued frames
+    uint32_t rx_skipped_blocks;  // Phase 13D: blocks dropped (too large / queue full)
     // RUDP (UDP acceleration)
     rudp_context_t* rudp;
     int rudp_enabled;
@@ -253,6 +254,15 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
 // Raw L2 I/O (sends/receives raw Ethernet frames — used by DHCP)
 int softether_send_raw(softether_connection_t* conn, const uint8_t* frame, size_t len);
 int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t max_len, uint32_t* frame_len);
+
+// Phase 13D: drain up to max_packets queued frames into `buffer` contiguously.
+// Per-frame sizes are written to lengths[0..count-1]; *out_count receives the
+// frame count. Fills the queue from the wire when empty. Returns total bytes
+// copied (0 = nothing available), -1 on error.
+int softether_receive_batch(softether_connection_t* conn,
+                            uint8_t* buffer, uint32_t max_len,
+                            uint32_t* lengths, uint32_t max_packets,
+                            uint32_t* out_count);
 
 // ARP resolution — resolves gateway MAC after DHCP
 int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_host);

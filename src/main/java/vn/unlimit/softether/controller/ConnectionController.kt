@@ -46,6 +46,7 @@ class ConnectionController(
         private const val RECONNECT_DELAY_MS = 3000L
         private const val DATA_LOOP_DELAY_MS = 1L
         private const val STATS_INTERVAL_MS = 1000L
+        private const val RX_BATCH_MAX_PACKETS = 32  // Phase 13D: frames per receiveBatch call
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -656,18 +657,26 @@ class ConnectionController(
         // Receive loop: VPN -> TUN
         scope.launch {
             val receiveBuffer = ByteArray(65535)
+            val batchLengths = IntArray(RX_BATCH_MAX_PACKETS)
             var receiveCount = 0
             while (isConnected() && !isCancelled.get()) {
                 try {
-                    val result = client.receive(receiveBuffer)
+                    // Phase 13D: drain multiple frames per JNI crossing
+                    val total = client.receiveBatch(receiveBuffer, batchLengths)
                     when {
-                        result > 0 -> {
-                            // Valid data received
-                            val packet = receiveBuffer.copyOf(result)
-                            val writeResult = terminal.write(packet)
-                            if (writeResult > 0) {
-                                bytesReceived.addAndGet(result.toLong())
-                                packetsReceived.incrementAndGet()
+                        total > 0 -> {
+                            // Valid data received — write frames back-to-back
+                            var offset = 0
+                            var written = 0
+                            for (len in batchLengths) {
+                                if (len == 0) break
+                                val writeResult = terminal.write(receiveBuffer, offset, len)
+                                if (writeResult > 0) written++
+                                offset += len
+                            }
+                            if (written > 0) {
+                                bytesReceived.addAndGet(total.toLong())
+                                packetsReceived.addAndGet(written.toLong())
                                 maybePublishTrafficSnapshot()
                             }
                             // Periodically protect additional sockets (multi-connection)
@@ -676,14 +685,14 @@ class ConnectionController(
                                 protectAdditionalSockets()
                             }
                         }
-                        result == 0 -> {
+                        total == 0 -> {
                             // Keepalive or no data, brief delay
                             keepAliveManager.recordReceived()
                             delay(DATA_LOOP_DELAY_MS)
                         }
-                        result < 0 -> {
+                        else -> {
                             // Error receiving
-                            Log.e(TAG, "Receive error: $result")
+                            Log.e(TAG, "Receive error: $total")
                             if (isConnected() && !isCancelled.get()) {
                                 scope.launch { attemptReconnect() }
                             }

@@ -85,6 +85,24 @@ class TunTerminal(
     }
 
     /**
+     * Write a slice of [buffer] to the TUN interface without copying
+     * (Phase 13D: lets batched receive avoid per-packet copyOf).
+     * @return Number of bytes written
+     */
+    fun write(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (!isRunning.get()) return -1
+
+        return try {
+            outputStream.write(buffer, offset, length)
+            outputStream.flush()
+            length
+        } catch (e: Exception) {
+            Log.e(TAG, "Error writing to TUN", e)
+            -1
+        }
+    }
+
+    /**
      * Read loop for TUN interface
      */
     private suspend fun readLoop() {

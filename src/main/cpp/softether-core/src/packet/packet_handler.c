@@ -1018,7 +1018,24 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
             if (block_size == 0) continue;
 
             if (block_size <= MAX_QUEUED_FRAME && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-                // Read into temp buffer to check for compression magic
+                queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+
+                if (!conn->server_use_compress) {
+                    // Phase 13D: session compression off (default since 13B) —
+                    // the server sends raw frames, so read straight into the
+                    // queue slot. One copy total (SSL -> slot).
+                    if (data_read_all_sock(conn, sel_ssl, sel_fd, entry->data, (int)block_size) != 0) {
+                        LOGE("fill_recv_queue: failed to read block %u from fd=%d", i, sel_fd);
+                        CLOSE_FAILED_ADDITIONAL_SOCKET();
+                    }
+                    entry->len = block_size;
+                    conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                    conn->recv_queue_count++;
+                    continue;
+                }
+
+                // Compressed session: read into temp buffer to check for
+                // compression magic before decompressing into the slot.
                 uint8_t* tmp_block = (uint8_t*)malloc(block_size);
                 if (tmp_block == NULL) {
                     LOGE("fill_recv_queue: allocation failed for block %u", i);
@@ -1030,41 +1047,37 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                     CLOSE_FAILED_ADDITIONAL_SOCKET();
                 }
 
-                queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-
                 int compressed_ok = 0;
-                if (conn->server_use_compress) {
-                    // Session-level compression: VPN Gate server sends raw zlib
-                    uint32_t raw_len = MAX_QUEUED_FRAME;
-                    if (uncompress_data(tmp_block, block_size,
-                                        entry->data, &raw_len) == 0) {
-                        entry->len = raw_len;
-                        LOGT("fill_recv_queue: session-decompressed block %u: %u -> %u bytes", i, block_size, raw_len);
-                        free(tmp_block);
-                        conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                        conn->recv_queue_count++;
-                        compressed_ok = 1;
-                        continue;
+                // Session-level compression: VPN Gate server sends raw zlib
+                uint32_t raw_len = MAX_QUEUED_FRAME;
+                if (uncompress_data(tmp_block, block_size,
+                                    entry->data, &raw_len) == 0) {
+                    entry->len = raw_len;
+                    LOGT("fill_recv_queue: session-decompressed block %u: %u -> %u bytes", i, block_size, raw_len);
+                    free(tmp_block);
+                    conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                    conn->recv_queue_count++;
+                    compressed_ok = 1;
+                    continue;
+                }
+                // Fallback: check for CONNECTION_BULK_COMPRESS_SIGNATURE
+                if (block_size > 8) {
+                    uint64_t sig = 0;
+                    for (int b = 0; b < 8; b++) {
+                        sig = (sig << 8) | tmp_block[b];
                     }
-                    // Fallback: check for CONNECTION_BULK_COMPRESS_SIGNATURE
-                    if (block_size > 8) {
-                        uint64_t sig = 0;
-                        for (int b = 0; b < 8; b++) {
-                            sig = (sig << 8) | tmp_block[b];
-                        }
-                        if (sig == COMPRESS_MAGIC) {
-                            raw_len = MAX_QUEUED_FRAME;
-                            if (uncompress_data(tmp_block + 8, block_size - 8,
-                                                entry->data, &raw_len) == 0) {
-                                entry->len = raw_len;
-                                LOGT("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes",
-                                     i, block_size - 8, raw_len);
-                                free(tmp_block);
-                                conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                                conn->recv_queue_count++;
-                                compressed_ok = 1;
-                                continue;
-                            }
+                    if (sig == COMPRESS_MAGIC) {
+                        raw_len = MAX_QUEUED_FRAME;
+                        if (uncompress_data(tmp_block + 8, block_size - 8,
+                                            entry->data, &raw_len) == 0) {
+                            entry->len = raw_len;
+                            LOGT("fill_recv_queue: magic-decompressed block %u: %u -> %u bytes",
+                                 i, block_size - 8, raw_len);
+                            free(tmp_block);
+                            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+                            conn->recv_queue_count++;
+                            compressed_ok = 1;
+                            continue;
                         }
                     }
                 }
@@ -1088,7 +1101,9 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                     }
                     remaining -= chunk;
                 }
-                LOGD("fill_recv_queue: skipped block %u (%u bytes)", i, block_size);
+                conn->rx_skipped_blocks++;
+                LOGD("fill_recv_queue: skipped block %u (%u bytes), total skipped=%u",
+                     i, block_size, conn->rx_skipped_blocks);
             }
         }
     }

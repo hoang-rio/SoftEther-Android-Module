@@ -262,6 +262,50 @@ JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGe
     return conn->socket_fd;
 }
 
+// Phase 13D: receive multiple frames per JNI crossing.
+// Returns total bytes written into `buffer` (0 = nothing available), or -1 on
+// error. lengths[0..n-1] hold per-frame sizes; entries beyond n are zeroed,
+// so callers detect the frame count by scanning for the first zero.
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeReceiveBatch(
+    JNIEnv *env, jobject thiz, jlong handle, jbyteArray buffer, jint maxLength,
+    jintArray lengths, jint maxPackets) {
+    if (handle == 0) {
+        LOGE("Invalid handle");
+        return -1;
+    }
+    if (buffer == NULL || lengths == NULL || maxPackets <= 0 || maxLength <= 0) {
+        LOGE("Invalid arguments for receiveBatch");
+        return -1;
+    }
+
+    jbyte* buffer_bytes = (*env)->GetByteArrayElements(env, buffer, NULL);
+    if (buffer_bytes == NULL) {
+        LOGE("Failed to get buffer bytes");
+        return -1;
+    }
+    jint* length_elems = (*env)->GetIntArrayElements(env, lengths, NULL);
+    if (length_elems == NULL) {
+        (*env)->ReleaseByteArrayElements(env, buffer, buffer_bytes, JNI_ABORT);
+        LOGE("Failed to get lengths array");
+        return -1;
+    }
+
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    uint32_t count = 0;
+    int result = softether_receive_batch(conn, (uint8_t*)buffer_bytes, (uint32_t)maxLength,
+                                         (uint32_t*)length_elems, (uint32_t)maxPackets,
+                                         &count);
+
+    (*env)->ReleaseIntArrayElements(env, lengths, length_elems, 0);
+    if (result > 0) {
+        (*env)->ReleaseByteArrayElements(env, buffer, buffer_bytes, 0);
+    } else {
+        (*env)->ReleaseByteArrayElements(env, buffer, buffer_bytes, JNI_ABORT);
+    }
+
+    return result;
+}
+
 JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetMaxConnection(
     JNIEnv *env, jobject thiz, jlong handle, jint maxConnections) {
     if (handle == 0) {

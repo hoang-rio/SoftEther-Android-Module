@@ -121,7 +121,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13A | Compile-time gate for hot-path logs | P0 | ✅ Done |
 | 13B | Disable session compression | P0 | ✅ Done |
 | 13C | Zero-alloc send path | P0 | ✅ Done |
-| 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
+| 13D | Receive-path copy elimination + batching | P1 | ✅ Done |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
 | 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial |
@@ -150,12 +150,14 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Acceptance: no heap allocations in `softether_send_packet` steady state (instrument with malloc hook or review), throughput ≥ +20% TX vs baseline.
 - Implemented: `send_block` staging buffer allocated once in `softether_create()` (freed in `softether_destroy()`, survives reconnects). `softether_send` now assembles `[block hdr][eth hdr][ip]` directly into it (payload copied exactly once, no 64 KB stack frame) and sends via new `softether_send_data_block`: RUDP carries the frame pointer, TCP transmits the prebuilt block via new `softether_transmit_block` (mutex + socket selection + single write, zero copies). `softether_send_packet` (DHCP/ARP raw path) builds into the same scratch under `write_mutex`; only the negotiated-compression fallback branch still allocates.
 
-#### 13D — Receive-path copy elimination + batching (P1)
+#### 13D — Receive-path copy elimination + batching (P1) — DONE
 
 - Read blocks straight into `entry->data` (queue slot) via a resize-free path: replace `tmp_block` malloc+copy with direct `data_read_all_sock(... entry->data ...)` where possible; decompress directly into the slot (`packet_handler.c:964-1022`).
 - Raise `MAX_QUEUED_FRAME` to ≥ 2048 so jumbo-ish server blocks are never silently skipped (`softether_protocol.h:106`, drop path `packet_handler.c:1023`); log-and-count skips instead of silence.
 - New JNI API `nativeReceiveBatch(handle, buffer, maxLength, int[] lengths, int maxPackets)` returning multiple frames per crossing; drain entire `recv_queue` / rudp queue per call. Keep single-packet API as compat shim.
 - Acceptance: ≤ 2 memcpys per RX packet end-to-end; batch API moves ≥ 8 packets/call under load.
+- Implemented: uncompressed sessions (default since 13B) now read straight into the queue slot (SSL → slot, zero temps); compressed sessions keep the tmp+decompress path. `MAX_QUEUED_FRAME` 1600 → 2048 + new `conn->rx_skipped_blocks` counter logged on drops. New `softether_receive_batch()` drains the whole queue per call (`receive_raw` = shim); JNI `nativeReceiveBatch` + Kotlin `receiveBatch()`; `TunTerminal.write(buffer, offset, len)` slice write; RX loop in ConnectionController consumes batches with no `copyOf`.
+- Measured (host loopback, 1400 B flood): batch drain 822 pps vs 660 best single-frame (+25%), RX CPU 0.135 s. Batch depth averaged only ~1.0 frame/call (max 5) because the local server sends ≈1 frame per protocol message — the ≥8/call acceptance depends on server-side message batching and should be re-checked against a real VPN Gate server on device. End-to-end copies per packet now 2 (SSL → slot → output/TUN).
 
 #### 13E — Java loop fixes (P1)
 
