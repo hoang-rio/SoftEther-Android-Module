@@ -2787,19 +2787,41 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
 // Forward declaration for background thread routine
 static void* additional_connect_thread_routine(void* arg);
 
-// Receive data — uses queue to handle multi-block messages; strips Ethernet header
-// Also handles ARP requests automatically
-// Also triggers additional connection establishment (multi-connection)
-int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len) {
-    if (conn == NULL || buffer == NULL || max_len == 0) {
-        return -1;
-    }
+// Auto-reply to a server ARP request for our assigned IP (Phase 13D fix:
+// shared by softether_receive and softether_receive_batch — the batched
+// data path must keep answering ARP or the gateway stops routing to us)
+static void softether_reply_arp_request(softether_connection_t* conn, const uint8_t* data) {
+    if (!(data[20] == 0x00 && data[21] == 0x01 && conn->assigned_ip != 0)) return;
 
-    if (conn->state != STATE_CONNECTED) {
-        LOGE("Not connected");
-        return -1;
-    }
+    // ARP request — check if it's for our IP
+    uint32_t target_ip = ((uint32_t)data[38] << 24) |
+                         ((uint32_t)data[39] << 16) |
+                         ((uint32_t)data[40] << 8) | data[41];
+    if (target_ip != conn->assigned_ip) return;
 
+    uint8_t reply[42];
+    memcpy(reply, data + 6, 6);
+    memcpy(reply + 6, conn->client_mac, 6);
+    reply[12] = 0x08; reply[13] = 0x06;
+    reply[14] = 0x00; reply[15] = 0x01;
+    reply[16] = 0x08; reply[17] = 0x00;
+    reply[18] = 6; reply[19] = 4;
+    reply[20] = 0x00; reply[21] = 0x02;
+    memcpy(reply + 22, conn->client_mac, 6);
+    reply[28] = (conn->assigned_ip >> 24) & 0xFF;
+    reply[29] = (conn->assigned_ip >> 16) & 0xFF;
+    reply[30] = (conn->assigned_ip >> 8) & 0xFF;
+    reply[31] = conn->assigned_ip & 0xFF;
+    memcpy(reply + 32, data + 22, 6);
+    memcpy(reply + 38, data + 28, 4);
+    softether_send_raw(conn, reply, 42);
+    LOGD("Sent ARP reply for our IP");
+}
+
+// Per-call link housekeeping previously done inside softether_receive only
+// (Phase 13D fix: the batched receive path must run this too, or additional
+// uplink sockets are never established / never cleaned up).
+static void softether_maintain_links(softether_connection_t* conn) {
     // Periodically send keepalives over all send-capable TCP sockets.
     // Prevents the server from timing out idle additional uplink (C2S) sockets
     // when UDP acceleration (RUDP) carries all VPN data.
@@ -2875,6 +2897,22 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
             conn->num_additional--;
         }
     }
+}
+
+// Receive data — uses queue to handle multi-block messages; strips Ethernet header
+// Also handles ARP requests automatically
+// Also triggers additional connection establishment (multi-connection)
+int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_len) {
+    if (conn == NULL || buffer == NULL || max_len == 0) {
+        return -1;
+    }
+
+    if (conn->state != STATE_CONNECTED) {
+        LOGE("Not connected");
+        return -1;
+    }
+
+    softether_maintain_links(conn);
 
     // If queue is empty, read one protocol message and fill queue
     if (conn->recv_queue_count <= 0) {
@@ -2891,31 +2929,7 @@ int softether_receive(softether_connection_t* conn, uint8_t* buffer, size_t max_
 
     // Handle ARP requests automatically (respond to server's ARP for our IP)
     if (frame_len >= 42 && entry->data[12] == 0x08 && entry->data[13] == 0x06) {
-        if (entry->data[20] == 0x00 && entry->data[21] == 0x01 && conn->assigned_ip != 0) {
-            // ARP request — check if it's for our IP
-            uint32_t target_ip = ((uint32_t)entry->data[38] << 24) |
-                                 ((uint32_t)entry->data[39] << 16) |
-                                 ((uint32_t)entry->data[40] << 8) | entry->data[41];
-            if (target_ip == conn->assigned_ip) {
-                uint8_t reply[42];
-                memcpy(reply, entry->data + 6, 6);
-                memcpy(reply + 6, conn->client_mac, 6);
-                reply[12] = 0x08; reply[13] = 0x06;
-                reply[14] = 0x00; reply[15] = 0x01;
-                reply[16] = 0x08; reply[17] = 0x00;
-                reply[18] = 6; reply[19] = 4;
-                reply[20] = 0x00; reply[21] = 0x02;
-                memcpy(reply + 22, conn->client_mac, 6);
-                reply[28] = (conn->assigned_ip >> 24) & 0xFF;
-                reply[29] = (conn->assigned_ip >> 16) & 0xFF;
-                reply[30] = (conn->assigned_ip >> 8) & 0xFF;
-                reply[31] = conn->assigned_ip & 0xFF;
-                memcpy(reply + 32, entry->data + 22, 6);
-                memcpy(reply + 38, entry->data + 28, 4);
-                softether_send_raw(conn, reply, 42);
-                LOGD("Sent ARP reply for our IP");
-            }
-        }
+        softether_reply_arp_request(conn, entry->data);
         // Skip ARP frames — not IP data for TUN
         conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
         conn->recv_queue_count--;
@@ -3005,6 +3019,10 @@ int softether_receive_raw(softether_connection_t* conn, uint8_t* frame, size_t m
 // Phase 13D: drain up to max_packets queued frames into one contiguous buffer.
 // One JNI crossing moves many frames; each frame costs exactly one memcpy
 // (slot -> output buffer) on top of the SSL read.
+// Phase 13D fix: mirrors softether_receive's per-frame processing — strips the
+// Ethernet header (TUN takes raw IP only), auto-replies to server ARP requests
+// and skips non-IP frames. Writing raw Ethernet frames to the TUN fd fails
+// with EINVAL ("write failed: EINVAL"), which killed all connectivity.
 int softether_receive_batch(softether_connection_t* conn,
                             uint8_t* buffer, uint32_t max_len,
                             uint32_t* lengths, uint32_t max_packets,
@@ -3013,6 +3031,8 @@ int softether_receive_batch(softether_connection_t* conn,
     *out_count = 0;
     if (max_len == 0 || max_packets == 0 || lengths == NULL) return 0;
     if (conn->state != STATE_CONNECTED) return -1;
+
+    softether_maintain_links(conn);
 
     // Fill the queue from the wire when empty
     if (conn->recv_queue_count <= 0) {
@@ -3024,11 +3044,30 @@ int softether_receive_batch(softether_connection_t* conn,
     uint32_t count = 0;
     while (count < max_packets && conn->recv_queue_count > 0) {
         queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_head];
-        if (total + entry->len > max_len) break;
-        memcpy(buffer + total, entry->data, entry->len);
-        lengths[count] = entry->len;
-        total += entry->len;
-        count++;
+        uint32_t frame_len = entry->len;
+
+        // Handle ARP requests automatically (respond to server's ARP for our IP)
+        if (frame_len >= 42 && entry->data[12] == 0x08 && entry->data[13] == 0x06) {
+            softether_reply_arp_request(conn, entry->data);
+            // Skip ARP frames — not IP data for TUN
+        } else if (frame_len <= ETH_HEADER_SIZE) {
+            // Too small for Ethernet — skip
+        } else {
+            // Check EtherType — only pass IPv4/IPv6 to TUN
+            uint16_t ethertype = (entry->data[12] << 8) | entry->data[13];
+            if (ethertype != 0x0800 && ethertype != 0x86DD) {
+                // Not IP — skip (e.g., ARP already handled above)
+            } else {
+                // Strip Ethernet header — emit IP packet only
+                uint32_t ip_len = frame_len - ETH_HEADER_SIZE;
+                if (total + ip_len > max_len) break;  // no room — leave frame queued
+                memcpy(buffer + total, entry->data + ETH_HEADER_SIZE, ip_len);
+                lengths[count] = ip_len;
+                total += ip_len;
+                count++;
+            }
+        }
+
         conn->recv_queue_head = (conn->recv_queue_head + 1) % RECV_QUEUE_SIZE;
         conn->recv_queue_count--;
     }
