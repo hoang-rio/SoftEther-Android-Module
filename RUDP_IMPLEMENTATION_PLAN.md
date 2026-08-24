@@ -202,11 +202,22 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 
 Rerun for stability: base 41.0 Mbps / CPU 4.64 s vs HEAD 92.8 Mbps / CPU 2.05 s — same ordering.
 
+**Follow-up runs after 13D/13E/13F (2026-08-24, same setup):**
+
+| Scenario | Result | Notes |
+|---|---|---|
+| 13D batched RX drain (`receive_batch`) | 822 pps vs 660 best single-frame (+25%) | avg 1.0 frame/call — local server sends ≈1 frame/message; depth is server-limited on loopback |
+| 13E idle behavior | CPU over 3 s idle ≈ 0 | native poll blocks up to 100 ms; Kotlin `delay(1ms)` spin removed (~10 wakeups/s) |
+| 13E paired flood (TCP mode) | TX 110 Mbps / RX 20.5 Mbps–1,807 pps | best RX recorded on loopback; no per-packet Kotlin allocs either direction |
+| 13F traced RUDP run (use_tcp=0, 27 s) | first ~10 s all TCP, then 178 K blocks RUDP vs 71 K TCP | proves ~10 s stability gate works; RUDP engages via `use_tcp=false` only |
+| 13F RUDP flood goodput | RX 1.7 Mbps / ~150 pps | server-delivery-limited; same ceiling family as TCP-mode runs |
+| 13F regression (TCP mode) | TX 107 Mbps, RX healthy | no impact from buffer sizing/recovery hooks |
+
 Findings:
 - Largest single win is 13B (zlib negotiation off): ~2.7× TX throughput and −45% sys CPU on its own.
-- **RUDP readiness gap confirmed:** UDP accel negotiated fully (v2, keys exchanged) but `rudp_is_send_ready` never became ready even on zero-loss loopback → 100% of data fell back to TCP. Reinforces 13F as the blocker for RUDP viability.
-- RX delivery ceiling: server forwarded only ~200–600 pps to the receiving session regardless of client variant (zero client-side drops/skips logged). Likely server-side broadcast-forwarding behavior; investigate separately.
-- Remaining for full acceptance: on-device iperf3 matrix vs OpenVPN TCP/UDP (needs phone + VPS), permanent `nativeGetStats` counters.
+- ~~RUDP readiness gap~~ **corrected:** the earlier "never ready" claim was a bench artifact — the harness passed `use_tcp=1`, which skips RUDP init entirely ("TCP mode - skipping RUDP initialization"). Production passes `use_tcp=false`. With RUDP enabled the 10 s stability gate works and data flows over UDP (see 13F rows above).
+- RX delivery ceiling: server forwards only ~150–600 pps to the receiving session regardless of client variant or transport (TCP and RUDP alike; zero client-side drops logged). Host-loopback runs therefore cannot discriminate transport goodput — treat absolute Mbps here as an environment ceiling, compare variants only within a single paired run.
+- Remaining for full acceptance: on-device iperf3 matrix vs OpenVPN TCP/UDP (needs phone + VPS), tc/netem 2%-loss matrix (kernel lacks NETEM in build container), permanent `nativeGetStats` counters (rudp_stats_t plumbing done in 13F).
 
 ### Execution order & risk
 
