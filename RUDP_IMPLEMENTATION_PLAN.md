@@ -124,7 +124,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13D | Receive-path copy elimination + batching | P1 | ⬜ Not started |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ⬜ Not started |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
-| 13G | Benchmark harness + acceptance criteria | P0 | ⬜ Not started |
+| 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial |
 
 #### 13A — Hot-path logging (P0) — DONE
 
@@ -172,12 +172,28 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Optional (P2): true reliable layer (seq + ACK + retransmit with small window) mirroring NAT-T R-UDP semantics; evaluate only if recovery alone doesn't close the gap.
 - Acceptance: under 2% random UDP loss (tc/netem), RUDP throughput within 30% of SoftEther TCP and no stall; 0% silent IP-packet drops counted at queue boundaries.
 
-#### 13G — Benchmark harness (P0, do first)
+#### 13G — Benchmark harness (P0, do first) — PARTIAL
 
 - Controlled setup: local SoftEther server (see `/server-setup`) + `iperf3` over each protocol; record Mbps + CPU% (simpleperf) + battery-neutral runs.
 - Baseline matrix before any change; re-run after each phase. Compare against OpenVPN TCP/UDP on same link.
 - Add permanent counters exposed via `nativeGetStats`: packets/bytes in-out, queue-full drops, skip-drops, compress ratio, log-suppression counter.
 - Acceptance: final matrix shows SoftEther TCP ≥ 80% of SSTP/OpenVPN TCP; SoftEther RUDP ≥ SoftEther TCP on clean links and degrades gracefully under loss.
+- **Host-loopback matrix done (2026-08-24):** local vpnserver v4.44 (repo submodule) on loopback:5555, hub BENCH; two harness processes running the real client stack built from four commits (git worktrees); one session floods 1400 B Ethernet-framed packets via `softether_send`, the other drains via `softether_receive_raw`; 10 s per run (harness + logs in `/tmp/opencode/bench`).
+
+| Variant | TX Mbps | TX pps | TX CPU user+sys | vs baseline |
+|---|---|---|---|---|
+| base (c889c28, pre-13A/B/C) | 34.9 | 3,120 | 3.99 s | — |
+| +13A trace-log gate | 45.7 | 4,084 | 3.96 s | +31% |
+| +13B compression off | 125.3 | 11,186 | 2.69 s | +259% |
+| +13C zero-alloc send (HEAD, af15e55) | **130.8** | **11,676** | **2.66 s** | **+275%** |
+
+Rerun for stability: base 41.0 Mbps / CPU 4.64 s vs HEAD 92.8 Mbps / CPU 2.05 s — same ordering.
+
+Findings:
+- Largest single win is 13B (zlib negotiation off): ~2.7× TX throughput and −45% sys CPU on its own.
+- **RUDP readiness gap confirmed:** UDP accel negotiated fully (v2, keys exchanged) but `rudp_is_send_ready` never became ready even on zero-loss loopback → 100% of data fell back to TCP. Reinforces 13F as the blocker for RUDP viability.
+- RX delivery ceiling: server forwarded only ~200–600 pps to the receiving session regardless of client variant (zero client-side drops/skips logged). Likely server-side broadcast-forwarding behavior; investigate separately.
+- Remaining for full acceptance: on-device iperf3 matrix vs OpenVPN TCP/UDP (needs phone + VPS), permanent `nativeGetStats` counters.
 
 ### Execution order & risk
 
