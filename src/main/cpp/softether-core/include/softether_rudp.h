@@ -57,6 +57,12 @@ extern "C" {
 // Receive queue
 #define RUDP_RECV_QUEUE_SIZE        64
 
+// Phase 13F: socket buffer sizing + loss recovery
+#define RUDP_SOCK_BUF_SIZE              (2 * 1024 * 1024) // SO_RCVBUF/SO_SNDBUF target
+#define RUDP_OVERFLOW_SUSPEND_THRESHOLD 8                 // recv-queue overflows before suspending UDP data
+#define RUDP_UDP_SUSPEND_MS             (30 * 1000)       // data-over-UDP suspension before re-probe
+#define RUDP_PEER_TICK_LOSS_GAP         (10 * 1000)       // peer-tick jump counted as a gap event
+
 typedef struct {
     uint8_t data[RUDP_MAX_PAYLOAD_SIZE];
     uint32_t len;
@@ -121,7 +127,29 @@ typedef struct {
 
     // Error tracking
     int fatal_error;
+
+    // Phase 13F: loss recovery + observability.
+    // recv_queue_overflow_count replaces the old silent drop: when the
+    // receive queue is full the frame is counted and dropped. Sustained
+    // overflows indicate a congested/lossy path — udp_data_suspended then
+    // routes DATA over TCP (keepalives continue over UDP) for
+    // RUDP_UDP_SUSPEND_MS before re-probing.
+    uint64_t recv_queue_overflow_count;
+    uint64_t udp_rx_packets;          // valid inbound RUDP packets processed
+    uint64_t peer_tick_gap_events;    // inbound peer-tick jumps >= RUDP_PEER_TICK_LOSS_GAP
+    uint64_t last_peer_tick_seen;     // peer's own clock at last accepted packet
+    uint32_t recent_overflows;        // overflows since last (re)probe window
+    int udp_data_suspended;           // 1 = send data via TCP, KAs only on UDP
+    uint64_t udp_data_resume_tick;    // when the suspension lifts
 } rudp_context_t;
+
+// Phase 13F: snapshot of RUDP health counters (for nativeGetStats / logging)
+typedef struct {
+    uint64_t recv_queue_overflow_count;
+    uint64_t udp_rx_packets;
+    uint64_t peer_tick_gap_events;
+    int udp_data_suspended;
+} rudp_stats_t;
 
 // API functions
 rudp_context_t* rudp_create(int is_client);
@@ -160,6 +188,9 @@ void rudp_set_fast_detect(rudp_context_t* ctx, int fast);
 void rudp_set_compress(rudp_context_t* ctx, int enable);
 int rudp_get_udp_fd(rudp_context_t* ctx);
 int rudp_is_active(rudp_context_t* ctx);
+
+// Phase 13F: read health counters
+void rudp_get_stats(rudp_context_t* ctx, rudp_stats_t* out);
 
 #ifdef __cplusplus
 }

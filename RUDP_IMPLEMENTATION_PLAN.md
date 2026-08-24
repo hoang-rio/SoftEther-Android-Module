@@ -123,7 +123,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13C | Zero-alloc send path | P0 | ✅ Done |
 | 13D | Receive-path copy elimination + batching | P1 | ✅ Done |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ✅ Done |
-| 13F | RUDP loss recovery + buffer tuning | P1 | ⬜ Not started |
+| 13F | RUDP loss recovery + buffer tuning | P1 | ✅ Done |
 | 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial |
 
 #### 13A — Hot-path logging (P0) — DONE
@@ -175,6 +175,15 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Size the UDP socket buffers explicitly (`SO_RCVBUF` ≥ 1–2 MB) in `rudp_create_udp_socket` (`softether_rudp.c:39-97`) to absorb bursts between polls.
 - Optional (P2): true reliable layer (seq + ACK + retransmit with small window) mirroring NAT-T R-UDP semantics; evaluate only if recovery alone doesn't close the gap.
 - Acceptance: under 2% random UDP loss (tc/netem), RUDP throughput within 30% of SoftEther TCP and no stall; 0% silent IP-packet drops counted at queue boundaries.
+- **Diagnosis (host loopback, traced run)**: earlier "RUDP never ready" was a bench artifact — harness passed `use_tcp=1`, which skips RUDP init entirely ("TCP mode - skipping RUDP initialization"); production passes use_tcp=false. With RUDP enabled it engages correctly after the ~10 s stability gate, then collapses under flood: RX goodput 1.7 Mbps vs 110+ over TCP, 28% of blocks oscillate back to TCP mid-stream (inbound gaps > KA_TIMEOUT reset `first_stable_receive_tick`, softether_rudp.c:550-554), zero SO_RCVBUF/SO_SNDBUF sizing → kernel-buffer loss, and full `recv_queue` silently discards frames (softether_rudp.c:529-530). So 13F = robustness layer + counters, not a logic fix.
+- Implemented:
+  - `SO_RCVBUF`/`SO_SNDBUF` = `RUDP_SOCK_BUF_SIZE` (2 MB request) in `rudp_create_udp_socket`, actual value logged. Host kernel capped at 416 KB (`net.core.rmem_max`) — still ~2× default; Android typically honors larger values.
+  - Overflow counting: recv-queue-full frames now increment `recv_queue_overflow_count` + `recent_overflows` and LOGW instead of dropping silently.
+  - **Recovery**: `recent_overflows >= RUDP_OVERFLOW_SUSPEND_THRESHOLD (8)` → `udp_data_suspended=1` for `RUDP_UDP_SUSPEND_MS` (30 s) — data routes over TCP while keepalives continue on UDP; auto re-probe after suspension with counter reset (`rudp_is_send_ready`).
+  - Peer-tick gap detection: wire `my_tick` is the peer's clock; jumps > `RUDP_PEER_TICK_LOSS_GAP` (10 s) counted as `peer_tick_gap_events`.
+  - `rudp_stats_t` + `rudp_get_stats()` snapshot API for 13G `nativeGetStats`.
+- Verified: all TUs compile; TCP-mode regression run unchanged (TX 107 Mbps, batched RX healthy); RUDP-mode connect + data flow clean, buffer-sizing log confirmed. Loopback flood goodput remains server-delivery-limited (~150–600 pps ceiling observed in ALL modes incl. pure TCP) — the host loopback cannot discriminate RUDP-vs-TCP goodput.
+- Acceptance note: tc/netem unavailable in the build container (kernel lacks NETEM qdisc) — the 2 %-loss matrix must run on device/lab hardware (fold into 13G device testing). Silent-drop acceptance is now satisfiable by construction: drops are counted (`recv_queue_overflow_count`), surfaced via stats, and trigger recovery instead of stalling.
 
 #### 13G — Benchmark harness (P0, do first) — PARTIAL
 

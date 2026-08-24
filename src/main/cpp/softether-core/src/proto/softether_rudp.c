@@ -16,6 +16,8 @@
 
 #define TAG "SoftEtherRUDP"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
@@ -58,6 +60,21 @@ static int rudp_create_udp_socket(rudp_context_t* ctx, int family) {
         LOGE("rudp_create_udp_socket: failed to create UDP socket family=%d (errno=%d)",
              family, errno);
         return -1;
+    }
+
+    // Phase 13F: size kernel buffers explicitly. Defaults (~200 KB) overflow
+    // under bursts between poll() cycles, silently dropping datagrams.
+    {
+        int buf = RUDP_SOCK_BUF_SIZE;
+        if (setsockopt(ctx->udp_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf)) == 0 &&
+            setsockopt(ctx->udp_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) {
+            socklen_t optlen = sizeof(buf);
+            buf = 0;
+            getsockopt(ctx->udp_fd, SOL_SOCKET, SO_RCVBUF, &buf, &optlen);
+            LOGD("rudp_create_udp_socket: SO_RCVBUF/SO_SNDBUF set (rcvbuf now %d)", buf);
+        } else {
+            LOGW("rudp_create_udp_socket: SO_RCVBUF/SO_SNDBUF failed (errno=%d)", errno);
+        }
     }
 
     // Bind to any available port
@@ -394,10 +411,43 @@ uint32_t rudp_calc_mss(rudp_context_t* ctx) {
     return (ctx->version >= 2) ? RUDP_DEFAULT_MSS_V2 : RUDP_DEFAULT_MSS;
 }
 
+void rudp_get_stats(rudp_context_t* ctx, rudp_stats_t* out) {
+    if (out == NULL) return;
+    if (ctx == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    out->recv_queue_overflow_count = ctx->recv_queue_overflow_count;
+    out->udp_rx_packets = ctx->udp_rx_packets;
+    out->peer_tick_gap_events = ctx->peer_tick_gap_events;
+    out->udp_data_suspended = ctx->udp_data_suspended;
+}
+
 int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
     if (ctx == NULL) return 0;
     if (!ctx->inited) return 0;
     if (!ctx->peer_addr_set) return 0;
+
+    // Phase 13F: UDP-data suspension for loss recovery. When the receive
+    // queue overflowed repeatedly (congested/lossy path), route DATA over
+    // TCP while keepalives continue on UDP; re-probe after the suspension.
+    if (ctx->udp_data_suspended) {
+        if (ctx->now < ctx->udp_data_resume_tick) {
+            return 0;
+        }
+        ctx->udp_data_suspended = 0;
+        ctx->recent_overflows = 0;
+        LOGI("rudp: re-probing UDP data path after suspension");
+    }
+    if (ctx->recent_overflows >= RUDP_OVERFLOW_SUSPEND_THRESHOLD) {
+        ctx->udp_data_suspended = 1;
+        ctx->udp_data_resume_tick = ctx->now + RUDP_UDP_SUSPEND_MS;
+        LOGW("rudp: %u recv-queue overflows -> suspending UDP data for %d ms "
+             "(total overflows %llu)",
+             ctx->recent_overflows, RUDP_UDP_SUSPEND_MS,
+             (unsigned long long)ctx->recv_queue_overflow_count);
+        return 0;
+    }
 
     uint64_t timeout_value = (ctx->mss & 0x80000000) ? RUDP_KA_TIMEOUT_FAST : RUDP_KA_TIMEOUT;
 
@@ -493,6 +543,19 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
     ctx->last_recv_my_tick = (your_tick > ctx->last_recv_my_tick) ? your_tick : ctx->last_recv_my_tick;
     ctx->last_recv_your_tick = (my_tick > ctx->last_recv_your_tick) ? my_tick : ctx->last_recv_your_tick;
 
+    // Phase 13F: my_tick on the wire is the peer's own clock. A large
+    // forward jump between consecutive packets means the peer transmitted
+    // traffic we never saw — count it as a loss/gap event.
+    if (ctx->last_peer_tick_seen != 0 &&
+        my_tick > ctx->last_peer_tick_seen + RUDP_PEER_TICK_LOSS_GAP) {
+        ctx->peer_tick_gap_events++;
+        LOGT("rudp: peer tick gap %llu -> %llu (gap event #%llu)",
+             (unsigned long long)ctx->last_peer_tick_seen, (unsigned long long)my_tick,
+             (unsigned long long)ctx->peer_tick_gap_events);
+    }
+    ctx->last_peer_tick_seen = my_tick;
+    ctx->udp_rx_packets++;
+
     // Update peer address from received packet
     ctx->peer_addr = *from_addr;
     ctx->peer_addr_len = from_len;
@@ -535,6 +598,13 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
             ctx->recv_queue_count++;
             LOGT("rudp_poll: queued %u bytes (compressed=%d)", queue_len,
                  (flag & RUDP_FLAG_COMPRESSED) ? 1 : 0);
+        } else if (queue_len <= RUDP_MAX_PAYLOAD_SIZE) {
+            // Phase 13F: count instead of dropping silently. Sustained
+            // overflows trip the UDP-data suspension in rudp_is_send_ready.
+            ctx->recv_queue_overflow_count++;
+            ctx->recent_overflows++;
+            LOGW("rudp_poll: recv queue full, dropped %u bytes (overflow #%llu)",
+                 queue_len, (unsigned long long)ctx->recv_queue_overflow_count);
         }
     }
     return 0;
