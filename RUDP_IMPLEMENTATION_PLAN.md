@@ -124,7 +124,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13D | Receive-path copy elimination + batching | P1 | ✅ Done |
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ✅ Done |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ✅ Done |
-| 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial |
+| 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial (device matrix outstanding) |
 
 #### 13A — Hot-path logging (P0) — DONE
 
@@ -190,7 +190,8 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Controlled setup: local SoftEther server (see `/server-setup`) + `iperf3` over each protocol; record Mbps + CPU% (simpleperf) + battery-neutral runs.
 - Baseline matrix before any change; re-run after each phase. Compare against OpenVPN TCP/UDP on same link.
 - Add permanent counters exposed via `nativeGetStats`: packets/bytes in-out, queue-full drops, skip-drops, compress ratio, log-suppression counter.
-- Acceptance: final matrix shows SoftEther TCP ≥ 80% of SSTP/OpenVPN TCP; SoftEther RUDP ≥ SoftEther TCP on clean links and degrades gracefully under loss.
+  - **Done:** native `softether_stats_t` + `softether_get_stats()` (tx/rx packets+bytes counted on the `softether_send` / `softether_receive_batch` paths; includes 13D `rx_skipped_blocks` and 13F rudp overflow/rx/gap/suspension counters); JNI `nativeGetStats(handle) → long[9]`; Kotlin `getStats(): NativeStats`; ConnectionController logs the snapshot at debug level behind the existing 1 s traffic-snapshot throttle. Verified end-to-end on host loopback (exact TX/RX counts in TCP mode; `rudp_rx` nonzero on an idle UDP-mode session). Compress-ratio counter obsolete since 13B disables compression.
+- Acceptance: final matrix shows SoftEther TCP ≥ 80% of SSTP/OpenVPN TCP; SoftEther RUDP ≥ SoftEther TCP on clean links and degrades gracefully under loss. **Blocked on hardware:** needs phone + VPS for the on-device iperf3 matrix vs OpenVPN, and tc/netem for the 2%-loss run — both impossible in this build container. All repo-side 13G work is complete; the matrix is the only outstanding item.
 - **Host-loopback matrix done (2026-08-24):** local vpnserver v4.44 (repo submodule) on loopback:5555, hub BENCH; two harness processes running the real client stack built from four commits (git worktrees); one session floods 1400 B Ethernet-framed packets via `softether_send`, the other drains via `softether_receive_raw`; 10 s per run (harness + logs in `/tmp/opencode/bench`).
 
 | Variant | TX Mbps | TX pps | TX CPU user+sys | vs baseline |

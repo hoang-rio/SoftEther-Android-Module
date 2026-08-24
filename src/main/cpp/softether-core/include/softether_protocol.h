@@ -225,7 +225,26 @@ typedef struct softether_connection {
     // softether_create(), freed in softether_destroy().
     uint8_t* send_block;
     uint32_t send_block_cap;
+    // Phase 13G: permanent traffic counters (updated on the data paths)
+    uint64_t stats_tx_packets;
+    uint64_t stats_tx_bytes;
+    uint64_t stats_rx_packets;
+    uint64_t stats_rx_bytes;
 } softether_connection_t;
+
+// Phase 13G: snapshot of connection health for nativeGetStats.
+// RUDP fields are zero when UDP acceleration is not active.
+typedef struct {
+    uint64_t tx_packets;
+    uint64_t tx_bytes;
+    uint64_t rx_packets;
+    uint64_t rx_bytes;
+    uint32_t rx_skipped_blocks;      // frames dropped at fill_recv_queue (13D)
+    uint64_t rudp_overflow_count;    // recv-queue overflows (13F)
+    uint64_t rudp_rx_packets;        // valid inbound RUDP datagrams
+    uint64_t rudp_tick_gaps;         // peer-tick gap events (13F)
+    int32_t  rudp_data_suspended;    // 1 = data currently routed via TCP (13F)
+} softether_stats_t;
 
 // Function prototypes
 
@@ -266,6 +285,9 @@ int softether_receive_batch(softether_connection_t* conn,
 
 // ARP resolution — resolves gateway MAC after DHCP
 int softether_resolve_gateway(softether_connection_t* conn, uint32_t gateway_ip_host);
+
+// Phase 13G: snapshot traffic/health counters into *out
+void softether_get_stats(softether_connection_t* conn, softether_stats_t* out);
 
 // Protocol operations
 int softether_send_packet(softether_connection_t* conn, uint16_t command,

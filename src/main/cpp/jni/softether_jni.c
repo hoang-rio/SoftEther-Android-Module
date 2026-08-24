@@ -384,6 +384,42 @@ JNIEXPORT jintArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nat
     return arr;
 }
 
+// Phase 13G: permanent traffic/health counters.
+// Returns long[9]: { txPackets, txBytes, rxPackets, rxBytes, rxSkippedBlocks,
+//                    rudpOverflowCount, rudpRxPackets, rudpTickGaps, rudpDataSuspended }
+// or NULL when the handle is invalid.
+JNIEXPORT jlongArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetStats(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return NULL;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+
+    softether_stats_t st;
+    softether_get_stats(conn, &st);
+
+    enum {
+        IDX_TX_PACKETS, IDX_TX_BYTES, IDX_RX_PACKETS, IDX_RX_BYTES,
+        IDX_RX_SKIPPED, IDX_RUDP_OVERFLOW, IDX_RUDP_RX, IDX_RUDP_GAPS,
+        IDX_RUDP_SUSPENDED, IDX_COUNT
+    };
+
+    jlongArray arr = (*env)->NewLongArray(env, IDX_COUNT);
+    if (arr == NULL) return NULL;
+
+    jlong vals[IDX_COUNT];
+    vals[IDX_TX_PACKETS] = (jlong)st.tx_packets;
+    vals[IDX_TX_BYTES] = (jlong)st.tx_bytes;
+    vals[IDX_RX_PACKETS] = (jlong)st.rx_packets;
+    vals[IDX_RX_BYTES] = (jlong)st.rx_bytes;
+    vals[IDX_RX_SKIPPED] = (jlong)st.rx_skipped_blocks;
+    vals[IDX_RUDP_OVERFLOW] = (jlong)st.rudp_overflow_count;
+    vals[IDX_RUDP_RX] = (jlong)st.rudp_rx_packets;
+    vals[IDX_RUDP_GAPS] = (jlong)st.rudp_tick_gaps;
+    vals[IDX_RUDP_SUSPENDED] = (jlong)st.rudp_data_suspended;
+
+    (*env)->SetLongArrayRegion(env, arr, 0, IDX_COUNT, vals);
+    return arr;
+}
+
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetRudpSocketFd(
     JNIEnv *env, jobject thiz, jlong handle) {
     if (handle == 0) return -1;

@@ -227,6 +227,29 @@ class SoftEtherClient {
     }
 
     /**
+     * Permanent traffic/health counters (Phase 13G).
+     *
+     * @return Snapshot of native counters, or null when disconnected
+     */
+    fun getStats(): NativeStats? {
+        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+        if (handle == 0L) return null
+        val arr = nativeGetStats(handle) ?: return null
+        if (arr.size < 9) return null
+        return NativeStats(
+            txPackets = arr[0],
+            txBytes = arr[1],
+            rxPackets = arr[2],
+            rxBytes = arr[3],
+            rxSkippedBlocks = arr[4],
+            rudpOverflowCount = arr[5],
+            rudpRxPackets = arr[6],
+            rudpTickGaps = arr[7],
+            rudpDataSuspended = arr[8] != 0L
+        )
+    }
+
+    /**
      * Check if currently connected
      */
     fun isConnected(): Boolean = isConnected.get()
@@ -306,6 +329,7 @@ class SoftEtherClient {
     external fun nativeGetState(handle: Long): Int
     external fun nativeSend(handle: Long, data: ByteArray, length: Int): Int
     external fun nativeSendSlice(handle: Long, data: ByteArray, offset: Int, length: Int): Int
+    external fun nativeGetStats(handle: Long): LongArray?
     external fun nativeReceive(handle: Long, buffer: ByteArray, maxLength: Int): Int
     external fun nativeReceiveBatch(handle: Long, buffer: ByteArray, maxLength: Int, lengths: IntArray, maxPackets: Int): Int
     external fun nativeSetOption(handle: Long, option: Int, value: Long)
@@ -376,6 +400,23 @@ data class DhcpResult(
     val dnsServer2: String,
     val leaseTime: Int,
     val prefixLength: Int
+)
+
+/**
+ * Permanent native traffic/health counters (Phase 13G).
+ *
+ * @param rudpDataSuspended true = data currently routed via TCP while RUDP re-probes
+ */
+data class NativeStats(
+    val txPackets: Long,
+    val txBytes: Long,
+    val rxPackets: Long,
+    val rxBytes: Long,
+    val rxSkippedBlocks: Long,
+    val rudpOverflowCount: Long,
+    val rudpRxPackets: Long,
+    val rudpTickGaps: Long,
+    val rudpDataSuspended: Boolean
 )
 
 /**

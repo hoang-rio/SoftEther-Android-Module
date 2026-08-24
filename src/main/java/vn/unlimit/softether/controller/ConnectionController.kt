@@ -997,6 +997,14 @@ class ConnectionController(
         val now = System.currentTimeMillis()
         if (now - lastPublishedAtMs >= STATS_INTERVAL_MS) {
             publishTrafficSnapshot()
+            // Phase 13G: surface native health counters alongside the
+            // traffic snapshot (same 1 s throttle, debug-level only)
+            client.getStats()?.let { st ->
+                Log.d(TAG,
+                    "stats: tx=${st.txPackets}p/${st.txBytes}B rx=${st.rxPackets}p/${st.rxBytes}B " +
+                    "skipped=${st.rxSkippedBlocks} rudp(rx=${st.rudpRxPackets} ovf=${st.rudpOverflowCount} " +
+                    "gaps=${st.rudpTickGaps} susp=${st.rudpDataSuspended})")
+            }
         }
     }
 

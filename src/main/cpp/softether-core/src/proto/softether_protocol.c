@@ -2777,6 +2777,10 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
         return -1;
     }
 
+    // Phase 13G: traffic counters
+    conn->stats_tx_packets++;
+    conn->stats_tx_bytes += len;
+
     return (int)len;
 }
 
@@ -3030,7 +3034,34 @@ int softether_receive_batch(softether_connection_t* conn,
     }
     for (uint32_t i = count; i < max_packets; i++) lengths[i] = 0;
     *out_count = count;
+
+    // Phase 13G: traffic counters
+    if (count > 0) {
+        conn->stats_rx_packets += count;
+        conn->stats_rx_bytes += total;
+    }
+
     return (int)total;
+}
+
+// Phase 13G: snapshot traffic/health counters
+void softether_get_stats(softether_connection_t* conn, softether_stats_t* out) {
+    if (out == NULL) return;
+    if (conn == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    out->tx_packets = conn->stats_tx_packets;
+    out->tx_bytes = conn->stats_tx_bytes;
+    out->rx_packets = conn->stats_rx_packets;
+    out->rx_bytes = conn->stats_rx_bytes;
+    out->rx_skipped_blocks = conn->rx_skipped_blocks;
+    rudp_stats_t rs;
+    rudp_get_stats(conn->rudp, &rs);
+    out->rudp_overflow_count = rs.recv_queue_overflow_count;
+    out->rudp_rx_packets = rs.udp_rx_packets;
+    out->rudp_tick_gaps = rs.peer_tick_gap_events;
+    out->rudp_data_suspended = rs.udp_data_suspended;
 }
 
 // ARP resolution — resolves gateway MAC address after DHCP
