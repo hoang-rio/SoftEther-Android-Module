@@ -343,12 +343,18 @@ class SoftEtherClient {
     external fun nativeGetAllSocketFds(handle: Long): IntArray?
     external fun nativeForceCloseSocket(handle: Long)
     external fun nativeGetClientMac(handle: Long): ByteArray?
+    external fun nativeSetClientMac(handle: Long, mac: ByteArray)
     external fun nativeSendRaw(handle: Long, data: ByteArray, length: Int): Int
 
     /**
      * This session's virtual MAC address (6 bytes), or null if the handle is invalid.
      */
     fun getClientMac(handle: Long = nativeHandle): ByteArray? = nativeGetClientMac(handle)
+
+    /**
+     * Set a stable client MAC (local-bridge ARP stability across reconnects).
+     */
+    fun setClientMac(handle: Long = nativeHandle, mac: ByteArray) = nativeSetClientMac(handle, mac)
 
     /**
      * Send a raw L2 Ethernet frame (no automatic Ethernet-header wrapping).

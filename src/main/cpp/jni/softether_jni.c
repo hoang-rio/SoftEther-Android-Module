@@ -528,6 +528,17 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeFo
     softether_force_close_socket(conn);
 }
 
+// Set a stable client MAC before connect (local-bridge ARP stability).
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetClientMac(
+    JNIEnv *env, jobject thiz, jlong handle, jbyteArray mac) {
+    if (handle == 0 || mac == NULL) return;
+    jbyte* m = (*env)->GetByteArrayElements(env, mac, NULL);
+    if (m == NULL) return;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    softether_set_client_mac(conn, (const uint8_t*)m);
+    (*env)->ReleaseByteArrayElements(env, mac, m, JNI_ABORT);
+}
+
 // Benchmark/diagnostics: return this session's virtual MAC (6 bytes) or NULL.
 JNIEXPORT jbyteArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetClientMac(
     JNIEnv *env, jobject thiz, jlong handle) {

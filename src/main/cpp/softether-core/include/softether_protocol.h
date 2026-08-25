@@ -335,6 +335,10 @@ int softether_reconnect(softether_connection_t* conn);
 
 // Set authentication type explicitly (use CLIENT_AUTHTYPE_* constants; 0=auto)
 void softether_set_auth_type(softether_connection_t* conn, int auth_type);
+// Override the auto-generated random client MAC (6 bytes, used for ARP/DHCP
+// identity). Use a MAC derived from the server identity so reconnects keep a
+// stable L2 address on local-bridge servers.
+void softether_set_client_mac(softether_connection_t* conn, const uint8_t mac[6]);
 
 // DHCP result
 typedef struct {

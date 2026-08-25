@@ -936,6 +936,12 @@ softether_connection_t* softether_create(void) {
         conn->client_mac[i] = (uint8_t)(rand() & 0xFF);
     }
 
+    // Optional stable override (set_client_mac): on local-bridge servers a
+    // random MAC per reconnect makes the upstream router's ARP entry flap
+    // between zombie and live sessions with the same DHCP IP, which presents
+    // as "connected but no network". Production derives a stable MAC from
+    // the server identity instead.
+
     // Set default hub name
     strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
 
@@ -3803,6 +3809,13 @@ void softether_set_reconnect_enabled(softether_connection_t* conn, int enabled) 
 
     // Store reconnection preference (implementation can be extended)
     LOGD("Reconnection %s", enabled ? "enabled" : "disabled");
+}
+
+void softether_set_client_mac(softether_connection_t* conn, const uint8_t mac[6]) {
+    if (conn == NULL || mac == NULL) return;
+    memcpy(conn->client_mac, mac, 6);
+    LOGD("client_mac set to %02X:%02X:%02X:%02X:%02X:%02X",
+         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 void softether_set_auth_type(softether_connection_t* conn, int auth_type) {

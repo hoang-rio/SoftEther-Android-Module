@@ -304,6 +304,21 @@ class ConnectionController(
         // Set timeout
         client.setTimeout(config.connectTimeoutMs)
 
+        // Stable client MAC derived from the server identity. On local-bridge
+        // servers a random MAC per reconnect makes the upstream router's ARP
+        // entry flap between zombie and live sessions holding the same DHCP
+        // IP ("connected but no network" after heavy use).
+        runCatching {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("vpngate-mac:${config.serverHost}:${config.serverPort}".toByteArray())
+            val mac = ByteArray(6)
+            mac[0] = 0x5E  // SoftEther-style locally administered unicast prefix
+            for (i in 1..5) mac[i] = digest[i]
+            mac[0] = (mac[0].toInt() and 0xFE).toByte()  // clear multicast bit
+            client.setClientMac(nativeHandle, mac)
+            Log.d(TAG, "Stable client MAC: ${mac.joinToString(":") { String.format("%02X", it) }}")
+        }
+
         // Enable the direct R-UDP stage (UDP-only servers reachable without relay)
         if (config.udpPort > 0) {
             client.nativeSetOption(nativeHandle, SoftEtherClient.OPTION_UDP_PORT, config.udpPort.toLong())
