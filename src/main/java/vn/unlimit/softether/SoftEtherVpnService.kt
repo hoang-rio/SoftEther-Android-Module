@@ -362,7 +362,20 @@ class SoftEtherVpnService : VpnService() {
                 // Connection was canceled (user pressed cancel)
                 Log.d(TAG, "Connection cancelled by user")
                 mIsUserDisconnect = true
+                // Clean up whatever the connect flow created (TUN interface,
+                // terminal, deferred native handle). Idempotent — safe even if
+                // the controller already tore itself down.
+                try {
+                    controller?.destroyResources()
+                } catch (ce: Exception) {
+                    Log.e(TAG, "Error destroying resources on cancel", ce)
+                }
+                controller = null
                 sendConnectionStateBroadcast(STATE_DISCONNECTED)
+                // stopForeground was already done by stopVpn(); make sure the
+                // service itself also stops, or the process lingers with the
+                // VPN route alive.
+                stopSelf()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start VPN", e)
                 // updateNotification("Connection failed: ${e.message}")

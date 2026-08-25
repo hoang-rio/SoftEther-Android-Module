@@ -250,12 +250,49 @@ class ConnectionController(
             throw Exception("Failed to create native connection")
         }
 
+        // Single-owner teardown: while this connect flow is alive, ONLY this
+        // function destroys the native handle. disconnect()/destroyResources()
+        // defer to it (see isConnectInFlight) so a user cancel during the
+        // blocking nativeConnectWithHub can never free the connection out
+        // from under the connect thread (zombie connect + stuck connect_mutex).
+        try {
+            performConnectInner()
+        } catch (e: Throwable) {
+            Log.d(TAG, "Connect flow ended (${e.javaClass.simpleName}), tearing down native handle")
+            teardownNativeConnection()
+            throw e
+        }
+    }
+
+    private fun isConnectInFlight(): Boolean =
+        currentState == ConnectionState.CONNECTING ||
+            currentState == ConnectionState.TLS_HANDSHAKE ||
+            currentState == ConnectionState.SESSION_SETUP
+
+    /**
+     * Gracefully disconnect and free the native handle (idempotent).
+     * Only called from the connect flow itself or when no connect is in flight.
+     */
+    private fun teardownNativeConnection() {
+        client.externalHandle = 0
+        val handle = nativeHandle
+        nativeHandle = 0
+        if (handle == 0L) return
+
+        try {
+            Log.d(TAG, "Tearing down native handle $handle")
+            client.nativeDisconnect(handle)
+            client.nativeDestroy(handle)
+            Log.d(TAG, "Native handle $handle torn down")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error tearing down native handle", e)
+        }
+    }
+
+    private suspend fun performConnectInner() {
         // Check if already cancelled before proceeding
         if (isCancelled.get()) {
             Log.d(TAG, "Connection cancelled before starting")
-            val handle = nativeHandle
-            nativeHandle = 0  // Clear handle first
-            client.nativeDestroy(handle)
             throw CancellationException("Connection cancelled by user")
         }
 
@@ -321,17 +358,10 @@ class ConnectionController(
         // Check if cancelled during connection
         if (isCancelled.get()) {
             Log.d(TAG, "Connection was cancelled during connect")
-            val handle = nativeHandle
-            nativeHandle = 0  // Clear handle first
-            client.nativeDisconnect(handle)
-            client.nativeDestroy(handle)
             throw CancellationException("Connection cancelled by user")
         }
 
         if (result != 0) {
-            val handle = nativeHandle
-            nativeHandle = 0  // Clear handle first
-            client.nativeDestroy(handle)
             currentState = ConnectionState.ERROR
             throw Exception("Connection failed with error code: $result")
         }
@@ -349,10 +379,6 @@ class ConnectionController(
         // Check if cancelled before establishing VPN interface
         if (isCancelled.get()) {
             Log.d(TAG, "Connection cancelled after successful connect, tearing down")
-            val handle = nativeHandle
-            nativeHandle = 0  // Clear handle first
-            client.nativeDisconnect(handle)
-            client.nativeDestroy(handle)
             throw CancellationException("Connection cancelled by user")
         }
 
@@ -392,12 +418,22 @@ class ConnectionController(
         // Perform DHCP over the SoftEther tunnel to get IP configuration
         Log.d(TAG, "Starting DHCP over SoftEther tunnel...")
         val dhcpResult = client.doDhcp(nativeHandle)
+
+        // Re-check after DHCP: if the user cancelled while doDhcp() was
+        // blocking, stop here — never establish the system VPN interface
+        // for a cancelled session (that is what left the VPN key icon up).
+        if (isCancelled.get()) {
+            Log.d(TAG, "Connection cancelled during DHCP, tearing down")
+            throw CancellationException("Connection cancelled by user")
+        }
+
+        val dhcpConfig: ConnectionConfig?
         if (dhcpResult != null) {
             Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
                     "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer} DNS2=${dhcpResult.dnsServer2}")
             assignedLocalIp = dhcpResult.assignedIp
             // Update config with DHCP-assigned values
-            val dhcpConfig = config.copy(
+            dhcpConfig = config.copy(
                 localAddress = dhcpResult.assignedIp,
                 prefixLength = dhcpResult.prefixLength,
                 dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
@@ -465,20 +501,16 @@ class ConnectionController(
                 currentState = ConnectionState.DISCONNECTING
             }
 
-            // Disconnect native connection (this will interrupt any blocking operations)
-            if (nativeHandle != 0L) {
-                val handle = nativeHandle
-                nativeHandle = 0  // Clear the handle first to prevent double-free
-                
-                try {
-                    Log.d(TAG, "Calling nativeDisconnect on handle $handle")
-                    client.nativeDisconnect(handle)
-                    Log.d(TAG, "nativeDisconnect completed, calling nativeDestroy")
-                    client.nativeDestroy(handle)
-                    Log.d(TAG, "nativeDestroy completed")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error during native disconnect", e)
-                }
+            // Disconnect native connection (this will interrupt any blocking operations).
+            // If a connect flow is in flight, DEFER native teardown to it: the
+            // connect coroutine is blocked inside nativeConnectWithHub and owns
+            // the handle. Freeing here would either deadlock on connect_mutex or
+            // free the connection out from under the connect thread (zombie
+            // session + poisoned state for every later connect attempt).
+            if (isConnectInFlight()) {
+                Log.w(TAG, "Connect in flight - deferring native teardown to connect flow")
+            } else if (nativeHandle != 0L) {
+                teardownNativeConnection()
             }
         } finally {
             if (connectionMutex.isLocked) {
@@ -540,6 +572,16 @@ class ConnectionController(
         // Force-close sockets to interrupt any blocking nativeConnectWithHub
         // that may be holding connect_mutex.  This makes softether_connect_with_hub
         // return with an error so softether_destroy can proceed without deadlock.
+        // If a connect flow is in flight, DEFER native teardown entirely: a
+        // force-close + 200ms sleep is not enough (the connect retries on new
+        // sockets / NAT-T), and destroying here frees the connection under the
+        // connect thread. The connect flow tears the handle down itself as soon
+        // as nativeConnectWithHub returns.
+        if (isConnectInFlight()) {
+            Log.w(TAG, "Connect in flight - deferring native destroy to connect flow")
+            return
+        }
+
         val handle = nativeHandle
         nativeHandle = 0
         if (handle != 0L) {
