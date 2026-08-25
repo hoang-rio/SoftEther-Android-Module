@@ -527,3 +527,27 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeFo
     softether_connection_t* conn = (softether_connection_t*)handle;
     softether_force_close_socket(conn);
 }
+
+// Benchmark/diagnostics: return this session's virtual MAC (6 bytes) or NULL.
+JNIEXPORT jbyteArray JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetClientMac(
+    JNIEnv *env, jobject thiz, jlong handle) {
+    if (handle == 0) return NULL;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    jbyteArray arr = (*env)->NewByteArray(env, 6);
+    if (arr == NULL) return NULL;
+    (*env)->SetByteArrayRegion(env, arr, 0, 6, (jbyte*)conn->client_mac);
+    return arr;
+}
+
+// Benchmark/diagnostics: send a raw L2 Ethernet frame (bypasses the
+// auto-eth-header wrapping of softether_send). Returns bytes sent or -1.
+JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSendRaw(
+    JNIEnv *env, jobject thiz, jlong handle, jbyteArray data, jint length) {
+    if (handle == 0 || data == NULL || length <= 0) return -1;
+    jbyte* buf = (*env)->GetByteArrayElements(env, data, NULL);
+    if (buf == NULL) return -1;
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    int ret = softether_send_raw(conn, (const uint8_t*)buf, (size_t)length);
+    (*env)->ReleaseByteArrayElements(env, data, buf, JNI_ABORT);
+    return ret;
+}
