@@ -296,6 +296,10 @@ int softether_send_packet(softether_connection_t* conn, uint16_t command,
 // over the best TCP socket. No copies, no allocation. 0 on success, -1 on error.
 int softether_transmit_block(softether_connection_t* conn,
                              const uint8_t* block, uint32_t block_len);
+// Same, but caller MUST already hold write_mutex (send_block staging is
+// built under it — see the softether_send / send_packet race fix).
+int softether_transmit_block_nolock(softether_connection_t* conn,
+                                    const uint8_t* block, uint32_t block_len);
 int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
                              uint8_t* payload, uint32_t* payload_len, uint32_t max_payload);
 

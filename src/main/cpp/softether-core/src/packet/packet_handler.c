@@ -247,19 +247,16 @@ static int read_uint32(softether_connection_t* conn, uint32_t* out) {
 
 
 // Transmit a fully built block ([block_count][block_size][payload]) over the
-// best TCP socket. No copies, no allocation (Phase 13C hot path).
-// Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
-int softether_transmit_block(softether_connection_t* conn,
-                             const uint8_t* block, uint32_t block_len) {
+// best TCP socket, with failover to healthy sockets. Caller MUST hold
+// write_mutex (the Phase 13C send_block staging buffer is built under it).
+int softether_transmit_block_nolock(softether_connection_t* conn,
+                                    const uint8_t* block, uint32_t block_len) {
     if (conn == NULL || block == NULL || block_len < 8) {
         return -1;
     }
 
-    pthread_mutex_lock(&conn->write_mutex);
-
     // Recheck state and SSL inside mutex (disconnect may have freed them)
     if (conn->state == STATE_DISCONNECTING || conn->ssl == NULL) {
-        pthread_mutex_unlock(&conn->write_mutex);
         return -1;
     }
 
@@ -313,7 +310,6 @@ int softether_transmit_block(softether_connection_t* conn,
                 ? data_write_all(conn, block, (int)block_len)
                 : data_write_all_sock(conn, send_ssl, send_fd, block, (int)block_len);
             if (wr == 0) {
-                pthread_mutex_unlock(&conn->write_mutex);
                 return 0;
             }
         }
@@ -339,9 +335,18 @@ int softether_transmit_block(softether_connection_t* conn,
         }
     }
 
-    pthread_mutex_unlock(&conn->write_mutex);
     LOGE("Failed to send data block: no healthy send socket");
     return -1;
+}
+
+// Public wrapper: locks write_mutex around the failover transmit.
+int softether_transmit_block(softether_connection_t* conn,
+                             const uint8_t* block, uint32_t block_len) {
+    if (conn == NULL) return -1;
+    pthread_mutex_lock(&conn->write_mutex);
+    int ret = softether_transmit_block_nolock(conn, block, block_len);
+    pthread_mutex_unlock(&conn->write_mutex);
+    return ret;
 }
 
 // Send one data block (Ethernet frame) using the real SoftEther block format.

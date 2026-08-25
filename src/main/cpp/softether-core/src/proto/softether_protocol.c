@@ -2718,8 +2718,8 @@ static int softether_send_data_block(softether_connection_t* conn,
         }
     }
 
-    // Fall back to TCP
-    int result = softether_transmit_block(conn, block, block_total);
+    // Fall back to TCP (write_mutex held by callers staging into send_block)
+    int result = softether_transmit_block_nolock(conn, block, block_total);
     if (result != 0) {
         return -1;
     }
@@ -2751,11 +2751,23 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
     // Phase 13C: build "[block_count=1][block_size][eth hdr][ip packet]"
     // directly in the preallocated staging buffer — no stack frame copy and
     // the IP payload is copied exactly once (from the TUN read buffer).
-    // Safe outside write_mutex: VPN data blocks have a single producer thread,
-    // and keepalive writes use their own scratch space.
+    // Staging build happens under write_mutex (see race fix below).
     uint32_t frame_len = ETH_HEADER_SIZE + (uint32_t)len;
     uint32_t total_size = 8 + frame_len;
     uint8_t* blk = conn->send_block;
+
+    // Phase 13C race fix: the ARP/raw path (softether_send_packet) builds and
+    // writes from this same staging buffer under write_mutex. This path used
+    // to build without the mutex ("single producer"), so concurrent ARP
+    // replies interleaved in the buffer under load and produced corrupted
+    // blocks - servers respond by killing the session.
+    pthread_mutex_lock(&conn->write_mutex);
+
+    // Recheck state inside mutex (disconnect may have freed things)
+    if (conn->state == STATE_DISCONNECTING || conn->ssl == NULL) {
+        pthread_mutex_unlock(&conn->write_mutex);
+        return -1;
+    }
 
     blk[0] = 0; blk[1] = 0; blk[2] = 0; blk[3] = 1;  // block_count = 1
     blk[4] = (uint8_t)(frame_len >> 24);
@@ -2772,6 +2784,7 @@ int softether_send(softether_connection_t* conn, const uint8_t* data, size_t len
     memcpy(eth + ETH_HEADER_SIZE, data, len);
 
     int sent = softether_send_data_block(conn, blk, total_size, eth, frame_len);
+    pthread_mutex_unlock(&conn->write_mutex);
     if (sent < 0) {
         LOGE("Failed to send data block");
         return -1;
