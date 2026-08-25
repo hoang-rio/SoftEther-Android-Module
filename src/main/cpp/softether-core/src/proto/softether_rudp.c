@@ -423,14 +423,58 @@ void rudp_get_stats(rudp_context_t* ctx, rudp_stats_t* out) {
     out->udp_data_suspended = ctx->udp_data_suspended;
 }
 
+// Phase 14: loss-adaptive send window (token bucket). Refills additively
+// with elapsed time; loss events halve it. Data sends consume the budget.
+static void rudp_cwin_refill(rudp_context_t* ctx) {
+    if (!ctx->cwin_inited) {
+        ctx->cwin_bytes = RUDP_CWIN_START;
+        ctx->cwin_last_refill_tick = ctx->now;
+        ctx->cwin_inited = 1;
+        return;
+    }
+    if (ctx->now <= ctx->cwin_last_refill_tick) return;
+    uint64_t dt = ctx->now - ctx->cwin_last_refill_tick;
+    ctx->cwin_last_refill_tick = ctx->now;
+    ctx->cwin_bytes += (RUDP_CWIN_GROW_BPS * dt) / 1000;
+    if (ctx->cwin_bytes > RUDP_CWIN_MAX) {
+        ctx->cwin_bytes = RUDP_CWIN_MAX;
+    }
+}
+
+// Phase 14: a detected loss (peer-tick gap, recv overflow) halves the send
+// window and records the event for the clean-period backoff reset.
+static void rudp_cwin_on_loss(rudp_context_t* ctx) {
+    ctx->last_loss_event_tick = ctx->now;
+    ctx->cwin_bytes /= 2;
+    if (ctx->cwin_bytes < RUDP_CWIN_MIN) {
+        ctx->cwin_bytes = RUDP_CWIN_MIN;
+    }
+}
+
 int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
     if (ctx == NULL) return 0;
     if (!ctx->inited) return 0;
     if (!ctx->peer_addr_set) return 0;
 
+    // Phase 14: refill the loss-adaptive send window (token bucket).
+    rudp_cwin_refill(ctx);
+
+    // Phase 14: a long clean stretch resets the suspension backoff so a
+    // temporarily bad network doesn't pin the session on TCP forever.
+    if (!ctx->udp_data_suspended &&
+        ctx->last_loss_event_tick != 0 &&
+        ctx->now > ctx->last_loss_event_tick &&
+        (ctx->now - ctx->last_loss_event_tick) >= RUDP_CLEAN_RESET_MS) {
+        ctx->suspension_count = 0;
+        ctx->recent_overflows = 0;
+        LOGI("rudp: %llu ms clean, resetting UDP fallback backoff",
+             (unsigned long long)(ctx->now - ctx->last_loss_event_tick));
+    }
+
     // Phase 13F: UDP-data suspension for loss recovery. When the receive
     // queue overflowed repeatedly (congested/lossy path), route DATA over
     // TCP while keepalives continue on UDP; re-probe after the suspension.
+    // Phase 14: each consecutive failed probe doubles the suspension.
     if (ctx->udp_data_suspended) {
         if (ctx->now < ctx->udp_data_resume_tick) {
             return 0;
@@ -440,11 +484,17 @@ int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
         LOGI("rudp: re-probing UDP data path after suspension");
     }
     if (ctx->recent_overflows >= RUDP_OVERFLOW_SUSPEND_THRESHOLD) {
+        uint64_t suspend_ms = RUDP_UDP_SUSPEND_MS;
+        int shift = ctx->suspension_count;
+        if (shift > RUDP_SUSPEND_BACKOFF_MAX_SHIFT) shift = RUDP_SUSPEND_BACKOFF_MAX_SHIFT;
+        suspend_ms <<= shift;
+        ctx->suspension_count++;
         ctx->udp_data_suspended = 1;
-        ctx->udp_data_resume_tick = ctx->now + RUDP_UDP_SUSPEND_MS;
-        LOGW("rudp: %u recv-queue overflows -> suspending UDP data for %d ms "
-             "(total overflows %llu)",
-             ctx->recent_overflows, RUDP_UDP_SUSPEND_MS,
+        ctx->udp_data_resume_tick = ctx->now + suspend_ms;
+        LOGW("rudp: %u recv-queue overflows -> suspending UDP data for %llu ms "
+             "(probe #%u, total overflows %llu)",
+             ctx->recent_overflows, (unsigned long long)suspend_ms,
+             ctx->suspension_count,
              (unsigned long long)ctx->recv_queue_overflow_count);
         return 0;
     }
@@ -458,6 +508,9 @@ int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
             return 0;
         } else {
             if ((ctx->first_stable_receive_tick + RUDP_REQUIRE_CONTINUOUS) <= ctx->now) {
+                // Phase 14: no send budget left this cycle -> excess blocks
+                // ride TCP until the window refills.
+                if (ctx->cwin_bytes == 0) return 0;
                 return 1;
             }
             return 0;
@@ -549,9 +602,12 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
     if (ctx->last_peer_tick_seen != 0 &&
         my_tick > ctx->last_peer_tick_seen + RUDP_PEER_TICK_LOSS_GAP) {
         ctx->peer_tick_gap_events++;
-        LOGT("rudp: peer tick gap %llu -> %llu (gap event #%llu)",
+        // Phase 14: inbound gap = we lost traffic -> shrink send window.
+        rudp_cwin_on_loss(ctx);
+        LOGT("rudp: peer tick gap %llu -> %llu (gap event #%llu, cwin now %llu)",
              (unsigned long long)ctx->last_peer_tick_seen, (unsigned long long)my_tick,
-             (unsigned long long)ctx->peer_tick_gap_events);
+             (unsigned long long)ctx->peer_tick_gap_events,
+             (unsigned long long)ctx->cwin_bytes);
     }
     ctx->last_peer_tick_seen = my_tick;
     ctx->udp_rx_packets++;
@@ -601,10 +657,14 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
         } else if (queue_len <= RUDP_MAX_PAYLOAD_SIZE) {
             // Phase 13F: count instead of dropping silently. Sustained
             // overflows trip the UDP-data suspension in rudp_is_send_ready.
+            // Phase 14: overflow also shrinks the send window.
             ctx->recv_queue_overflow_count++;
             ctx->recent_overflows++;
-            LOGW("rudp_poll: recv queue full, dropped %u bytes (overflow #%llu)",
-                 queue_len, (unsigned long long)ctx->recv_queue_overflow_count);
+            rudp_cwin_on_loss(ctx);
+            LOGW("rudp_poll: recv queue full, dropped %u bytes (overflow #%llu, cwin %llu)",
+                 queue_len,
+                 (unsigned long long)ctx->recv_queue_overflow_count,
+                 (unsigned long long)ctx->cwin_bytes);
         }
     }
     return 0;
@@ -621,6 +681,8 @@ void rudp_poll(rudp_context_t* ctx) {
         (ctx->last_recv_tick + timeout_value) < ctx->now) {
         // Timeout - reset state
         ctx->first_stable_receive_tick = 0;
+        // Phase 14: treat as a loss event for backoff accounting
+        ctx->last_loss_event_tick = ctx->now;
     }
 
     // Send keepalive if needed
@@ -874,6 +936,18 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
     if (ret < 0) {
         LOGE("rudp_send: sendto failed (errno=%d)", errno);
         return -1;
+    }
+
+    // Phase 14: data payloads consume the send-window budget (keepalives
+    // with data_size == 0 are free). rudp_is_send_ready gates on the same
+    // bucket, so exhausted budget routes excess blocks over TCP.
+    if (data_size > 0) {
+        rudp_cwin_refill(ctx);
+        if (ctx->cwin_bytes >= data_size) {
+            ctx->cwin_bytes -= data_size;
+        } else {
+            ctx->cwin_bytes = 0;
+        }
     }
 
     LOGT("rudp_send: %u bytes -> %u bytes (flag=0x%02X)", data_size, size, send_flag);

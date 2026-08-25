@@ -125,6 +125,18 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13E | Java loop fixes (delay, copyOf, blocking receive) | P1 | ✅ Done |
 | 13F | RUDP loss recovery + buffer tuning | P1 | ✅ Done |
 | 13G | Benchmark harness + acceptance criteria | P0 | 🟡 Partial (device matrix outstanding) |
+| 14  | RUDP loss-adaptive send window + sticky fallback | P1 | ✅ Done (device validation outstanding) |
+
+#### 14 — RUDP loss-adaptive window + sticky fallback (P1) — DONE
+
+- On-device UDP-mode goodput collapsed to ~1/10 of TCP: the wire format has no seq/ack fields, so every lost datagram is a silently lost IP packet and inner TCP collapses; the fixed 30 s suspension re-probe then oscillated between fast-TCP and lossy-UDP forever.
+- Implemented (`softether_rudp.c/.h`, `packet_handler.c`):
+  - Loss-adaptive token-bucket send window (start 256 KB, min 32 KB, max 8 MB, +4 MB/s refill). Peer-tick gaps, recv overflows, and KA timeouts halve it; `rudp_is_send_ready` returns 0 when exhausted so excess blocks ride TCP until refill.
+  - Sticky fallback with exponential backoff: consecutive failed probes suspend UDP data 30 s → ×8 cap; 5 clean minutes reset backoff.
+  - `RUDP_RECV_QUEUE_SIZE` 64 → 256 (absorbs bursts instead of dropping).
+  - `fill_recv_queue` now drains all buffered RUDP frames per call (was one), matching the Phase 13D batched RX path.
+- Acceptance for device run: iperf3 over UDP mode within ~30% of TCP mode on Wi-Fi; `stats:` log shows `ovf`/`gaps` stable (not climbing) and `susp=false` during steady state.
+
 
 #### 13A — Hot-path logging (P0) — DONE
 

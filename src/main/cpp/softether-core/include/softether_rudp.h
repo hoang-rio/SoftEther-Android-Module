@@ -55,13 +55,26 @@ extern "C" {
 #define RUDP_FLAG_COMPRESSED        0x01
 
 // Receive queue
-#define RUDP_RECV_QUEUE_SIZE        64
+#define RUDP_RECV_QUEUE_SIZE        256
 
 // Phase 13F: socket buffer sizing + loss recovery
 #define RUDP_SOCK_BUF_SIZE              (2 * 1024 * 1024) // SO_RCVBUF/SO_SNDBUF target
 #define RUDP_OVERFLOW_SUSPEND_THRESHOLD 8                 // recv-queue overflows before suspending UDP data
-#define RUDP_UDP_SUSPEND_MS             (30 * 1000)       // data-over-UDP suspension before re-probe
+#define RUDP_UDP_SUSPEND_MS             (30 * 1000)       // base data-over-UDP suspension before re-probe
 #define RUDP_PEER_TICK_LOSS_GAP         (10 * 1000)       // peer-tick jump counted as a gap event
+
+// Phase 14: loss-adaptive congestion window + sticky fallback.
+// The SoftEther UDP-accel wire format has no seq/ack fields, so reliability
+// is approximated: the send window shrinks on detected loss (peer-tick gaps,
+// recv overflows) and grows additively while clean; blocks that do not fit
+// the budget ride TCP instead. Re-probe suspensions back off exponentially so
+// a lossy path settles on TCP instead of oscillating every 30 s.
+#define RUDP_CWIN_START                 (256 * 1024)      // initial send-window budget (bytes)
+#define RUDP_CWIN_MIN                   (32 * 1024)       // floor after repeated halvings
+#define RUDP_CWIN_MAX                   (8 * 1024 * 1024) // ceiling while path stays clean
+#define RUDP_CWIN_GROW_BPS              (4ull * 1024 * 1024) // additive refill rate (~4 MB/s)
+#define RUDP_SUSPEND_BACKOFF_MAX_SHIFT  3                 // suspend x1, x2, x4, x8 (cap)
+#define RUDP_CLEAN_RESET_MS             (5 * 60 * 1000)   // clean period that resets backoff state
 
 typedef struct {
     uint8_t data[RUDP_MAX_PAYLOAD_SIZE];
@@ -141,6 +154,15 @@ typedef struct {
     uint32_t recent_overflows;        // overflows since last (re)probe window
     int udp_data_suspended;           // 1 = send data via TCP, KAs only on UDP
     uint64_t udp_data_resume_tick;    // when the suspension lifts
+    uint32_t suspension_count;        // consecutive suspensions (drives backoff)
+    uint64_t last_loss_event_tick;    // last gap/overflow/timeout seen (ms tick)
+
+    // Phase 14: loss-adaptive send window. Data sends consume the budget;
+    // rudp_is_send_ready returns 0 when it is exhausted, so excess blocks
+    // fall back to TCP until the token bucket refills.
+    uint64_t cwin_bytes;
+    uint64_t cwin_last_refill_tick;
+    int cwin_inited;
 } rudp_context_t;
 
 // Phase 13F: snapshot of RUDP health counters (for nativeGetStats / logging)

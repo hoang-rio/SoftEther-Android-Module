@@ -714,6 +714,36 @@ int softether_process_keepalive(softether_connection_t* conn) {
 
 // ---- Receive queue helpers ----
 
+// Phase 14: drain as many decoded RUDP frames as possible into the connection
+// receive queue (previously one frame per fill_recv_queue call, which capped
+// the batched RX path at one JNI crossing per UDP datagram).
+// Returns the number of frames moved.
+static int drain_rudp_into_recv_queue(softether_connection_t* conn, int max_frames) {
+    int moved = 0;
+    if (conn == NULL || !(conn->rudp && conn->rudp_enabled)) return 0;
+
+    rudp_poll(conn->rudp);
+
+    uint8_t rudp_buf[MAX_QUEUED_FRAME];
+    while (moved < max_frames && conn->recv_queue_count < RECV_QUEUE_SIZE) {
+        uint32_t rudp_len = 0;
+        int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
+        if (r <= 0 || rudp_len == 0) break;
+
+        queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
+        uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
+        memcpy(entry->data, rudp_buf, copy_len);
+        entry->len = copy_len;
+        conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
+        conn->recv_queue_count++;
+        moved++;
+    }
+    if (moved > 0) {
+        LOGT("fill_recv_queue: drained %d frame(s) from RUDP", moved);
+    }
+    return moved;
+}
+
 // Read one protocol message and queue ALL blocks into the receive queue.
 // Supports multi-connection: polls all active TCP sockets + optional UDP socket.
 // Returns: 1 = data queued, 0 = keepalive/no data/timeout, -1 = error
@@ -722,22 +752,8 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) return -1;
 
     // Check for queued RUDP data first (non-blocking)
-    if (conn->rudp && conn->rudp_enabled) {
-        rudp_poll(conn->rudp);
-
-        uint32_t rudp_len = 0;
-        uint8_t rudp_buf[MAX_QUEUED_FRAME];
-        int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
-        if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-            queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-            uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
-            memcpy(entry->data, rudp_buf, copy_len);
-            entry->len = copy_len;
-            conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-            conn->recv_queue_count++;
-            LOGT("fill_recv_queue: queued %u bytes from RUDP (buffered)", copy_len);
-            return 1;
-        }
+    if (drain_rudp_into_recv_queue(conn, RECV_QUEUE_SIZE) > 0) {
+        return 1;
     }
 
     // Build pollfd array: [UDP (optional)] + [primary TCP] + [additional TCP 0..N-1]
@@ -869,18 +885,7 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
         if (conn->rudp && conn->rudp_enabled && udp_fd >= 0) {
             for (nfds_t i = 0; i < nfds; i++) {
                 if (fds[i].fd == udp_fd && (fds[i].revents & POLLIN)) {
-                    rudp_poll(conn->rudp);
-                    uint32_t rudp_len = 0;
-                    uint8_t rudp_buf[MAX_QUEUED_FRAME];
-                    int r = rudp_recv(conn->rudp, rudp_buf, &rudp_len, sizeof(rudp_buf));
-                    if (r > 0 && rudp_len > 0 && conn->recv_queue_count < RECV_QUEUE_SIZE) {
-                        queued_frame_t* entry = &conn->recv_queue[conn->recv_queue_tail];
-                        uint32_t copy_len = rudp_len < MAX_QUEUED_FRAME ? rudp_len : MAX_QUEUED_FRAME;
-                        memcpy(entry->data, rudp_buf, copy_len);
-                        entry->len = copy_len;
-                        conn->recv_queue_tail = (conn->recv_queue_tail + 1) % RECV_QUEUE_SIZE;
-                        conn->recv_queue_count++;
-                        LOGT("fill_recv_queue: queued %u bytes from RUDP (poll)", copy_len);
+                    if (drain_rudp_into_recv_queue(conn, RECV_QUEUE_SIZE) > 0) {
                         return 1;
                     }
                 }
