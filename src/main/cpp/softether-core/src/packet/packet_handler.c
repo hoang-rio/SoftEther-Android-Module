@@ -263,34 +263,85 @@ int softether_transmit_block(softether_connection_t* conn,
         return -1;
     }
 
-    // Select best socket for multi-connection send
-    int send_idx = softether_select_send_socket(conn);
-    void* send_ssl = (send_idx == 0) ? conn->ssl : conn->additional[send_idx - 1].ssl;
-    int send_fd = (send_idx == 0) ? conn->socket_fd : conn->additional[send_idx - 1].socket_fd;
-    __sync_synchronize();  // load-acquire: ensure ssl/fd reads are ordered
+    // Select best socket for multi-connection send, with failover: if the
+    // selected socket (or any candidate) fails — e.g. the server hung up an
+    // additional connection — retire it and retry on the remaining healthy
+    // sockets instead of failing the whole session and forcing a reconnect.
+    int best = softether_select_send_socket(conn);
 
-    // Revalidate: if using additional, verify it's still active
-    if (send_idx > 0) {
-        softether_tcp_sock_t* ts = &conn->additional[send_idx - 1];
-        if (!ts->active || send_ssl == NULL) {
-            pthread_mutex_unlock(&conn->write_mutex);
-            return -1;
+    // Build the candidate list (send-capable sockets only), best socket first
+    int candidates[MAX_SE_CONNECTIONS + 1];
+    int count = 0;
+    if (best != 0) candidates[count++] = best;
+    {
+        int pd = conn->primary_direction;
+        if (conn->socket_fd >= 0 && conn->ssl != NULL &&
+            (pd == TCP_DIRECTION_BOTH || pd == TCP_DIRECTION_CLIENT_TO_SERVER)) {
+            candidates[count++] = 0;
         }
-        if (data_write_all_sock(conn, send_ssl, send_fd, block, (int)block_len) != 0) {
-            pthread_mutex_unlock(&conn->write_mutex);
-            LOGE("Failed to send data block");
-            return -1;
+        for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+            softether_tcp_sock_t* ts = &conn->additional[i];
+            if (!ts->active) continue;
+            int d = ts->direction;
+            if (d != TCP_DIRECTION_BOTH && d != TCP_DIRECTION_CLIENT_TO_SERVER) continue;
+            int idx = i + 1;
+            if (idx == best) continue;
+            candidates[count++] = idx;
         }
-    } else {
-        if (data_write_all(conn, block, (int)block_len) != 0) {
-            pthread_mutex_unlock(&conn->write_mutex);
-            LOGE("Failed to send data block");
-            return -1;
+    }
+
+    for (int ci = 0; ci < count; ci++) {
+        int send_idx = candidates[ci];
+        void* send_ssl;
+        int send_fd;
+        softether_tcp_sock_t* ts = NULL;
+
+        if (send_idx == 0) {
+            if (conn->ssl == NULL || conn->socket_fd < 0) continue;
+            send_ssl = conn->ssl;
+            send_fd = conn->socket_fd;
+        } else {
+            ts = &conn->additional[send_idx - 1];
+            __sync_synchronize();  // load-acquire: ensure ssl/fd reads are ordered
+            if (!ts->active || ts->ssl == NULL || ts->socket_fd < 0) continue;
+            send_ssl = ts->ssl;
+            send_fd = ts->socket_fd;
+        }
+
+        {
+            int wr = (send_idx == 0)
+                ? data_write_all(conn, block, (int)block_len)
+                : data_write_all_sock(conn, send_ssl, send_fd, block, (int)block_len);
+            if (wr == 0) {
+                pthread_mutex_unlock(&conn->write_mutex);
+                return 0;
+            }
+        }
+
+        // Write failed on this socket. Retire failed additional sockets so
+        // later sends skip them; a dead primary falls through to others.
+        LOGW("transmit_block: write failed on %s socket fd=%d, failing over",
+             send_idx == 0 ? "primary" : "additional", send_fd);
+        if (ts != NULL) {
+            int saved_fd = ts->socket_fd;
+            void* saved_ssl_ctx = ts->ssl_ctx;
+            ts->active = 0;
+            ts->ssl = NULL;
+            ts->ssl_ctx = NULL;
+            ts->socket_fd = -1;
+            __sync_synchronize();
+            if (saved_fd >= 0) close(saved_fd);
+            if (saved_ssl_ctx != NULL) {
+                ssl_shutdown((ssl_context_t*)saved_ssl_ctx);
+                ssl_destroy((ssl_context_t*)saved_ssl_ctx);
+            }
+            conn->num_additional--;
         }
     }
 
     pthread_mutex_unlock(&conn->write_mutex);
-    return 0;
+    LOGE("Failed to send data block: no healthy send socket");
+    return -1;
 }
 
 // Send one data block (Ethernet frame) using the real SoftEther block format.
