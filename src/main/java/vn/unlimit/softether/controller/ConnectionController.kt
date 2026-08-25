@@ -51,6 +51,11 @@ class ConnectionController(
     private val client = SoftEtherClient()
     private val isCancelled = AtomicBoolean(false)
     private val isReconnecting = AtomicBoolean(false)
+    // True while a connect flow owns the native handle (performConnect alive).
+    // Deliberately NOT derived from currentState: disconnect() resets the state
+    // to DISCONNECTED immediately, but the blocked nativeConnectWithHub JNI
+    // call may still hold connect_mutex long after that.
+    private val connectInFlight = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
     private val connectionMutex = Mutex()
     private var stateMonitorJob: Job? = null
@@ -252,22 +257,22 @@ class ConnectionController(
 
         // Single-owner teardown: while this connect flow is alive, ONLY this
         // function destroys the native handle. disconnect()/destroyResources()
-        // defer to it (see isConnectInFlight) so a user cancel during the
+        // defer to it (see connectInFlight) so a user cancel during the
         // blocking nativeConnectWithHub can never free the connection out
         // from under the connect thread (zombie connect + stuck connect_mutex).
+        connectInFlight.set(true)
         try {
             performConnectInner()
         } catch (e: Throwable) {
             Log.d(TAG, "Connect flow ended (${e.javaClass.simpleName}), tearing down native handle")
             teardownNativeConnection()
             throw e
+        } finally {
+            connectInFlight.set(false)
         }
     }
 
-    private fun isConnectInFlight(): Boolean =
-        currentState == ConnectionState.CONNECTING ||
-            currentState == ConnectionState.TLS_HANDSHAKE ||
-            currentState == ConnectionState.SESSION_SETUP
+    private fun isConnectInFlight(): Boolean = connectInFlight.get()
 
     /**
      * Gracefully disconnect and free the native handle (idempotent).

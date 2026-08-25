@@ -295,13 +295,12 @@ class SoftEtherVpnService : VpnService() {
         connectionJob?.cancel()
         connectionJob = null
         
-        // Clean up resources
-        try {
-            controller?.disconnect()
-            controller = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error disconnecting on destroy", e)
-        }
+        // Clean up resources OFF the main thread: disconnect/destroy make
+        // blocking native calls (nativeDisconnect waits on connect_mutex and
+        // can block for the whole connect timeout when a connect is in
+        // flight — running that on main caused an ANR in softether_disconnect).
+        val currentController = controller
+        controller = null
         
         try {
             vpnInterface?.close()
@@ -312,6 +311,15 @@ class SoftEtherVpnService : VpnService() {
         
         unregisterNetworkReceiver()
         notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
+        // NonCancellable: serviceScope is cancelled right below, but this
+        // cleanup must still run to free the native connection.
+        serviceScope.launch(NonCancellable + Dispatchers.IO) {
+            try {
+                currentController?.destroyResources()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error destroying controller on destroy", e)
+            }
+        }
         serviceScope.cancel()
     }
 

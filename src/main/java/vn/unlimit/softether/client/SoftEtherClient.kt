@@ -342,6 +342,20 @@ class SoftEtherClient {
     external fun nativeGetNumConnections(handle: Long): Int
     external fun nativeGetAllSocketFds(handle: Long): IntArray?
     external fun nativeForceCloseSocket(handle: Long)
+    external fun nativeGetClientMac(handle: Long): ByteArray?
+    external fun nativeSendRaw(handle: Long, data: ByteArray, length: Int): Int
+
+    /**
+     * This session's virtual MAC address (6 bytes), or null if the handle is invalid.
+     */
+    fun getClientMac(handle: Long = nativeHandle): ByteArray? = nativeGetClientMac(handle)
+
+    /**
+     * Send a raw L2 Ethernet frame (no automatic Ethernet-header wrapping).
+     * Benchmark/diagnostics use only.
+     */
+    fun sendRaw(handle: Long = nativeHandle, frame: ByteArray): Int =
+        nativeSendRaw(handle, frame, frame.size)
 
     /**
      * Perform DHCP over SoftEther tunnel to get IP configuration
