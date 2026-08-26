@@ -42,11 +42,14 @@ struct ssl_context {
     int connected;
 };
 
-// Phase 16: OpenSSL 3.5.7's multiblock record-write path frees a shared
-// provider-cached EVP_SIGNATURE; concurrent SSL_write from two connections
-// double-frees it (scudo abort). Writes + lifecycle are serialized behind a
-// process-wide lock; reads stay parallel to protect idle latency.
-static pthread_mutex_t g_tls_write_lock = PTHREAD_MUTEX_INITIALIZER;
+// TLS object lifetime guard. OpenSSL 3.5.7's multiblock record-write path
+// frees a shared provider-cached EVP_SIGNATURE; concurrent SSL_write from two
+// connections double-frees it — so writers stay fully serialized (wrlock is
+// exclusive). Readers take the shared rdlock so parallel SSL_read keeps its
+// idle latency, while ssl_destroy/shutdown take wrlock and therefore can
+// never free an SSL object that a reader is still inside of (UAF crash in
+// ossl_tls_handle_rlayer_return / ssl3_read_bytes during DHCP or receive).
+static pthread_rwlock_t g_tls_use_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 // Per-connection SSL_CTX (Phase 16): sharing one CTX across connections with
 // concurrent I/O corrupted TLS digest state (scudo aborts in EVP_MD_CTX_free).
@@ -365,14 +368,14 @@ void ssl_destroy(ssl_context_t* ctx) {
         return;
     }
     
-    pthread_mutex_lock(&g_tls_write_lock);
+    pthread_rwlock_wrlock(&g_tls_use_lock);
     if (ctx->ssl) {
         SSL_free(ctx->ssl);
     }
     if (ctx->ctx) {
         SSL_CTX_free(ctx->ctx);
     }
-    pthread_mutex_unlock(&g_tls_write_lock);
+    pthread_rwlock_unlock(&g_tls_use_lock);
     
     free(ctx);
 }
@@ -383,11 +386,11 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
         return -1;
     }
 
-    pthread_mutex_lock(&g_tls_write_lock);
+    pthread_rwlock_wrlock(&g_tls_use_lock);
     ctx->ssl = SSL_new(ctx->ctx);
     if (ctx->ssl == NULL) {
         LOGE("Failed to create SSL object");
-        pthread_mutex_unlock(&g_tls_write_lock);
+        pthread_rwlock_unlock(&g_tls_use_lock);
         return -1;
     }
 
@@ -403,16 +406,20 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
         LOGE("Failed to set SSL fd");
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
-        pthread_mutex_unlock(&g_tls_write_lock);
+        pthread_rwlock_unlock(&g_tls_use_lock);
         return -1;
     }
 
     // Set connect state
     SSL_set_connect_state(ctx->ssl);
-    // Handshake runs unlocked — it can block on network I/O for seconds and
-    // only touches this connection's own SSL object.
-    pthread_mutex_unlock(&g_tls_write_lock);
-    
+    pthread_rwlock_unlock(&g_tls_use_lock);
+
+    // Handshake runs under the SHARED lock: it can block on network I/O for
+    // seconds, but ssl_destroy must wait for it instead of freeing the SSL
+    // object mid-handshake. Teardown paths force-close the fd first, so the
+    // handshake exits promptly on socket error and releases the lock.
+    pthread_rwlock_rdlock(&g_tls_use_lock);
+
     // Perform handshake with retry loop - TLS handshake often requires multiple exchanges
     int max_attempts = 100;  // Prevent infinite loop
     int attempt = 0;
@@ -448,6 +455,7 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
             LOGE("SSL handshake failed: error=%d detail=%lu (%s)", ssl_error, err_detail,
                  err_detail ? ERR_error_string(err_detail, NULL) : "none");
         }
+        pthread_rwlock_unlock(&g_tls_use_lock);
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
         return -1;
@@ -455,6 +463,7 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     
     if (result != 1) {
         LOGE("SSL handshake did not complete after %d attempts", max_attempts);
+        pthread_rwlock_unlock(&g_tls_use_lock);
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
         return -1;
@@ -472,7 +481,8 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     // Set SSL modes matching reference SoftEther implementation
     SSL_set_mode(ctx->ssl, SSL_MODE_AUTO_RETRY);
     SSL_set_mode(ctx->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    
+
+    pthread_rwlock_unlock(&g_tls_use_lock);
     return 0;
 }
 
@@ -480,6 +490,10 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     if (ctx == NULL || ctx->ssl == NULL || !ctx->connected) {
         return -1;
     }
+
+    // Shared lock: keeps the SSL object alive against concurrent
+    // ssl_destroy/shutdown without serializing parallel readers.
+    pthread_rwlock_rdlock(&g_tls_use_lock);
 
     // Check if there's pending data in the SSL buffer first
     int pending = SSL_pending(ctx->ssl);
@@ -494,6 +508,7 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
     do {
         if (!ctx->connected) {
             LOGE("SSL read: connection lost");
+            pthread_rwlock_unlock(&g_tls_use_lock);
             return -1;
         }
         result = SSL_read(ctx->ssl, buffer, (int)len);
@@ -529,6 +544,7 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
                  err_detail, err_detail ? ERR_error_string(err_detail, NULL) : "none");
         }
     }
+    pthread_rwlock_unlock(&g_tls_use_lock);
     return result;
 }
 
@@ -537,7 +553,7 @@ int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len) {
         return -1;
     }
 
-    pthread_mutex_lock(&g_tls_write_lock);
+    pthread_rwlock_wrlock(&g_tls_use_lock);
     int result = SSL_write(ctx->ssl, data, (int)len);
     if (result < 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
@@ -545,7 +561,7 @@ int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len) {
             LOGE("SSL write error: %d", ssl_error);
         }
     }
-    pthread_mutex_unlock(&g_tls_write_lock);
+    pthread_rwlock_unlock(&g_tls_use_lock);
     return result;
 }
 
@@ -554,15 +570,18 @@ void ssl_shutdown(ssl_context_t* ctx) {
         return;
     }
 
-    pthread_mutex_lock(&g_tls_write_lock);
+    pthread_rwlock_wrlock(&g_tls_use_lock);
     SSL_shutdown(ctx->ssl);
     ctx->connected = 0;
-    pthread_mutex_unlock(&g_tls_write_lock);
+    pthread_rwlock_unlock(&g_tls_use_lock);
 }
 
 int ssl_has_pending(ssl_context_t* ctx) {
     if (ctx == NULL || ctx->ssl == NULL) return 0;
-    return SSL_pending(ctx->ssl) > 0 ? 1 : 0;
+    pthread_rwlock_rdlock(&g_tls_use_lock);
+    int pending = SSL_pending(ctx->ssl) > 0 ? 1 : 0;
+    pthread_rwlock_unlock(&g_tls_use_lock);
+    return pending;
 }
 
 // MD5 hashing
