@@ -249,19 +249,24 @@ class ConnectionController(
         currentState = ConnectionState.CONNECTING
         isCancelled.set(false)
 
-        // Create native connection
-        nativeHandle = client.nativeCreate()
-        if (nativeHandle == 0L) {
-            throw Exception("Failed to create native connection")
-        }
-
         // Single-owner teardown: while this connect flow is alive, ONLY this
         // function destroys the native handle. disconnect()/destroyResources()
         // defer to it (see connectInFlight) so a user cancel during the
         // blocking nativeConnectWithHub can never free the connection out
         // from under the connect thread (zombie connect + stuck connect_mutex).
+        //
+        // Raise connectInFlight BEFORE nativeCreate(): if a cancel lands in
+        // the window between handle creation and the flag being set, teardown
+        // paths see nativeHandle != 0 && !connectInFlight and destroy the
+        // fresh handle under the connect thread (use-after-free crash inside
+        // softether_protocol_login / ssl_write).
         connectInFlight.set(true)
         try {
+            nativeHandle = client.nativeCreate()
+            if (nativeHandle == 0L) {
+                throw Exception("Failed to create native connection")
+            }
+
             performConnectInner()
         } catch (e: Throwable) {
             Log.d(TAG, "Connect flow ended (${e.javaClass.simpleName}), tearing down native handle")
@@ -824,6 +829,15 @@ class ConnectionController(
                 return
             }
 
+            // Raise connectInFlight BEFORE creating the new handle: this flow
+            // now owns the native lifecycle and blocks inside
+            // nativeConnectWithHub. Without the flag, disconnect()/destroyResources()
+            // see !isConnectInFlight() + nativeHandle != 0 and destroy the
+            // connection under the blocked reconnect thread (use-after-free
+            // crash inside softether_protocol_login / ssl_write). Cleared in
+            // the outer finally below.
+            connectInFlight.set(true)
+
             // Create new native connection
             nativeHandle = client.nativeCreate()
             if (nativeHandle == 0L) {
@@ -956,6 +970,7 @@ class ConnectionController(
             currentState = ConnectionState.DISCONNECTED
             onStateChange(ConnectionState.DISCONNECTED)
         } finally {
+            connectInFlight.set(false)
             isReconnecting.set(false)
         }
     }
