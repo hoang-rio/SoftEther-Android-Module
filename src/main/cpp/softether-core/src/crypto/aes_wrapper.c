@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/provider.h>
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -52,13 +53,36 @@ static pthread_mutex_t g_tls_write_lock = PTHREAD_MUTEX_INITIALIZER;
 // Library init stays global/once; each connection creates its own CTX under a
 // creation-only mutex (serializes OpenSSL init without serializing I/O).
 static pthread_mutex_t g_ssl_ctx_create_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_ssl_library_inited = 0;
+
+// Phase 17: OpenSSL 3.x needs explicit provider pre-loading.
+// Use pthread_once so ssl_init_library() is safe to call from ANY context
+// (not just ssl_create_client under g_ssl_ctx_create_lock).  This prevents
+// the lazy-load race when NAT-T/R-UDP transport threads call sha1_hash()
+// before any ssl_create_client() has run, while a TCP transport thread
+// simultaneously triggers provider loading via EVP_DigestInit_ex.
+static pthread_once_t g_ssl_init_once = PTHREAD_ONCE_INIT;
+
+static void ssl_init_library_do(void) {
+    OPENSSL_init_ssl(OPENSSL_INIT_ADD_ALL_CIPHERS |
+                     OPENSSL_INIT_ADD_ALL_DIGESTS |
+                     OPENSSL_INIT_NO_LOAD_CONFIG, NULL);
+
+    OSSL_PROVIDER *prov_default = OSSL_PROVIDER_load(NULL, "default");
+    if (prov_default == NULL) {
+        LOGE("Failed to load OpenSSL default provider");
+    }
+    OSSL_PROVIDER *prov_legacy = OSSL_PROVIDER_load(NULL, "legacy");
+    if (prov_legacy == NULL) {
+        LOGD("Legacy provider not available (non-fatal)");
+    }
+
+    LOGD("OpenSSL library initialized (providers: default=%s, legacy=%s)",
+         prov_default ? "loaded" : "FAILED",
+         prov_legacy ? "loaded" : "unavailable");
+}
 
 static void ssl_init_library(void) {
-    if (g_ssl_library_inited) return;
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-    g_ssl_library_inited = 1;
+    pthread_once(&g_ssl_init_once, ssl_init_library_do);
 }
 
 // Apply the connection options every client CTX needs.
@@ -76,6 +100,8 @@ static void ssl_configure_client_ctx(SSL_CTX* c) {
 
 aes_context_t* aes_create(int mode, const uint8_t* key, size_t key_len, 
                           const uint8_t* iv, size_t iv_len) {
+    ssl_init_library();
+
     if (key == NULL || (key_len != 16 && key_len != 24 && key_len != 32)) {
         LOGE("Invalid key parameters");
         return NULL;
@@ -221,6 +247,7 @@ void sha256_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
     if (data == NULL || hash == NULL) {
         return;
     }
+    ssl_init_library();
     
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (ctx == NULL) {
@@ -283,6 +310,7 @@ void hmac_sha256(const uint8_t* key, size_t key_len,
     if (key == NULL || data == NULL || mac == NULL) {
         return;
     }
+    ssl_init_library();
     
     unsigned int mac_len = 32;
     HMAC(EVP_sha256(), key, (int)key_len, data, data_len, mac, &mac_len);
@@ -292,6 +320,7 @@ int generate_random_bytes(uint8_t* buffer, size_t len) {
     if (buffer == NULL || len == 0) {
         return -1;
     }
+    ssl_init_library();
     
     if (RAND_bytes(buffer, (int)len) != 1) {
         LOGE("Failed to generate random bytes");
@@ -542,6 +571,7 @@ void md5_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
         LOGE("md5_hash: Invalid parameters");
         return;
     }
+    ssl_init_library();
 
     unsigned int hash_len = 0;
     unsigned char md_buf[EVP_MAX_MD_SIZE];
@@ -587,6 +617,7 @@ void sha1_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
         LOGE("sha1_hash: Invalid parameters");
         return;
     }
+    ssl_init_library();
 
     unsigned int hash_len = 0;
     unsigned char md_buf[EVP_MAX_MD_SIZE];
