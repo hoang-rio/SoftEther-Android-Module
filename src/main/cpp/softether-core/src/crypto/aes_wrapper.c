@@ -41,33 +41,37 @@ struct ssl_context {
     int connected;
 };
 
-// Shared SSL_CTX — created once, reused by all ssl_context_t instances.
-// SSL_CTX is thread-safe for sharing; only SSL objects are per-connection.
-static SSL_CTX* g_shared_ssl_ctx = NULL;
-static pthread_once_t g_ssl_ctx_once = PTHREAD_ONCE_INIT;
+// Phase 16: OpenSSL 3.5.7's multiblock record-write path frees a shared
+// provider-cached EVP_SIGNATURE; concurrent SSL_write from two connections
+// double-frees it (scudo abort). Writes + lifecycle are serialized behind a
+// process-wide lock; reads stay parallel to protect idle latency.
+static pthread_mutex_t g_tls_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void ssl_init_shared_ctx(void) {
+// Per-connection SSL_CTX (Phase 16): sharing one CTX across connections with
+// concurrent I/O corrupted TLS digest state (scudo aborts in EVP_MD_CTX_free).
+// Library init stays global/once; each connection creates its own CTX under a
+// creation-only mutex (serializes OpenSSL init without serializing I/O).
+static pthread_mutex_t g_ssl_ctx_create_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_ssl_library_inited = 0;
+
+static void ssl_init_library(void) {
+    if (g_ssl_library_inited) return;
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
+    g_ssl_library_inited = 1;
+}
 
-    const SSL_METHOD* method = TLS_client_method();
-    g_shared_ssl_ctx = SSL_CTX_new(method);
-    if (g_shared_ssl_ctx == NULL) {
-        LOGE("Failed to create shared SSL context");
-        return;
-    }
-
+// Apply the connection options every client CTX needs.
+static void ssl_configure_client_ctx(SSL_CTX* c) {
     // Restrict to TLS 1.2 max — VPNGate servers reject TLS 1.3 ClientHellos with RST
-    SSL_CTX_set_min_proto_version(g_shared_ssl_ctx, TLS1_VERSION);
-    SSL_CTX_set_max_proto_version(g_shared_ssl_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_min_proto_version(c, TLS1_VERSION);
+    SSL_CTX_set_max_proto_version(c, TLS1_2_VERSION);
 
     // Auto-retry for renegotiation transparency
-    SSL_CTX_set_mode(g_shared_ssl_ctx, SSL_MODE_AUTO_RETRY);
+    SSL_CTX_set_mode(c, SSL_MODE_AUTO_RETRY);
 
     // Disable verification for VPN connections (self-signed certs are common)
-    SSL_CTX_set_verify(g_shared_ssl_ctx, SSL_VERIFY_NONE, NULL);
-
-    LOGD("Shared SSL context created");
+    SSL_CTX_set_verify(c, SSL_VERIFY_NONE, NULL);
 }
 
 aes_context_t* aes_create(int mode, const uint8_t* key, size_t key_len, 
@@ -304,19 +308,26 @@ ssl_context_t* ssl_create_client(void) {
         return NULL;
     }
 
-    // Ensure shared SSL_CTX is initialized (once, thread-safe)
-    pthread_once(&g_ssl_ctx_once, ssl_init_shared_ctx);
-    if (g_shared_ssl_ctx == NULL) {
-        LOGE("Shared SSL context not available");
+    // Library init once (thread-safe)
+    pthread_mutex_lock(&g_ssl_ctx_create_lock);
+    ssl_init_library();
+
+    // Phase 16: per-connection SSL_CTX, created under the create-lock so
+    // concurrent OpenSSL context init cannot race (the original RAND_DRBG
+    // crash motivation), while I/O on separate CTXs stays fully parallel.
+    SSL_CTX* c = SSL_CTX_new(TLS_client_method());
+    if (c == NULL) {
+        LOGE("Failed to create SSL context");
+        pthread_mutex_unlock(&g_ssl_ctx_create_lock);
         free(ctx);
         return NULL;
     }
+    ssl_configure_client_ctx(c);
+    pthread_mutex_unlock(&g_ssl_ctx_create_lock);
 
-    // Increment refcount so the shared ctx survives until all users release it
-    SSL_CTX_up_ref(g_shared_ssl_ctx);
-    ctx->ctx = g_shared_ssl_ctx;
+    ctx->ctx = c;
 
-    LOGD("SSL client context created (shared)");
+    LOGD("SSL client context created (per-connection)");
     return ctx;
 }
 
@@ -325,12 +336,14 @@ void ssl_destroy(ssl_context_t* ctx) {
         return;
     }
     
+    pthread_mutex_lock(&g_tls_write_lock);
     if (ctx->ssl) {
         SSL_free(ctx->ssl);
     }
     if (ctx->ctx) {
         SSL_CTX_free(ctx->ctx);
     }
+    pthread_mutex_unlock(&g_tls_write_lock);
     
     free(ctx);
 }
@@ -340,30 +353,36 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
         LOGE("Invalid SSL context");
         return -1;
     }
-    
+
+    pthread_mutex_lock(&g_tls_write_lock);
     ctx->ssl = SSL_new(ctx->ctx);
     if (ctx->ssl == NULL) {
         LOGE("Failed to create SSL object");
+        pthread_mutex_unlock(&g_tls_write_lock);
         return -1;
     }
-    
+
     // Set SNI hostname — hostname is always a resolved IP address at this point
     // (domain names are resolved before TLS in softether_protocol.c).
     // OpenSSL sends SNI with the IP string; VPNGate servers accept this.
     if (hostname != NULL) {
         SSL_set_tlsext_host_name(ctx->ssl, hostname);
     }
-    
+
     // Attach socket to SSL
     if (SSL_set_fd(ctx->ssl, socket_fd) != 1) {
         LOGE("Failed to set SSL fd");
         SSL_free(ctx->ssl);
         ctx->ssl = NULL;
+        pthread_mutex_unlock(&g_tls_write_lock);
         return -1;
     }
-    
+
     // Set connect state
     SSL_set_connect_state(ctx->ssl);
+    // Handshake runs unlocked — it can block on network I/O for seconds and
+    // only touches this connection's own SSL object.
+    pthread_mutex_unlock(&g_tls_write_lock);
     
     // Perform handshake with retry loop - TLS handshake often requires multiple exchanges
     int max_attempts = 100;  // Prevent infinite loop
@@ -488,7 +507,8 @@ int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len) {
     if (ctx == NULL || ctx->ssl == NULL || !ctx->connected) {
         return -1;
     }
-    
+
+    pthread_mutex_lock(&g_tls_write_lock);
     int result = SSL_write(ctx->ssl, data, (int)len);
     if (result < 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
@@ -496,6 +516,7 @@ int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len) {
             LOGE("SSL write error: %d", ssl_error);
         }
     }
+    pthread_mutex_unlock(&g_tls_write_lock);
     return result;
 }
 
@@ -503,9 +524,11 @@ void ssl_shutdown(ssl_context_t* ctx) {
     if (ctx == NULL || ctx->ssl == NULL) {
         return;
     }
-    
+
+    pthread_mutex_lock(&g_tls_write_lock);
     SSL_shutdown(ctx->ssl);
     ctx->connected = 0;
+    pthread_mutex_unlock(&g_tls_write_lock);
 }
 
 int ssl_has_pending(ssl_context_t* ctx) {

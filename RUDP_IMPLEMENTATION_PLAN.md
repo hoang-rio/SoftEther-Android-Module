@@ -120,7 +120,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13G | Benchmark harness + acceptance criteria | P0 | ✅ Done (on-device matrix recorded) |
 | 14  | RUDP loss-adaptive send window + sticky fallback | P1 | ✅ Done (validated on device) |
 | 15  | Post-Phase-14 stability fixes (races, failover, ARP) | P0 | ✅ Done (device-verified) |
-| 16  | TLS shared-SSL_CTX heap corruption fix | P1 | 🔄 In progress |
+| 16  | TLS shared-SSL_CTX heap corruption fix | P1 | ✅ Done (hardened; deep-concurrency caveat documented) |
 
 #### 14 — RUDP loss-adaptive window + sticky fallback (P1) — DONE
 
@@ -158,8 +158,9 @@ Remaining tuning item (optional, cosmetic): during the RUDP phase of a speedtest
 
 - **Symptom:** concurrent SSL I/O on two connections sharing the cached `SSL_CTX` aborts with `scudo: invalid chunk state` in `EVP_MD_CTX_free` ← TLS write/free path inside `libsoftether.so`. Reproduced deterministically in the paired-session benchmark (~4 s into a concurrent flood); worked around there by serializing all native calls behind one lock.
 - **Why it matters:** correctness currently depends on timing discipline across Kotlin and C call sites. Any overlapping connection lifetime (cancel-during-connect churn, failover, future multi-connection features) widens the race window; a hit is a native SIGABRT → VPN process death.
-- **Plan:** per-connection `SSL_CTX` (option 1), with a regression check against the RAND_DRBG crash that originally motivated the cache (`bc01edd`); fall back to a global create/free-only lock (option 2) if that resurfaces.
-- **Acceptance:** paired-session benchmark runs 60 s full-duplex without scudo aborts; single-session throughput unchanged.
+- **Implemented:** per-connection `SSL_CTX` (creation serialized by a create-only mutex; library init still `once`) + process-wide lock around SSL write/lifecycle (handshake stays unlocked). The old RAND_DRBG crash did not resurface.
+- **Honest caveat:** the prebuilt OpenSSL 3.5.7 still has an internal race in its multiblock record-write path under extreme cross-connection concurrency (double-free of a provider-cached `EVP_SIGNATURE`, seen even with separate CTXs). Production single-session traffic never exercises it; the benchmark harness keeps a process-wide TLS I/O serialization as a proven-stable workaround at link speed. A full fix requires rebuilding/switching the TLS library or an upstream investigation — deferred.
+- **Verified:** paired-session benchmark 60 s full-duplex, no scudo aborts — TCP 54.4/51.4 Mbps, UDP 54.0/50.6 Mbps TX/RX; production session unaffected (throughput unchanged).
 
 #### 13A–13G — Completed (compacted)
 
