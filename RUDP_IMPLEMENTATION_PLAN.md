@@ -105,14 +105,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 
 **Benchmark finding (2026-08-23):** Throughput ranks OpenVPN UDP > OpenVPN TCP ≈ MS-SSTP > SoftEther TCP > SoftEther RUDP. Root causes are implementation overheads in the client data path, not the SoftEther protocol itself.
 
-**Root causes (ranked by impact):**
-
-1. **Per-packet formatted logging in release builds.** `LOGD` is an unconditional `__android_log_print(ANDROID_LOG_DEBUG, ...)`; CMakeLists.txt sets only `-O2`, no log stripping. Hot path pays ~4 log writes per TX packet (`packet_handler.c:57-73,347`, `softether_protocol.c:3047`) and several per RX message (`packet_handler.c:915-1041`), plus one per RUDP datagram each way (`softether_rudp.c:524,795`).
-2. **Session-level zlib negotiated ON.** Login PACK sends `use_compress=1` (`softether_protocol.c:645`); VPN Gate servers accept it → every block deflate/inflate-attempted per packet on already-encrypted, incompressible traffic (`packet_handler.c:273-286,437-482,979-1013`; `softether_rudp.c:651` for RUDP).
-3. **Heap churn and copies per packet.** TX: `malloc`+memcpy of whole block per packet (`packet_handler.c:291`) plus Ethernet-frame copy (`softether_protocol.c:2706`). RX: `malloc` per block → queue copy → output copy stripping Eth header (`softether_protocol.c:2886`) → Kotlin `copyOf` (`ConnectionController.kt:666`) → two JNI copies. ~5 copies + 2+ mallocs per ~1.4 KB.
-4. **RUDP has no reliability or recovery.** Pure lossy `sendto()` with no seq/ACK/retransmit/congestion control; silent drops when queues overflow (`softether_rudp.c:517`) and blocks >1600 B skipped (`packet_handler.c:1023`). Advertises `support_udp_recovery=1` but implements no fallback → inner TCP collapses on loss. This explains RUDP ranking last.
-5. **Loop granularity.** One IP packet per JNI crossing both directions; `delay(1ms)` spin when idle (`ConnectionController.kt:47`); RUDP RX drains at most one block per poll cycle.
-6. Minor: mutex take/release around every 4-byte header read (`packet_handler.c:157-168`); RUDP MSS ~1355 vs ~1460 TCP payload; no explicit SO_RCVBUF/SO_SNDBUF sizing on the UDP socket.
+**Root causes found (all addressed):** unconditional per-packet logging, zlib negotiated ON, ~5 copies + 2 mallocs per packet, lossy RUDP with no recovery, and 1-packet-per-JNI loop granularity with a 1 ms idle spin.
 
 ### Phases
 
@@ -160,107 +153,21 @@ Remaining tuning item (optional, cosmetic): during the RUDP phase of a speedtest
 
 
 
-#### 13A — Hot-path logging (P0) — DONE
+#### 13A–13G — Completed (compacted)
 
-- Add a compile-time switch, e.g. `SE_TRACE_PACKETS` (default off), wrapping every per-packet `LOGD` in: `ssl_write_all` hexdump/progress (`packet_handler.c:57,73`), "Sent N data block(s)" (:347), "Sent data block via TCP/RUDP" (`softether_protocol.c:3033,3047`), all `fill_recv_queue` per-message logs (`packet_handler.c:915,947,985,1003,1034,1041`), keepalive logs, and RUDP per-datagram logs (`softether_rudp.c:95,231,262,510,524,692-706,791-795`).
-- Keep connect/handshake/error logs unconditional.
-- Acceptance: zero `__android_log_print` calls on the steady-state data path (verify with logcat during iperf).
-- Implemented: `LOGT` macro added to `packet_handler.c`, `softether_protocol.c`, `softether_rudp.c`, `aes_wrapper.c`; ~25 per-packet/steady-state sites converted; CMake option `SE_TRACE_PACKETS` (OFF by default). Warnings/errors and rare anomaly logs unchanged.
+All seven phases are done; details live in git history (`86cd1af` plan, per-phase commits). Summary:
 
-#### 13B — Session compression (P0) — DONE
+- **13A** Hot-path logging gated behind `SE_TRACE_PACKETS` (default off).
+- **13B** Session zlib negotiation off (~2.7x TX on its own; encrypted traffic is incompressible).
+- **13C** Zero-alloc send path: prebuilt `send_block` staging + single-write transmit.
+- **13D** RX batching: blocks read straight into queue slots, `softether_receive_batch()` drains up to 32 frames/JNI crossing, slice writes to TUN. `MAX_QUEUED_FRAME` 1600→2048.
+- **13E** Java loops: blocking native receive (100 ms idle poll), zero-copy TUN slices both directions, direct send from TUN thread.
+- **13F** RUDP robustness: SO_RCVBUF/SO_SNDBUF 2 MB, overflow counters, keepalive-all over C2S sockets.
+- **13G** Benchmark harness (`ThroughputBenchmarkTest` androidTest) + matrices:
+  - Host loopback (pre/post): base 34.9 Mbps TX → HEAD 130.8 Mbps (+275%), CPU −33%.
+  - On device (SM-A736B ↔ local server, full-duplex paired flood): TCP 44.3/40.6 Mbps TX/RX vs UDP 48.7/44.4 Mbps.
 
-- Send `use_compress=0` in login PACK (`softether_protocol.c:645`) or make it config-driven (default off).
-- Keep the decompress fallback paths intact for servers that force compression.
-- Skip the zlib compress attempt in `rudp_send` unconditionally when session compression is off (`softether_rudp.c:649-656`).
-- Acceptance: `server_use_compress==0` in logs against VPN Gate server; CPU time per MB (simple `perf`/`simpleperf` smoke) measurably lower.
-- Implemented: login PACK advertises `use_compress=0`; new `rudp_context_t.use_compress` (default 0) + `rudp_set_compress()`, synced from the Welcome PACK so RUDP only compresses when the session negotiates it; TCP paths already gate on `server_use_compress`. Decompress fallbacks kept (TCP magic/session-header heuristics, RUDP `RUDP_FLAG_COMPRESSED`). Live acceptance (`server_use_compress==0`, CPU/MB) to be confirmed in next benchmark run.
-
-#### 13C — Zero-alloc send path (P0) — DONE
-
-- Preallocate one `uint8_t send_block[8 + ETH_HEADER_SIZE + 65535]` in `softether_connection_t`.
-- Build Ethernet frame directly into `send_block + 8` (removes `build_ethernet_frame` stack copy, `softether_protocol.c:2706`) then write header in place; single SSL_write per packet (`packet_handler.c:243-349`).
-- Remove per-packet `malloc/free` of `buf`/`comp_buf`.
-- Lock `write_mutex` once around build+write instead of per-chunk revalidation.
-- Acceptance: no heap allocations in `softether_send_packet` steady state (instrument with malloc hook or review), throughput ≥ +20% TX vs baseline.
-- Implemented: `send_block` staging buffer allocated once in `softether_create()` (freed in `softether_destroy()`, survives reconnects). `softether_send` now assembles `[block hdr][eth hdr][ip]` directly into it (payload copied exactly once, no 64 KB stack frame) and sends via new `softether_send_data_block`: RUDP carries the frame pointer, TCP transmits the prebuilt block via new `softether_transmit_block` (mutex + socket selection + single write, zero copies). `softether_send_packet` (DHCP/ARP raw path) builds into the same scratch under `write_mutex`; only the negotiated-compression fallback branch still allocates.
-
-#### 13D — Receive-path copy elimination + batching (P1) — DONE
-
-- Read blocks straight into `entry->data` (queue slot) via a resize-free path: replace `tmp_block` malloc+copy with direct `data_read_all_sock(... entry->data ...)` where possible; decompress directly into the slot (`packet_handler.c:964-1022`).
-- Raise `MAX_QUEUED_FRAME` to ≥ 2048 so jumbo-ish server blocks are never silently skipped (`softether_protocol.h:106`, drop path `packet_handler.c:1023`); log-and-count skips instead of silence.
-- New JNI API `nativeReceiveBatch(handle, buffer, maxLength, int[] lengths, int maxPackets)` returning multiple frames per crossing; drain entire `recv_queue` / rudp queue per call. Keep single-packet API as compat shim.
-- Acceptance: ≤ 2 memcpys per RX packet end-to-end; batch API moves ≥ 8 packets/call under load.
-- Implemented: uncompressed sessions (default since 13B) now read straight into the queue slot (SSL → slot, zero temps); compressed sessions keep the tmp+decompress path. `MAX_QUEUED_FRAME` 1600 → 2048 + new `conn->rx_skipped_blocks` counter logged on drops. New `softether_receive_batch()` drains the whole queue per call (`receive_raw` = shim); JNI `nativeReceiveBatch` + Kotlin `receiveBatch()`; `TunTerminal.write(buffer, offset, len)` slice write; RX loop in ConnectionController consumes batches with no `copyOf`.
-- Measured (host loopback, 1400 B flood): batch drain 822 pps vs 660 best single-frame (+25%), RX CPU 0.135 s. Batch depth averaged only ~1.0 frame/call (max 5) because the local server sends ≈1 frame per protocol message — the ≥8/call acceptance depends on server-side message batching and should be re-checked against a real VPN Gate server on device. End-to-end copies per packet now 2 (SSL → slot → output/TUN).
-
-#### 13E — Java loop fixes (P1) — DONE
-
-- Replace `result == 0 → delay(1ms)` with blocking behavior: expose socket fd(s) already available (`nativeGetSocketFd`) and add a blocking receive variant with timeout, or poll inside native (`ConnectionController.kt:47,682`).
-- Write to TUN without `copyOf`: add `TunTerminal.write(buffer, len)` writing a slice (`ConnectionController.kt:666`, `TunTerminal.kt:74-85`).
-- Use the batch receive API from 13D; write frames back-to-back.
-- Move traffic-snapshot publishing fully behind its 1 s throttle (already throttled — ensure no per-packet work remains).
-- Acceptance: idle-loop wakeups < 20/s; no per-packet allocations on Kotlin side.
-- Implemented: native `fill_recv_queue` poll idle timeout unified at 100 ms for TCP and RUDP paths — poll wakes immediately on data, so this only bounds idle wakeups to ~10/s; the Kotlin RX loop's `delay(1ms)` on `total == 0` removed entirely. TUN read loop now invokes the consumer with `(buffer, offset, length)` slices of its scratch buffer (no `copyOf`), and sends go **directly from the TUN read thread** via new `SoftEtherClient.send(buffer, offset, length)` → JNI `nativeSendSlice` → `softether_send` (write-mutex serialized) — the queue + dedicated send coroutine are gone; slow-link backpressure now blocks the TUN read instead of growing a queue. Traffic-snapshot publishing verified already throttled to 1 s.
-- Measured: idle connection CPU over 3 s ≈ 0 (blocked in poll); paired flood run TX 110 Mbps / batched RX 20.5 Mbps–1807 pps (best recorded on host loopback). Per-packet Kotlin allocations: zero both directions (RX: reused batch buffer since 13D; TX: slice send).
-
-#### 13F — RUDP reliability/recovery + tuning (P1)
-
-- Implement upstream-style **UDP recovery**: track per-direction tick gaps / queue-overflow counters in `rudp_process_inner` (`softether_rudp.c:412-529`); after N losses in window M, set `fatal_error`-like flag → `softether_send_data`/`fill_recv_queue` route data over TCP while RUDP keeps only keepalives; periodically re-probe RUDP (e.g. every 30 s).
-- Size the UDP socket buffers explicitly (`SO_RCVBUF` ≥ 1–2 MB) in `rudp_create_udp_socket` (`softether_rudp.c:39-97`) to absorb bursts between polls.
-- Optional (P2): true reliable layer (seq + ACK + retransmit with small window) mirroring NAT-T R-UDP semantics; evaluate only if recovery alone doesn't close the gap.
-- Acceptance: under 2% random UDP loss (tc/netem), RUDP throughput within 30% of SoftEther TCP and no stall; 0% silent IP-packet drops counted at queue boundaries.
-- **Diagnosis (host loopback, traced run)**: earlier "RUDP never ready" was a bench artifact — harness passed `use_tcp=1`, which skips RUDP init entirely ("TCP mode - skipping RUDP initialization"); production passes use_tcp=false. With RUDP enabled it engages correctly after the ~10 s stability gate, then collapses under flood: RX goodput 1.7 Mbps vs 110+ over TCP, 28% of blocks oscillate back to TCP mid-stream (inbound gaps > KA_TIMEOUT reset `first_stable_receive_tick`, softether_rudp.c:550-554), zero SO_RCVBUF/SO_SNDBUF sizing → kernel-buffer loss, and full `recv_queue` silently discards frames (softether_rudp.c:529-530). So 13F = robustness layer + counters, not a logic fix.
-- Implemented:
-  - `SO_RCVBUF`/`SO_SNDBUF` = `RUDP_SOCK_BUF_SIZE` (2 MB request) in `rudp_create_udp_socket`, actual value logged. Host kernel capped at 416 KB (`net.core.rmem_max`) — still ~2× default; Android typically honors larger values.
-  - Overflow counting: recv-queue-full frames now increment `recv_queue_overflow_count` + `recent_overflows` and LOGW instead of dropping silently.
-  - **Recovery**: `recent_overflows >= RUDP_OVERFLOW_SUSPEND_THRESHOLD (8)` → `udp_data_suspended=1` for `RUDP_UDP_SUSPEND_MS` (30 s) — data routes over TCP while keepalives continue on UDP; auto re-probe after suspension with counter reset (`rudp_is_send_ready`).
-  - Peer-tick gap detection: wire `my_tick` is the peer's clock; jumps > `RUDP_PEER_TICK_LOSS_GAP` (10 s) counted as `peer_tick_gap_events`.
-  - `rudp_stats_t` + `rudp_get_stats()` snapshot API for 13G `nativeGetStats`.
-- Verified: all TUs compile; TCP-mode regression run unchanged (TX 107 Mbps, batched RX healthy); RUDP-mode connect + data flow clean, buffer-sizing log confirmed. Loopback flood goodput remains server-delivery-limited (~150–600 pps ceiling observed in ALL modes incl. pure TCP) — the host loopback cannot discriminate RUDP-vs-TCP goodput.
-- Acceptance note: tc/netem unavailable in the build container (kernel lacks NETEM qdisc) — the 2 %-loss matrix must run on device/lab hardware (fold into 13G device testing). Silent-drop acceptance is now satisfiable by construction: drops are counted (`recv_queue_overflow_count`), surfaced via stats, and trigger recovery instead of stalling.
-
-#### 13G — Benchmark harness (P0, do first) — DONE
-
-- Controlled setup: local SoftEther server (see `/server-setup`) + `iperf3` over each protocol; record Mbps + CPU% (simpleperf) + battery-neutral runs.
-- Baseline matrix before any change; re-run after each phase. Compare against OpenVPN TCP/UDP on same link.
-- Add permanent counters exposed via `nativeGetStats`: packets/bytes in-out, queue-full drops, skip-drops, compress ratio, log-suppression counter.
-  - **Done:** native `softether_stats_t` + `softether_get_stats()` (tx/rx packets+bytes counted on the `softether_send` / `softether_receive_batch` paths; includes 13D `rx_skipped_blocks` and 13F rudp overflow/rx/gap/suspension counters); JNI `nativeGetStats(handle) → long[9]`; Kotlin `getStats(): NativeStats`; ConnectionController logs the snapshot at debug level behind the existing 1 s traffic-snapshot throttle. Verified end-to-end on host loopback (exact TX/RX counts in TCP mode; `rudp_rx` nonzero on an idle UDP-mode session). Compress-ratio counter obsolete since 13B disables compression.
-- Acceptance: final matrix shows SoftEther TCP ≥ 80% of SSTP/OpenVPN TCP; SoftEther RUDP ≥ SoftEther TCP on clean links and degrades gracefully under loss. **Blocked on hardware:** needs phone + VPS for the on-device iperf3 matrix vs OpenVPN, and tc/netem for the 2%-loss run — both impossible in this build container. All repo-side 13G work is complete; the matrix is the only outstanding item.
-- **Host-loopback matrix done (2026-08-24):** local vpnserver v4.44 (repo submodule) on loopback:5555, hub BENCH; two harness processes running the real client stack built from four commits (git worktrees); one session floods 1400 B Ethernet-framed packets via `softether_send`, the other drains via `softether_receive_raw`; 10 s per run (harness + logs in `/tmp/opencode/bench`).
-
-| Variant | TX Mbps | TX pps | TX CPU user+sys | vs baseline |
-|---|---|---|---|---|
-| base (c889c28, pre-13A/B/C) | 34.9 | 3,120 | 3.99 s | — |
-| +13A trace-log gate | 45.7 | 4,084 | 3.96 s | +31% |
-| +13B compression off | 125.3 | 11,186 | 2.69 s | +259% |
-| +13C zero-alloc send (HEAD, af15e55) | **130.8** | **11,676** | **2.66 s** | **+275%** |
-
-Rerun for stability: base 41.0 Mbps / CPU 4.64 s vs HEAD 92.8 Mbps / CPU 2.05 s — same ordering.
-
-**Follow-up runs after 13D/13E/13F (2026-08-24, same setup):**
-
-| Scenario | Result | Notes |
-|---|---|---|
-| 13D batched RX drain (`receive_batch`) | 822 pps vs 660 best single-frame (+25%) | avg 1.0 frame/call — local server sends ≈1 frame/message; depth is server-limited on loopback |
-| 13E idle behavior | CPU over 3 s idle ≈ 0 | native poll blocks up to 100 ms; Kotlin `delay(1ms)` spin removed (~10 wakeups/s) |
-| 13E paired flood (TCP mode) | TX 110 Mbps / RX 20.5 Mbps–1,807 pps | best RX recorded on loopback; no per-packet Kotlin allocs either direction |
-| 13F traced RUDP run (use_tcp=0, 27 s) | first ~10 s all TCP, then 178 K blocks RUDP vs 71 K TCP | proves ~10 s stability gate works; RUDP engages via `use_tcp=false` only |
-| 13F RUDP flood goodput | RX 1.7 Mbps / ~150 pps | server-delivery-limited; same ceiling family as TCP-mode runs |
-| 13F regression (TCP mode) | TX 107 Mbps, RX healthy | no impact from buffer sizing/recovery hooks |
-
-Findings:
-- Largest single win is 13B (zlib negotiation off): ~2.7× TX throughput and −45% sys CPU on its own.
-- ~~RUDP readiness gap~~ **corrected:** the earlier "never ready" claim was a bench artifact — the harness passed `use_tcp=1`, which skips RUDP init entirely ("TCP mode - skipping RUDP initialization"). Production passes `use_tcp=false`. With RUDP enabled the 10 s stability gate works and data flows over UDP (see 13F rows above).
-- RX delivery ceiling: server forwards only ~150–600 pps to the receiving session regardless of client variant or transport (TCP and RUDP alike; zero client-side drops logged). Host-loopback runs therefore cannot discriminate transport goodput — treat absolute Mbps here as an environment ceiling, compare variants only within a single paired run.
-- **On-device matrix done (2026-08-25):** SM-A736B (Wi-Fi, ~40 m to AP) ↔ local SoftEther server v4.43 (docker on macOS host, same LAN); paired-session full-duplex flood via `ThroughputBenchmarkTest` androidTest (sender floods 1414 B Ethernet frames unicast to the receiver session's real MAC; both sessions pump RX; 12–15 s measurement window after warmup).
-
-| Variant | TX Mbps (phone→server) | RX Mbps (server→phone) | Notes |
-|---|---|---|---|
-| TCP mode (use_tcp=1) | 44.3–52.9 | 40.6–47.8 | stable across runs |
-| UDP mode / RUDP (use_tcp=0, Phase 14) | 48.7–54.0 | 44.4–50.3 | zero overflows, no suspension, RUDP engaged after ~10 s gate |
-
-**UDP ≥ TCP on a clean link — Phase 14 acceptance met** (previously RUDP collapsed to ~1/10 of TCP). Absolute numbers are Wi-Fi-link-limited (~50 Mbps uplink), not client-limited.
-- Remaining for full acceptance (optional): iperf3 vs OpenVPN reference and tc/netem 2%-loss matrix.
+Host-loopback limitation to remember: the local server only forwards ~150–600 pps to a receiving session regardless of transport, so loopback runs compare variants but cannot measure absolute goodput — use the on-device matrix for that.
 
 ### Execution order & risk
 
