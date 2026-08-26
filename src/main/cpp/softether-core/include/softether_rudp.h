@@ -157,6 +157,12 @@ typedef struct {
     uint32_t suspension_count;        // consecutive suspensions (drives backoff)
     uint64_t last_loss_event_tick;    // last gap/overflow/timeout seen (ms tick)
 
+    // Phase 15: global RUDP lock. rudp_poll/rudp_send are called from both
+    // the RX thread and the TUN send thread; without serialization, concurrent
+    // sends race on next_iv (cipher chaining) and poll races on the recv
+    // queue - corrupted upstream datagrams that servers silently drop.
+    pthread_mutex_t lock;
+
     // Phase 14: loss-adaptive send window. Data sends consume the budget;
     // rudp_is_send_ready returns 0 when it is exhausted, so excess blocks
     // fall back to TCP until the token bucket refills.

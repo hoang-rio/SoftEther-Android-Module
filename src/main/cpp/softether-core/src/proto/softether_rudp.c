@@ -1,6 +1,7 @@
 #include "softether_rudp.h"
 #include "softether_crypto.h"
 #include "softether_compress.h"
+#include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -126,6 +127,15 @@ rudp_context_t* rudp_create(int is_client) {
 
     ctx->is_client_mode = is_client;
     ctx->version = 1;
+
+    // Phase 15: recursive lock (rudp_poll -> keepalive -> rudp_send nests)
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&ctx->lock, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
     ctx->mss = RUDP_DEFAULT_MSS;
     ctx->max_udp_packet_size = RUDP_MAX_UDP_PACKET_IPV4;  // MTU - IPv4 - UDP
 
@@ -170,6 +180,7 @@ rudp_context_t* rudp_create(int is_client) {
 
 void rudp_destroy(rudp_context_t* ctx) {
     if (ctx == NULL) return;
+    pthread_mutex_destroy(&ctx->lock);
     if (ctx->evp_encrypt_ctx) EVP_CIPHER_CTX_free((EVP_CIPHER_CTX*)ctx->evp_encrypt_ctx);
     if (ctx->evp_decrypt_ctx) EVP_CIPHER_CTX_free((EVP_CIPHER_CTX*)ctx->evp_decrypt_ctx);
     if (ctx->udp_fd >= 0) {
@@ -423,6 +434,10 @@ void rudp_get_stats(rudp_context_t* ctx, rudp_stats_t* out) {
     out->udp_data_suspended = ctx->udp_data_suspended;
 }
 
+static void rudp_poll_nolock(rudp_context_t* ctx);
+static int rudp_send_nolock(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint8_t flag);
+static int rudp_is_send_ready_nolock(rudp_context_t* ctx, int check_keepalive);
+
 // Phase 14: loss-adaptive send window (token bucket). Refills additively
 // with elapsed time; loss events halve it. Data sends consume the budget.
 static void rudp_cwin_refill(rudp_context_t* ctx) {
@@ -452,9 +467,14 @@ static void rudp_cwin_on_loss(rudp_context_t* ctx) {
 }
 
 int rudp_is_send_ready(rudp_context_t* ctx, int check_keepalive) {
-    if (ctx == NULL) return 0;
-    if (!ctx->inited) return 0;
-    if (!ctx->peer_addr_set) return 0;
+    if (ctx == NULL || !ctx->inited || !ctx->peer_addr_set) return 0;
+    pthread_mutex_lock(&ctx->lock);
+    int ret = rudp_is_send_ready_nolock(ctx, check_keepalive);
+    pthread_mutex_unlock(&ctx->lock);
+    return ret;
+}
+
+static int rudp_is_send_ready_nolock(rudp_context_t* ctx, int check_keepalive) {
 
     // Phase 14: refill the loss-adaptive send window (token bucket).
     rudp_cwin_refill(ctx);
@@ -673,6 +693,12 @@ static int rudp_process_inner(rudp_context_t* ctx, uint8_t* buf, uint32_t size,
 void rudp_poll(rudp_context_t* ctx) {
     if (ctx == NULL || !ctx->inited) return;
 
+    pthread_mutex_lock(&ctx->lock);
+    rudp_poll_nolock(ctx);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+static void rudp_poll_nolock(rudp_context_t* ctx) {
     ctx->now = tick64();
 
     uint64_t timeout_value = (ctx->mss & 0x80000000) ? RUDP_KA_TIMEOUT_FAST : RUDP_KA_TIMEOUT;
@@ -782,6 +808,13 @@ int rudp_send(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint
     if (ctx == NULL || !ctx->inited || !ctx->peer_addr_set) return -1;
     if (data_size > 0 && data == NULL) return -1;
 
+    pthread_mutex_lock(&ctx->lock);
+    int ret = rudp_send_nolock(ctx, data, data_size, flag);
+    pthread_mutex_unlock(&ctx->lock);
+    return ret;
+}
+
+static int rudp_send_nolock(rudp_context_t* ctx, const uint8_t* data, uint32_t data_size, uint8_t flag) {
     ctx->now = tick64();
 
     // Attempt zlib compression only when session compression was negotiated
@@ -962,7 +995,11 @@ int rudp_send_keepalive(rudp_context_t* ctx) {
 int rudp_recv(rudp_context_t* ctx, uint8_t* buffer, uint32_t* len, uint32_t max_len) {
     if (ctx == NULL || buffer == NULL || len == NULL) return -1;
 
-    if (ctx->recv_queue_count <= 0) return 0;
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->recv_queue_count <= 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        return 0;
+    }
 
     rudp_queued_block_t* entry = &ctx->recv_queue[ctx->recv_queue_head];
     if (entry->len > max_len) {
@@ -975,6 +1012,7 @@ int rudp_recv(rudp_context_t* ctx, uint8_t* buffer, uint32_t* len, uint32_t max_
 
     ctx->recv_queue_head = (ctx->recv_queue_head + 1) % RUDP_RECV_QUEUE_SIZE;
     ctx->recv_queue_count--;
+    pthread_mutex_unlock(&ctx->lock);
 
     return (int)entry->len;
 }
