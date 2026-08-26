@@ -28,6 +28,17 @@
 
 #define TAG "SoftEtherPacket"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+// Atomically claim ownership of a shared SSL context slot. Exactly one
+// concurrent caller receives the pointer and must destroy it; all others get
+// NULL. Prevents double-destroy races when e.g. fill_recv_queue's error path,
+// transmit_block's failover, and close_additional all retire the same socket.
+static void* take_ssl_ctx_slot(void** slot) {
+    void* p = *slot;
+    if (p == NULL) return NULL;
+    return __sync_bool_compare_and_swap(slot, p, NULL) ? p : NULL;
+}
+
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -320,16 +331,15 @@ int softether_transmit_block_nolock(softether_connection_t* conn,
              send_idx == 0 ? "primary" : "additional", send_fd);
         if (ts != NULL) {
             int saved_fd = ts->socket_fd;
-            void* saved_ssl_ctx = ts->ssl_ctx;
             ts->active = 0;
             ts->ssl = NULL;
-            ts->ssl_ctx = NULL;
             ts->socket_fd = -1;
             __sync_synchronize();
             if (saved_fd >= 0) close(saved_fd);
-            if (saved_ssl_ctx != NULL) {
-                ssl_shutdown((ssl_context_t*)saved_ssl_ctx);
-                ssl_destroy((ssl_context_t*)saved_ssl_ctx);
+            ssl_context_t* doomed = (ssl_context_t*)take_ssl_ctx_slot(&ts->ssl_ctx);
+            if (doomed != NULL) {
+                ssl_shutdown(doomed);
+                ssl_destroy(doomed);
             }
             conn->num_additional--;
         }
@@ -1017,10 +1027,10 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
                 _ts->socket_fd = -1; \
                 __sync_synchronize(); \
                 if (_saved_fd >= 0) close(_saved_fd); \
-                if (_ts->ssl_ctx != NULL) { \
-                    ssl_shutdown((ssl_context_t*)_ts->ssl_ctx); \
-                    ssl_destroy((ssl_context_t*)_ts->ssl_ctx); \
-                    _ts->ssl_ctx = NULL; \
+                ssl_context_t* _doomed = (ssl_context_t*)take_ssl_ctx_slot(&_ts->ssl_ctx); \
+                if (_doomed != NULL) { \
+                    ssl_shutdown(_doomed); \
+                    ssl_destroy(_doomed); \
                 } \
                 conn->num_additional--; \
                 return 0; \

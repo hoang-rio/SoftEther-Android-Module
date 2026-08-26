@@ -22,6 +22,16 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// Atomically claim ownership of a shared SSL context slot. Exactly one
+// concurrent caller receives the pointer and must destroy it; all others get
+// NULL. Prevents double-destroy races between softether_disconnect,
+// close_additional, and the packet-handler receive/transmit error paths.
+static void* take_ssl_ctx_slot(void** slot) {
+    void* p = *slot;
+    if (p == NULL) return NULL;
+    return __sync_bool_compare_and_swap(slot, p, NULL) ? p : NULL;
+}
+
 // Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
 #ifdef SE_TRACE_PACKETS
 #define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -2667,13 +2677,19 @@ void softether_disconnect(softether_connection_t* conn) {
         close(saved_fd);
     }
 
-    // Shutdown SSL only if it was initialized
-    if (conn->ssl != NULL && conn->ssl_ctx != NULL) {
-        LOGD("Shutting down SSL");
-        ssl_shutdown((ssl_context_t*)conn->ssl);
-        ssl_destroy((ssl_context_t*)conn->ssl_ctx);
-        conn->ssl = NULL;
-        conn->ssl_ctx = NULL;
+    // Shutdown SSL only if it was initialized. CAS-claim conn->ssl so a
+    // concurrent error-path retirement cannot double-destroy the same object.
+    {
+        void* primary_ssl = conn->ssl;
+        if (primary_ssl != NULL && conn->ssl_ctx != NULL &&
+            __sync_bool_compare_and_swap(&conn->ssl, primary_ssl, NULL)) {
+            LOGD("Shutting down SSL");
+            if (conn->ssl_ctx == primary_ssl) {
+                conn->ssl_ctx = NULL;
+            }
+            ssl_shutdown((ssl_context_t*)primary_ssl);
+            ssl_destroy((ssl_context_t*)primary_ssl);
+        }
     }
 
     // Destroy the NAT-T + RUDP transport if the connection used the fallback.
@@ -2893,13 +2909,11 @@ static void softether_maintain_links(softether_connection_t* conn) {
         int poll_ret = poll(&pfd, 1, 0);
         if (poll_ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             LOGW("Additional socket [%d] fd=%d disconnected (revents=0x%x), closing",
-                 i, ts->socket_fd, pfd.revents);
+                 i, ts->socket_fd);
             // Mark inactive BEFORE destroying (prevent use-after-free by other threads)
             int saved_fd = ts->socket_fd;
-            void* saved_ssl_ctx = ts->ssl_ctx;
             ts->active = 0;
             ts->ssl = NULL;
-            ts->ssl_ctx = NULL;
             ts->socket_fd = -1;
             ts->late_count = 0;
             ts->last_recv = 0;
@@ -2909,9 +2923,10 @@ static void softether_maintain_links(softether_connection_t* conn) {
             if (saved_fd >= 0) {
                 close(saved_fd);
             }
-            if (saved_ssl_ctx != NULL) {
-                ssl_shutdown((ssl_context_t*)saved_ssl_ctx);
-                ssl_destroy((ssl_context_t*)saved_ssl_ctx);
+            ssl_context_t* doomed = (ssl_context_t*)take_ssl_ctx_slot(&ts->ssl_ctx);
+            if (doomed != NULL) {
+                ssl_shutdown(doomed);
+                ssl_destroy(doomed);
             }
             conn->num_additional--;
         }
@@ -3363,13 +3378,15 @@ void softether_close_additional(softether_connection_t* conn) {
         }
     }
     // Phase 3: now safely destroy SSL contexts (no thread can be blocked in
-    // SSL_read on these anymore because the underlying fd is closed)
+    // SSL_read on these anymore because the underlying fd is closed). CAS-claim
+    // each slot so a concurrent receive/transmit error path retiring the same
+    // socket cannot double-destroy it.
     for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
         softether_tcp_sock_t* ts = &conn->additional[i];
-        if (ts->ssl_ctx != NULL) {
-            ssl_shutdown((ssl_context_t*)ts->ssl_ctx);
-            ssl_destroy((ssl_context_t*)ts->ssl_ctx);
-            ts->ssl_ctx = NULL;
+        ssl_context_t* doomed = (ssl_context_t*)take_ssl_ctx_slot(&ts->ssl_ctx);
+        if (doomed != NULL) {
+            ssl_shutdown(doomed);
+            ssl_destroy(doomed);
         }
     }
     conn->num_additional = 0;
