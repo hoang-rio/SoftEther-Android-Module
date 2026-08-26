@@ -943,7 +943,7 @@ softether_connection_t* softether_create(void) {
     // the server identity instead.
 
     // Set default hub name
-    strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
+    snprintf(conn->hub_name, sizeof(conn->hub_name), "%s", "vpngate");
 
     // Initialize write mutex for thread-safe SSL writes
     pthread_mutex_init(&conn->write_mutex, NULL);
@@ -1156,8 +1156,8 @@ static int perform_authentication_http(softether_connection_t* conn,
          username, conn->hub_name);
     conn->state = STATE_AUTHENTICATING;
 
-    strncpy(conn->username, username, sizeof(conn->username) - 1);
-    strncpy(conn->password, password, sizeof(conn->password) - 1);
+    snprintf(conn->username, sizeof(conn->username), "%s", username);
+    snprintf(conn->password, sizeof(conn->password), "%s", password);
 
     // Decide auth type: use forced_auth_type if set, otherwise auto-detect
     // NOTE: CLIENT_AUTHTYPE_ANONYMOUS == 0 doubles as the "auto-detect"
@@ -1391,8 +1391,8 @@ static int perform_authentication_http(softether_connection_t* conn,
                 LOGD("RUDP: server IP = %s", conn->rudp_server_ip);
             } else {
                 // Fallback to the TCP server IP
-                strncpy(conn->rudp_server_ip, conn->server_ip,
-                        sizeof(conn->rudp_server_ip) - 1);
+                snprintf(conn->rudp_server_ip, sizeof(conn->rudp_server_ip),
+                         "%s", conn->server_ip);
                 LOGD("RUDP: using TCP server IP = %s", conn->rudp_server_ip);
             }
 
@@ -2284,51 +2284,51 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
 
     // Store client info for login PACK
     if (client_product_name && client_product_name[0]) {
-        strncpy(conn->client_product_name, client_product_name, sizeof(conn->client_product_name) - 1);
+        snprintf(conn->client_product_name, sizeof(conn->client_product_name), "%s", client_product_name);
     }
     if (client_product_version && client_product_version[0]) {
-        strncpy(conn->client_product_version, client_product_version, sizeof(conn->client_product_version) - 1);
+        snprintf(conn->client_product_version, sizeof(conn->client_product_version), "%s", client_product_version);
     }
     conn->client_product_build = client_product_build;
     if (client_os_name && client_os_name[0]) {
-        strncpy(conn->client_os_name, client_os_name, sizeof(conn->client_os_name) - 1);
+        snprintf(conn->client_os_name, sizeof(conn->client_os_name), "%s", client_os_name);
     }
     if (client_os_version && client_os_version[0]) {
-        strncpy(conn->client_os_version, client_os_version, sizeof(conn->client_os_version) - 1);
+        snprintf(conn->client_os_version, sizeof(conn->client_os_version), "%s", client_os_version);
     }
     if (client_os_product_id && client_os_product_id[0]) {
-        strncpy(conn->client_os_product_id, client_os_product_id, sizeof(conn->client_os_product_id) - 1);
+        snprintf(conn->client_os_product_id, sizeof(conn->client_os_product_id), "%s", client_os_product_id);
     }
     if (client_host_name && client_host_name[0]) {
-        strncpy(conn->client_host_name, client_host_name, sizeof(conn->client_host_name) - 1);
+        snprintf(conn->client_host_name, sizeof(conn->client_host_name), "%s", client_host_name);
     }
     if (client_ip_address && client_ip_address[0]) {
         if (strchr(client_ip_address, ':') != NULL) {
-            strncpy(conn->client_ip_v6, client_ip_address, sizeof(conn->client_ip_v6) - 1);
+            snprintf(conn->client_ip_v6, sizeof(conn->client_ip_v6), "%s", client_ip_address);
             LOGD("Client IPv6 address: %s", conn->client_ip_v6);
         } else {
-            strncpy(conn->client_ip_address, client_ip_address, sizeof(conn->client_ip_address) - 1);
+            snprintf(conn->client_ip_address, sizeof(conn->client_ip_address), "%s", client_ip_address);
         }
     }
     conn->client_port = client_port;
     if (server_host_name && server_host_name[0]) {
-        strncpy(conn->server_host_name, server_host_name, sizeof(conn->server_host_name) - 1);
+        snprintf(conn->server_host_name, sizeof(conn->server_host_name), "%s", server_host_name);
     }
     if (server_ip_address && server_ip_address[0]) {
         if (strchr(server_ip_address, ':') != NULL) {
-            strncpy(conn->server_ip_v6, server_ip_address, sizeof(conn->server_ip_v6) - 1);
+            snprintf(conn->server_ip_v6, sizeof(conn->server_ip_v6), "%s", server_ip_address);
             LOGD("Server IPv6 address: %s", conn->server_ip_v6);
         } else {
-            strncpy(conn->server_ip_address, server_ip_address, sizeof(conn->server_ip_address) - 1);
+            snprintf(conn->server_ip_address, sizeof(conn->server_ip_address), "%s", server_ip_address);
         }
     }
     conn->server_port_reported = server_port;
 
     // Store hub name
     if (hub_name != NULL && hub_name[0] != '\0') {
-        strncpy(conn->hub_name, hub_name, sizeof(conn->hub_name) - 1);
+        snprintf(conn->hub_name, sizeof(conn->hub_name), "%s", hub_name);
     } else {
-        strncpy(conn->hub_name, "vpngate", sizeof(conn->hub_name) - 1);
+        snprintf(conn->hub_name, sizeof(conn->hub_name), "%s", "vpngate");
     }
 
     // Resolve hostname to IP upfront for bookkeeping. The actual connect still
@@ -2374,7 +2374,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                          preferred_ipv6 ? "IPv6" : "IPv4",
                          preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
                     if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
-                        strncpy(resolved_ip, fallback_ip, sizeof(resolved_ip) - 1);
+                        snprintf(resolved_ip, sizeof(resolved_ip), "%s", fallback_ip);
                         preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
                         tcp_ok = 1;
                     } else {
@@ -2401,7 +2401,7 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                         src = &((struct sockaddr_in6*)&sock->addr)->sin6_addr;
                     }
                     if (src != NULL && inet_ntop(sock->addr.ss_family, src, actual_ip, sizeof(actual_ip)) != NULL) {
-                        strncpy(resolved_ip, actual_ip, sizeof(resolved_ip) - 1);
+                        snprintf(resolved_ip, sizeof(resolved_ip), "%s", actual_ip);
                         preferred_ipv6 = (sock->addr.ss_family == AF_INET6);
                     }
                 }
@@ -2440,11 +2440,11 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     // Store server info
-    strncpy(conn->server_ip, resolved_ip, sizeof(conn->server_ip) - 1);
+    snprintf(conn->server_ip, sizeof(conn->server_ip), "%s", resolved_ip);
     conn->server_port = port;
     conn->is_ipv6 = (strchr(resolved_ip, ':') != NULL);
     if (conn->is_ipv6) {
-        strncpy(conn->server_ip_v6, resolved_ip, sizeof(conn->server_ip_v6) - 1);
+        snprintf(conn->server_ip_v6, sizeof(conn->server_ip_v6), "%s", resolved_ip);
         LOGD("IPv6 server detected: %s", resolved_ip);
     } else {
         conn->server_ip_v6[0] = '\0';
