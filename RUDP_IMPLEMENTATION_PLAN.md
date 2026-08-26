@@ -126,6 +126,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 13F | RUDP loss recovery + buffer tuning | P1 | ✅ Done |
 | 13G | Benchmark harness + acceptance criteria | P0 | ✅ Done (on-device matrix recorded) |
 | 14  | RUDP loss-adaptive send window + sticky fallback | P1 | ✅ Done (validated on device) |
+| 15  | Post-Phase-14 stability fixes (races, failover, ARP) | P0 | ✅ Done (device-verified) |
 
 #### 14 — RUDP loss-adaptive window + sticky fallback (P1) — DONE
 
@@ -138,6 +139,25 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 - Acceptance for device run: iperf3 over UDP mode within ~30% of TCP mode on Wi-Fi; `stats:` log shows `ovf`/`gaps` stable (not climbing) and `susp=false` during steady state.
 - **Validated on device** (SM-A736B, Wi-Fi ↔ local SoftEther server via docker, paired-session full-duplex flood through `ThroughputBenchmarkTest`, 12 s window): TCP 44.3/40.6 Mbps TX/RX vs UDP 48.7/44.4 Mbps — UDP ≥ TCP, zero overflows, no suspension. Acceptance met.
 - Known follow-up: concurrent SSL I/O across two connections sharing the cached SSL_CTX can corrupt the TLS layer (scudo abort in EVP_MD_CTX_free) — production keeps one connection's I/O mostly serialized per direction but this needs a proper fix (per-connection CTX or global TLS lock).
+
+#### 15 — Post-Phase-14 stability fixes (P0) — DONE (device-verified)
+
+Real-world regression reports after shipping 13/14, root-caused and fixed one by one:
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Batched RX wrote raw Ethernet frames to TUN → `write failed: EINVAL`, no network at all | `softether_receive_batch` skipped softether_receive's per-frame processing (eth strip, ARP reply, EtherType filter, link housekeeping) | Same processing in batch path; shared helpers (`softether_reply_arp_request`, `softether_maintain_links`) (`5d61d59` predecessor, commit `3e05d12` family) |
+| TCP: single dead additional socket → burst of send failures → full teardown + reconnect storms | `softether_transmit_block` returned -1 on first write error | Candidate-list failover; retire dead additional sockets, retry healthy ones (`ebbd99c`) |
+| Connected-but-no-network after heavy use on local-bridge servers | **Phase 13C race**: TUN path built into shared `send_block` staging without write_mutex while ARP/raw path built under it → corrupted blocks → server kills session | Both staging paths hold write_mutex across build+transmit (`5d61d59`); transmit split into nolock core + wrapper |
+| Same IP flapping between MACs of zombie + live sessions on local-bridge LANs → router ARP entry flaps, downstream lands on dead MACs | Random client MAC per reconnect | MAC derived from SHA-256(server host:port), stable across reconnects; `nativeSetClientMac` JNI (`02c3d8b`) |
+| UDP mode: "connected but no network" after one speedtest — upstream silently dead while downstream control traffic still arrives | **RUDP had no locking**: rudp_poll/rudp_send called from RX thread AND TUN thread; concurrent sends raced the shared `next_iv` cipher chaining (corrupted upstream datagrams servers silently drop), concurrent polls interleaved recv-queue indices | Recursive lock in `rudp_context_t` guarding poll/send/is_send_ready/recv (`f37cce1`) |
+
+**Device verification (SM-A736B, paid local-bridge server, UDP profile, one-shot speedtest):**
+- Before fixes: ~19 MB into the test then total silence — counters frozen, gateway ARP-storming for our IP, ping 100% loss until manual reconnect.
+- After fixes: 77 MB up / 102 MB down through the tunnel; RUDP carried the initial burst with ~4.2k recv-queue drops under sustained flood, Phase 14 suspension engaged (`susp=true`), traffic continued over TCP; **ping after test 128–159 ms — session alive**.
+
+Remaining tuning item (optional, cosmetic): during the RUDP phase of a speedtest, throughput dips while overflows accumulate before suspension engages (~4k drops @ ~50 Mbps). Candidates: faster RUDP queue drain under load or earlier suspension threshold.
+
 
 
 #### 13A — Hot-path logging (P0) — DONE
