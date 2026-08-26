@@ -32,6 +32,26 @@ static void* take_ssl_ctx_slot(void** slot) {
     return __sync_bool_compare_and_swap(slot, p, NULL) ? p : NULL;
 }
 
+// Atomically claim ownership of the shared NAT-T transport. Exactly one
+// concurrent caller receives the pointer and must destroy it; all others get
+// NULL. Prevents double-close (fdsan abort) and double-free when e.g. the
+// connect-thread error path and external teardown both run
+// softether_disconnect/softether_destroy on the same connection.
+static rudp_transport_t* take_nat_t_transport(softether_connection_t* conn) {
+    void* p = conn->nat_t_transport;
+    if (p == NULL) return NULL;
+    return __sync_bool_compare_and_swap((void**)&conn->nat_t_transport, p, NULL)
+        ? (rudp_transport_t*)p : NULL;
+}
+
+// Same ownership-claim pattern for the RUDP context.
+static rudp_context_t* take_rudp_ctx(softether_connection_t* conn) {
+    void* p = conn->rudp;
+    if (p == NULL) return NULL;
+    return __sync_bool_compare_and_swap((void**)&conn->rudp, p, NULL)
+        ? (rudp_context_t*)p : NULL;
+}
+
 // Per-packet trace logging (Phase 13A) — compiled out unless SE_TRACE_PACKETS.
 #ifdef SE_TRACE_PACKETS
 #define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -1014,10 +1034,13 @@ void softether_destroy(softether_connection_t* conn) {
     }
 
     // Safety: ensure the NAT-T transport is gone even if we were already
-    // marked disconnected (edge case in reconnection).
-    if (conn->nat_t_transport != NULL) {
-        rudp_transport_destroy(conn->nat_t_transport);
-        conn->nat_t_transport = NULL;
+    // marked disconnected (edge case in reconnection). CAS-claim so a
+    // concurrent disconnect cannot double-destroy it.
+    {
+        rudp_transport_t* stale_tr = take_nat_t_transport(conn);
+        if (stale_tr != NULL) {
+            rudp_transport_destroy(stale_tr);
+        }
     }
     conn->using_nat_t = 0;
 
@@ -2283,9 +2306,11 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
 
     // Ensure no stale NAT-T transport is carried into a fresh connect attempt
     // (re-entered via softether_reconnect). The app fd must already be closed.
-    if (conn->nat_t_transport != NULL && conn->socket_fd < 0) {
-        rudp_transport_destroy(conn->nat_t_transport);
-        conn->nat_t_transport = NULL;
+    if (conn->socket_fd < 0) {
+        rudp_transport_t* stale_tr = take_nat_t_transport(conn);
+        if (stale_tr != NULL) {
+            rudp_transport_destroy(stale_tr);
+        }
     }
     conn->using_nat_t = 0;
 
@@ -2694,17 +2719,23 @@ void softether_disconnect(softether_connection_t* conn) {
 
     // Destroy the NAT-T + RUDP transport if the connection used the fallback.
     // (The app-facing fd above was closed first; destroy then stops the worker.)
-    if (conn->nat_t_transport != NULL) {
-        LOGD("Destroying NAT-T transport");
-        rudp_transport_destroy(conn->nat_t_transport);
-        conn->nat_t_transport = NULL;
+    // CAS-claim so a concurrent disconnect/destroy cannot double-close the
+    // transport fds (fdsan abort) or double-free the object.
+    {
+        rudp_transport_t* nat_tr = take_nat_t_transport(conn);
+        if (nat_tr != NULL) {
+            LOGD("Destroying NAT-T transport");
+            rudp_transport_destroy(nat_tr);
+        }
     }
     conn->using_nat_t = 0;
 
-    // Destroy RUDP context if present
-    if (conn->rudp != NULL) {
-        rudp_destroy(conn->rudp);
-        conn->rudp = NULL;
+    // Destroy RUDP context if present (same ownership-claim discipline)
+    {
+        rudp_context_t* rudp = take_rudp_ctx(conn);
+        if (rudp != NULL) {
+            rudp_destroy(rudp);
+        }
     }
     conn->rudp_enabled = 0;
 
@@ -2908,7 +2939,7 @@ static void softether_maintain_links(softether_connection_t* conn) {
         pfd.revents = 0;
         int poll_ret = poll(&pfd, 1, 0);
         if (poll_ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            LOGW("Additional socket [%d] fd=%d disconnected (revents=0x%x), closing",
+            LOGW("Additional socket [%d] fd=%d disconnected, closing",
                  i, ts->socket_fd);
             // Mark inactive BEFORE destroying (prevent use-after-free by other threads)
             int saved_fd = ts->socket_fd;
