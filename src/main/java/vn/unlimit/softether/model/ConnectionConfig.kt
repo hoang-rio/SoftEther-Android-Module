@@ -47,7 +47,11 @@ data class ConnectionConfig(
     val authMethod: AuthMethod = AuthMethod.AUTO,
     val clientProductName: String = "VPN Gate Connector",
     val clientVersion: String = "1.0.0",
-    val clientBuild: Int = 1
+    val clientBuild: Int = 1,
+    // Phase 17: manual override for half/full-duplex auto-selection.
+    // null = auto-select by device tier; true = force full-duplex (all BOTH);
+    // false = force half-duplex (directional C2S/S2C split).
+    val fullDuplex: Boolean? = null
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -81,7 +85,14 @@ data class ConnectionConfig(
         authMethod = AuthMethod.valueOf(parcel.readString() ?: AuthMethod.AUTO.name),
         clientProductName = parcel.readString() ?: "VPN Gate Connector",
         clientVersion = parcel.readString() ?: "1.0.0",
-        clientBuild = parcel.readInt()
+        clientBuild = parcel.readInt(),
+        fullDuplex = parcel.readByte().let { b ->
+            when (b) {
+                0.toByte() -> null
+                1.toByte() -> true
+                else -> false
+            }
+        }
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -116,6 +127,11 @@ data class ConnectionConfig(
         parcel.writeString(clientProductName)
         parcel.writeString(clientVersion)
         parcel.writeInt(clientBuild)
+        parcel.writeByte(when (fullDuplex) {
+            null -> 0
+            true -> 1
+            false -> 2
+        })
     }
 
     override fun describeContents(): Int = 0

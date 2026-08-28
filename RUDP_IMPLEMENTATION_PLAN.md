@@ -121,6 +121,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | 14  | RUDP loss-adaptive send window + sticky fallback | P1 | ✅ Done (validated on device) |
 | 15  | Post-Phase-14 stability fixes (races, failover, ARP) | P0 | ✅ Done (device-verified) |
 | 16  | TLS shared-SSL_CTX heap corruption fix | P1 | ✅ Done (hardened; deep-concurrency caveat documented) |
+| 17  | Half/full-duplex auto-selection (device-tier) | P2 | ✅ Done (device-validated: full beats half on SM-A736B) |
 
 #### 14 — RUDP loss-adaptive window + sticky fallback (P1) — DONE
 
@@ -161,6 +162,38 @@ Remaining tuning item (optional, cosmetic): during the RUDP phase of a speedtest
 - **Implemented:** per-connection `SSL_CTX` (creation serialized by a create-only mutex; library init still `once`) + process-wide lock around SSL write/lifecycle (handshake stays unlocked). The old RAND_DRBG crash did not resurface.
 - **Honest caveat:** the prebuilt OpenSSL 3.5.7 still has an internal race in its multiblock record-write path under extreme cross-connection concurrency (double-free of a provider-cached `EVP_SIGNATURE`, seen even with separate CTXs). Production single-session traffic never exercises it; the benchmark harness keeps a process-wide TLS I/O serialization as a proven-stable workaround at link speed. A full fix requires rebuilding/switching the TLS library or an upstream investigation — deferred.
 - **Verified:** paired-session benchmark 60 s full-duplex, no scudo aborts — TCP 54.4/51.4 Mbps, UDP 54.0/50.6 Mbps TX/RX; production session unaffected (throughput unchanged).
+
+#### 17 — Half/full-duplex auto-selection (device-tier) (P2) — PLANNED
+
+**Goal:** choose per-device (at connect time) whether the SoftEther session runs in **half-duplex** (current: 2 TX + 2 RX directional connections) or **full-duplex** (up to 4× `BOTH` connections), driven by device capability so flagship devices get maximum aggregate throughput and budget devices don't pay concurrency overhead they can't use.
+
+**Grounding in the data path (why this helps / where it's free):**
+- Direction is **server-assigned**, but gated client-side by the `half_connection` flag we send in the login PACK (`softether_protocol.c:690` — currently hardcoded `1`). `half_connection=1` → server splits connections into C2S/S2C roles (the "2 TX 2 RX" split); `half_connection=0` → every connection negotiated `BOTH`. Parsed from server reply at `softether_protocol.c:1387-1391`.
+- `softether_select_send_socket` (`softether_protocol.c:3792`) already **round-robins TX across every send-capable socket** (C2S or BOTH). RX already drains every receive-capable socket (`packet_handler.c:849-872`). So switching to full-duplex (all BOTH) needs **zero change to TX/RX socket selection** — the decision is isolated to the `half_connection` flag + connecting the extra sockets.
+- **Main benefit is RX + flexibility:** all-4-BOTH yields 4 independent receive windows vs 2, and each direction can borrow any of the 4 links (better for asymmetric real traffic). It is **not** a raw TX speedup on its own because ALL sends are still serialized by the single `write_mutex` (`packet_handler.c:356`) — a separate, riskier follow-up to split per-connection locks.
+- **Why low-tier stays half:** on low-core/low-RAM devices, 4 concurrent TLS sessions add CPU/SSL/RX overhead and, with TX mutex-serialized, yield no TX gain — so they keep the cheaper half-duplex 2/2 split or fewer connections.
+
+**Implementation (client-side only):**
+1. **Native** (`softether_protocol.c` / `softether.h`): replace the hardcoded `half_connection=1` at `:690` with a field read from `conn->half_connection` (default 0 = full-duplex). Add a JNI setter (or reuse `setMaxConnection` path) so Kotlin can pass the chosen mode pre-connect. Ensure the first-additional-establish logic (`softether_establish_first_additional`, `:1489`) only runs the S2C-switch when `half_connection=1`.
+2. **JNI** (`softether_jni.c`): new/existing external `nativeSetHalfConnection(handle, boolean)` that stores into `conn` before connect, mirroring `nativeSetMaxConnection` (`:345-352`).
+3. **Kotlin** (`SoftEtherClient.kt`): `setHalfConnection(enabled: Boolean)` → `nativeSetHalfConnection`.
+4. **Kotlin device-tier selector** (new, e.g. in `ConnectionController` or a small `DuplexModeSelector`):
+   - `cores = Runtime.getRuntime().availableProcessors()`
+   - `totalMemGB = (ActivityManager.MemoryInfo.totalMem / 1GB).toInt()`
+   - `network = ConnectivityManager.activeNetwork` (Wi-Fi vs cellular) + signal strength where available.
+   - Thresholds (defaults; tunable): **full-duplex** if `cores>=4 && totalMemGB>=4 && network is Wi-Fi` (or strong cellular); **half-duplex** otherwise. Log the decision + rationale at connect.
+5. **Wire it in** at the connect path (`ConnectionController.connect` near `:358`): compute mode → `client.setHalfConnection(modeFullDuplex)` → proceed with existing `nativeConnectWithHub`.
+
+**Acceptance / validation:**
+- Device matrix (paired full-duplex via `ThroughputBenchmarkTest`) comparing half vs full on the SM-A736B and, if available, a low-tier device: expect **RX** to improve on high-tier full-duplex and **no regression** on low-tier half-duplex; `rudp_overflow_count`/`rudp_data_suspended` stay 0.
+- Connect must produce the chosen direction sets in logs ("direction=0/2", i.e. BOTH on all sockets when full-duplex).
+- No crash under the paired 60 s full-duplex flood (Phase 16 TLS-concurrency discipline still applies).
+
+**Risk / caveats (carried over):**
+- Phase 16's shared/prebuilt-OpenSSL concurrency caveat still applies if full-duplex ever overlaps two connections' I/O concurrently; in production, per-connection TX is mutex-serialized so the practical exposure mirrors today.
+- This moves the throughput bottleneck; realizing the full duplex gain on TX would require splitting `write_mutex` — deferred (see Phase 17.1 below).
+
+**Phase 17.1 (deferred, P2):** split `write_mutex` into per-connection transmit locks so full-duplex can push TX in parallel across the 4 BOTH sockets. Higher risk (interacts with Phase 16 TLS fixes + the shared-SSL_CTX/chunking caveat); measure Phase 17 first before attempting.
 
 #### 13A–13G — Completed (compacted)
 

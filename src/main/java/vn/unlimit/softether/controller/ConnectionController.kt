@@ -352,6 +352,11 @@ class ConnectionController(
             client.nativeSetAuthType(nativeHandle, authTypeInt)
         }
         startNativeStateMonitor()
+        // Phase 17: choose half/full-duplex by device tier (or manual override) and
+        // apply before connect. fullDuplex=false -> half-duplex (current 2TX/2RX split).
+        val fullDuplex = DuplexModeSelector.resolve(service, config)
+        client.setHalfConnection(!fullDuplex)
+        Log.d(TAG, "Duplex mode: ${if (fullDuplex) "FULL" else "HALF"} (4x BOTH / directional split)")
         // Build client info (rudpPort will be filled in by native code during RUDP init)
         val clientInfo = buildClientInfo(0)
         val result = try {
@@ -857,6 +862,12 @@ class ConnectionController(
                 }
                 client.nativeSetAuthType(nativeHandle, authTypeInt)
             }
+
+            // Phase 17: re-apply duplex mode to the fresh reconnect handle
+            // (nativeCreate resets half_connection to 0, i.e. full-duplex).
+            val reconnectFullDuplex = DuplexModeSelector.resolve(service, config)
+            client.setHalfConnection(!reconnectFullDuplex)
+            Log.d(TAG, "Reconnect duplex mode: ${if (reconnectFullDuplex) "FULL" else "HALF"}")
 
             // Connect to server (TLS + protocol + auth + session)
             startNativeStateMonitor()

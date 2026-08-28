@@ -687,7 +687,10 @@ static uint8_t* build_login_pack(const char* hub_name, const char* username,
     // Phase 13B: advertise no session compression. VPN Gate traffic is
     // TLS-encrypted and incompressible; zlib per block only burns CPU.
     pack_add_int(&p, "use_compress", 0);
-    pack_add_int(&p, "half_connection", 1);  // Half-connection: primary becomes C2S, additional sockets get S2C/C2S
+    // Phase 17: half_connection is device-tier driven (Kotlin sets conn->half_connection
+    // before connect). 1 = half-duplex (primary C2S, additional S2C/C2S split);
+    // 0 = full-duplex (every connection negotiated BOTH).
+    pack_add_int(&p, "half_connection", conn->half_connection ? 1 : 0);
     pack_add_int(&p, "require_bridge_routing_mode", 0);
     pack_add_int(&p, "require_monitor_mode", 0);
     pack_add_int(&p, "qos", 1);

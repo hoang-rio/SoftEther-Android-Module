@@ -144,6 +144,16 @@ class SoftEtherClient {
     }
 
     /**
+     * Set half/full-duplex mode (Phase 17).
+     * @param halfConnection true = half-duplex (directional C2S/S2C split),
+     *   false = full-duplex (all connections BOTH). Must be called before connect.
+     */
+    fun setHalfConnection(halfConnection: Boolean) {
+        if (nativeHandle == 0L) return
+        nativeSetHalfConnection(nativeHandle, halfConnection)
+    }
+
+    /**
      * Get the current number of active TCP connections (primary + additional)
      * @return Number of active connections
      */
@@ -339,6 +349,7 @@ class SoftEtherClient {
     external fun nativeDoDhcp(handle: Long): IntArray?
     external fun nativeSetAuthType(handle: Long, authType: Int)
     external fun nativeSetMaxConnection(handle: Long, maxConnections: Int)
+    external fun nativeSetHalfConnection(handle: Long, halfConnection: Boolean)
     external fun nativeGetNumConnections(handle: Long): Int
     external fun nativeGetAllSocketFds(handle: Long): IntArray?
     external fun nativeForceCloseSocket(handle: Long)

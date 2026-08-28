@@ -38,6 +38,19 @@ class ThroughputBenchmarkTest {
     private fun arg(name: String, def: String): String =
         InstrumentationRegistry.getArguments().getString(name) ?: def
 
+    /**
+     * Phase 17: benchDuplex = "full" (default, all BOTH) / "half" (directional
+     * C2S/S2C split) / "auto" (device-tier). Applies before connect.
+     */
+    private fun applyDuplex(client: SoftEtherClient, handle: Long) {
+        val full = when (arg("benchDuplex", "full")) {
+            "half" -> false
+            "auto" -> null
+            else -> true
+        }
+        if (full != null) client.setHalfConnection(!full) // setHalfConnection(true)=half-duplex
+    }
+
     private fun csum(data: ByteArray, offset: Int, len: Int): Int {
         var sum = 0L
         var i = offset
@@ -103,6 +116,7 @@ class ThroughputBenchmarkTest {
         client.externalHandle = handle
         check(handle != 0L) { "nativeCreate failed" }
         client.setTimeout(30000)
+        applyDuplex(client, handle)
 
         val serverIp = try {
             InetAddress.getByName(host).hostAddress ?: host
@@ -221,6 +235,7 @@ class ThroughputBenchmarkTest {
             val h = c.nativeCreate()
             check(h != 0L)
             c.setTimeout(30000)
+            applyDuplex(c, h)
             val rc = c.nativeConnectWithHub(
                 h, host, port, username, password, hub, useTcp,
                 "vpngate-bench", "1.0", 0,

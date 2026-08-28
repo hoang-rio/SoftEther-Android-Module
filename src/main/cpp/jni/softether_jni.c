@@ -352,6 +352,19 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
     LOGD("Set max_connection to %d", conn->max_connection);
 }
 
+// Phase 17: set half/full-duplex mode. halfConnection=1 -> half-duplex (directional
+// C2S/S2C split, primary becomes C2S); halfConnection=0 -> full-duplex (all BOTH).
+JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSetHalfConnection(
+    JNIEnv *env, jobject thiz, jlong handle, jboolean halfConnection) {
+    if (handle == 0) {
+        LOGE("Invalid handle for setHalfConnection");
+        return;
+    }
+    softether_connection_t* conn = (softether_connection_t*)handle;
+    conn->half_connection = halfConnection ? 1 : 0;
+    LOGD("Set half_connection to %d", conn->half_connection);
+}
+
 JNIEXPORT jint JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeGetNumConnections(
     JNIEnv *env, jobject thiz, jlong handle) {
     if (handle == 0) return 0;
