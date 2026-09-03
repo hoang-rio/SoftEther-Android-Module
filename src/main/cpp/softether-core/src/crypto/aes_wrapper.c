@@ -42,7 +42,7 @@ struct ssl_context {
     int connected;
 };
 
-// TLS object lifetime guard. OpenSSL 3.5.7's multiblock record-write path
+// TLS object lifetime guard. OpenSSL 3.5.8's multiblock record-write path
 // frees a shared provider-cached EVP_SIGNATURE; concurrent SSL_write from two
 // connections double-frees it — so writers stay fully serialized (wrlock is
 // exclusive). Readers take the shared rdlock so parallel SSL_read keeps its

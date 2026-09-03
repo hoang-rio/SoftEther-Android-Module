@@ -59,4 +59,4 @@ This project is under Apache License 2.0 ([LICENSE](LICENSE)) for all original c
 
 Third-party components retain their original licenses:
 * [**SoftEtherVPN**](https://github.com/SoftEtherVPN/SoftEtherVPN_Stable) under Apache License 2.0 (https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/blob/master/LICENSE)
-* [**OpenSSL**](https://github.com/openssl/openssl) under Apache License 2.0 (https://github.com/openssl/openssl/blob/openssl-3.5.7/LICENSE.txt)
+* [**OpenSSL**](https://github.com/openssl/openssl) under Apache License 2.0 (https://github.com/openssl/openssl/blob/openssl-3.5.8/LICENSE.txt)
