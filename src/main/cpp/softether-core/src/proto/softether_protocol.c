@@ -991,6 +991,10 @@ softether_connection_t* softether_create(void) {
         pthread_mutexattr_destroy(&attr);
     }
 
+    // Initialize the SSL-context lifetime rwlock (protects conn->ssl and the
+    // additional[i].ssl pointer slots against the receive path).
+    pthread_rwlock_init(&conn->ssl_lifetime_lock, NULL);
+
     // Initialize multi-connection fields
     conn->num_additional = 0;
     conn->max_connection = 4;  // Target: request 4 connections in login PACK
@@ -1058,6 +1062,7 @@ void softether_destroy(softether_connection_t* conn) {
     // Destroy write mutex
     pthread_mutex_destroy(&conn->write_mutex);
     pthread_mutex_destroy(&conn->connect_mutex);
+    pthread_rwlock_destroy(&conn->ssl_lifetime_lock);
 
     // Release the Phase 13C TX staging buffer
     free(conn->send_block);
@@ -2713,6 +2718,15 @@ void softether_disconnect(softether_connection_t* conn) {
     // waiting here cannot deadlock. The background additional-connect thread is
     // joined above; this mutex is never taken while connect_mutex is held,
     // keeping the lock order connect->write consistent.
+    //
+    // Take the SSL-lifetime WRITE lock BEFORE write_mutex: it must exclude the
+    // receive path (softether_fill_recv_queue), which holds the same lock READ
+    // while capturing/using conn->ssl / additional[i].ssl and only takes
+    // write_mutex afterwards via keepalive. Locking in this order (ssl_lifetime
+    // then write_mutex) keeps a single global order and prevents an AB-BA
+    // deadlock. A receiver holding READ is bounded by poll()/SSL_read, and its
+    // fd was already force-closed above, so it releases promptly.
+    pthread_rwlock_wrlock(&conn->ssl_lifetime_lock);
     pthread_mutex_lock(&conn->write_mutex);
 
     // Close all additional connections first
@@ -2739,6 +2753,10 @@ void softether_disconnect(softether_connection_t* conn) {
     // Release write_mutex before touching the NAT-T/RUDP transports: they are
     // independent objects with their own teardown and don't need this mutex.
     pthread_mutex_unlock(&conn->write_mutex);
+    // Release the SSL-lifetime WRITE lock after all SSL contexts (primary +
+    // additional) have been freed above. From here on no thread can observe a
+    // stale ssl_context_t* for this connection.
+    pthread_rwlock_unlock(&conn->ssl_lifetime_lock);
 
     // Destroy the NAT-T + RUDP transport if the connection used the fallback.
     // (The app-facing fd above was closed first; destroy then stops the worker.)

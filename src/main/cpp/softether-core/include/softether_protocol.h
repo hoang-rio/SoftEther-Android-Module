@@ -204,6 +204,14 @@ typedef struct softether_connection {
     // Thread safety for concurrent send/receive
     pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
     pthread_mutex_t connect_mutex;  // serializes connect/disconnect (recursive; connect calls disconnect internally)
+    // Protects the LIFETIME of ssl_context_t* pointers (conn->ssl and the
+    // additional[i].ssl slots). Readers (the receive path) hold it while
+    // capturing and using an SSL pointer; teardown holds it (write) while
+    // CAS-claiming a slot to NULL and freeing it, so the receive path can
+    // never deref a freed context. Acquired BEFORE write_mutex everywhere
+    // (receive holds read then may take write_mutex via keepalive; teardown
+    // holds write then takes write_mutex), keeping a single lock order.
+    pthread_rwlock_t ssl_lifetime_lock;  // protects ssl_context_t* pointer lifetime
     // Multi-connection support
     softether_tcp_sock_t additional[MAX_SE_CONNECTIONS];  // additional TCP sockets (index 0 unused; primary is in socket_fd/ssl)
     int num_additional;          // number of active additional connections

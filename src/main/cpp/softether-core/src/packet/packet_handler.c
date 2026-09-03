@@ -813,7 +813,7 @@ static int drain_rudp_into_recv_queue(softether_connection_t* conn, int max_fram
 // Read one protocol message and queue ALL blocks into the receive queue.
 // Supports multi-connection: polls all active TCP sockets + optional UDP socket.
 // Returns: 1 = data queued, 0 = keepalive/no data/timeout, -1 = error
-int softether_fill_recv_queue(softether_connection_t* conn) {
+static int softether_fill_recv_queue_locked(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) return -1;
     if (conn->state == STATE_DISCONNECTED || conn->state == STATE_DISCONNECTING) return -1;
 
@@ -1186,4 +1186,20 @@ int softether_fill_recv_queue(softether_connection_t* conn) {
 
     LOGT("fill_recv_queue: queued %d frames total", conn->recv_queue_count);
     return (conn->recv_queue_count > 0) ? 1 : 0;
+}
+
+// Public entry point. Holds the SSL-lifetime READ lock across the whole receive
+// pass so that the ssl_context_t* pointers captured inside (conn->ssl and the
+// additional[i].ssl slots) cannot be freed concurrently by
+// softether_disconnect / softether_close_additional, which take the same lock
+// in WRITE mode before CAS-claiming a slot to NULL and calling ssl_destroy().
+// This closes the use-after-free where the old code captured conn->ssl into
+// tcp_info[] and later deref'd it in ssl_has_pending()/SSL_read() after teardown
+// had already freed the context.
+int softether_fill_recv_queue(softether_connection_t* conn) {
+    if (conn == NULL) return -1;
+    pthread_rwlock_rdlock(&conn->ssl_lifetime_lock);
+    int rc = softether_fill_recv_queue_locked(conn);
+    pthread_rwlock_unlock(&conn->ssl_lifetime_lock);
+    return rc;
 }
