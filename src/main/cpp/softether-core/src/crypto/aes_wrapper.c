@@ -445,8 +445,21 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     int result;
     
     while (attempt < max_attempts) {
+        // The TLS handshake parses the server certificate / public key through
+        // OpenSSL's ASN.1 decoder + provider/namemap machinery (OSSL_DECODER,
+        // DER2KEY, ERR_pop_to_mark). These mutate GLOBAL OpenSSL provider and
+        // decoder registries shared by every thread. The per-SSL g_tls_use_lock
+        // above only protects this SSL object, NOT those globals, so run the
+        // handshake under g_openssl_lock to make it mutually exclusive with the
+        // data path's digest/RAND/SHA calls and with other concurrent
+        // handshakes. A concurrent unmarshalled provider fetch here corrupts
+        // the shared decoder registry (scudo header corruption in
+        // ERR_pop_to_mark / der2key_decode) — see the production crash whose
+        // backtrace is OSSL_DECODER_from_data -> der2key_decode.
+        pthread_mutex_lock(&g_openssl_lock);
         result = SSL_do_handshake(ctx->ssl);
-        
+        pthread_mutex_unlock(&g_openssl_lock);
+
         if (result == 1) {
             // Handshake successful
             break;
