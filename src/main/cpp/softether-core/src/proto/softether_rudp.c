@@ -40,7 +40,7 @@ static void calc_key(uint8_t* key, const uint8_t* common_key, const uint8_t* iv)
     uint8_t tmp[RUDP_COMMON_KEY_SIZE_V1 + RUDP_PACKET_IV_SIZE_V1];
     memcpy(tmp, common_key, RUDP_COMMON_KEY_SIZE_V1);
     memcpy(tmp + RUDP_COMMON_KEY_SIZE_V1, iv, RUDP_PACKET_IV_SIZE_V1);
-    SHA1(tmp, sizeof(tmp), key);
+    sha1_hash(tmp, sizeof(tmp), key);
 }
 
 // Create (or re-create) the UDP socket for the given address family, bind it
