@@ -2689,14 +2689,11 @@ void softether_disconnect(softether_connection_t* conn) {
         conn->additional_connecting = 0;
     }
 
-    // Close all additional connections first
-    softether_close_additional(conn);
-
-    // In real SoftEther, disconnect is simply closing the connection.
-    // No special disconnect packet exists in the block protocol.
-
-    // Close primary fd FIRST so that any in-flight SSL_read returns with
-    // SSL_ERROR_SYSCALL instead of crashing on freed SSL internals.
+    // Close primary fd FIRST so that any in-flight SSL_read/SSL_write returns
+    // with an error promptly (SSL_ERROR_SYSCALL) instead of blocking forever
+    // and instead of crashing on freed SSL internals. A sender already past the
+    // state check below will then finish its SSL_write on the closed fd, release
+    // write_mutex, and never deref a freed context.
     if (conn->socket_fd >= 0) {
         LOGD("Closing primary socket fd");
         int saved_fd = conn->socket_fd;
@@ -2704,6 +2701,25 @@ void softether_disconnect(softether_connection_t* conn) {
         __sync_synchronize();
         close(saved_fd);
     }
+
+    // Serialize SSL-context teardown against the send path. softether_send
+    // holds write_mutex across building the block AND reading conn->ssl and
+    // transmitting it (ssl_write_all -> ssl_write -> SSL_write). If we freed
+    // conn->ssl / additional SSL contexts without write_mutex, a concurrently
+    // running sender could already hold a stale ssl_context_t* and crash in
+    // ossl_ssl_get_error (inside SSL_get_error) after ssl_destroy() free()s it.
+    // Any sender is bounded by the socket timeout (SO_SNDTIMEO/SO_RCVTIMEO set
+    // at connect) and the fd closes above force it to finish shortly, so
+    // waiting here cannot deadlock. The background additional-connect thread is
+    // joined above; this mutex is never taken while connect_mutex is held,
+    // keeping the lock order connect->write consistent.
+    pthread_mutex_lock(&conn->write_mutex);
+
+    // Close all additional connections first
+    softether_close_additional(conn);
+
+    // In real SoftEther, disconnect is simply closing the connection.
+    // No special disconnect packet exists in the block protocol.
 
     // Shutdown SSL only if it was initialized. CAS-claim conn->ssl so a
     // concurrent error-path retirement cannot double-destroy the same object.
@@ -2719,6 +2735,10 @@ void softether_disconnect(softether_connection_t* conn) {
             ssl_destroy((ssl_context_t*)primary_ssl);
         }
     }
+
+    // Release write_mutex before touching the NAT-T/RUDP transports: they are
+    // independent objects with their own teardown and don't need this mutex.
+    pthread_mutex_unlock(&conn->write_mutex);
 
     // Destroy the NAT-T + RUDP transport if the connection used the fallback.
     // (The app-facing fd above was closed first; destroy then stops the worker.)
