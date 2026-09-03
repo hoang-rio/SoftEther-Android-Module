@@ -543,7 +543,20 @@ int ssl_read(ssl_context_t* ctx, uint8_t* buffer, size_t len) {
             pthread_rwlock_unlock(&g_tls_use_lock);
             return -1;
         }
+        // The TLS record layer computes the record HMAC through OpenSSL's
+        // provider-fetched EVP_MAC (tls1_mac -> EVP_MD_CTX_free ->
+        // EVP_PKEY_CTX_free -> EVP_MAC_free). This touches the same GLOBAL
+        // provider/namemap registry shared by every thread. The per-SSL
+        // g_tls_use_lock above only protects THIS SSL object; without
+        // g_openssl_lock a concurrent handshake/digest/RAND on another thread
+        // can corrupt the shared EVP_MAC, which surfaces as scudo header
+        // corruption in EVP_MAC_free deep inside SSL_read. Serialize the read
+        // (and write, below) under g_openssl_lock to close the last uncovered
+        // provider-touching path. Lock order stays g_tls_use_lock ->
+        // g_openssl_lock, matching the handshake.
+        pthread_mutex_lock(&g_openssl_lock);
         result = SSL_read(ctx->ssl, buffer, (int)len);
+        pthread_mutex_unlock(&g_openssl_lock);
         if (result > 0 || result == 0) {
             break;
         }
@@ -586,7 +599,14 @@ int ssl_write(ssl_context_t* ctx, const uint8_t* data, size_t len) {
     }
 
     pthread_rwlock_wrlock(&g_tls_use_lock);
+    // Same provider-registry serialization as the read path: SSL_write's TLS
+    // record MAC computation fetches a provider-side EVP_MAC (global namemap),
+    // so it must be made mutually exclusive with every other OpenSSL
+    // provider-touching op (handshake, digests, RAND, reads) under
+    // g_openssl_lock. Held only around the SSL_write call itself.
+    pthread_mutex_lock(&g_openssl_lock);
     int result = SSL_write(ctx->ssl, data, (int)len);
+    pthread_mutex_unlock(&g_openssl_lock);
     if (result < 0) {
         int ssl_error = SSL_get_error(ctx->ssl, result);
         if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
