@@ -1607,7 +1607,6 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
     struct in_addr ip4;
     char ip_str[INET_ADDRSTRLEN];
 
-    (void)host;
     if (inet_pton(AF_INET, resolved_ip, &ip4) != 1) {
         LOGE("NAT-T fallback requires an IPv4 server address (got %s)", resolved_ip);
         return ERR_TCP_CONNECT;
@@ -1616,7 +1615,10 @@ static int softether_try_nat_t_connect(softether_connection_t* conn,
     LOGD("NAT-T rendezvous for %s:%d ...", resolved_ip, port);
     softether_nat_t_result_t nr;
     memset(&nr, 0, sizeof(nr));
-    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, (uint32_t)conn->timeout_ms, &nr, NULL) != 0) {
+    // Forward the original hostname as target_hostname so the relay can route
+    // hostname-with-hint servers (Network.c:5475-5482).
+    if (nat_t_connect_ex(ip4.s_addr, NAT_T_SVC_NAME, NULL, host,
+                         (uint32_t)conn->timeout_ms, &nr, NULL) != 0) {
         LOGE("NAT-T rendezvous failed: error=%d", nr.error_code);
         return ERR_TCP_CONNECT;
     }
@@ -1905,11 +1907,13 @@ static void* transport_thread_natt(void* arg) {
     LOGD("[%s] attempting rendezvous for %s", transport_name(TRANSPORT_NATT),
          ctx->resolved_ip);
 
-    // NAT-T rendezvous
+    // NAT-T rendezvous. Forward the original hostname as target_hostname so the
+    // relay can route hostname-with-hint servers (Network.c:5475-5482).
     softether_nat_t_result_t nr;
     memset(&nr, 0, sizeof(nr));
-    if (nat_t_connect(ip4.s_addr, NAT_T_SVC_NAME, ctx->timeout_ms, &nr,
-                      ctx->cancel_flag) != 0) {
+    if (nat_t_connect_ex(ip4.s_addr, NAT_T_SVC_NAME, NULL, ctx->host,
+                         ctx->timeout_ms, &nr,
+                         ctx->cancel_flag) != 0) {
         LOGD("[%s] rendezvous failed: error=%d", transport_name(TRANSPORT_NATT),
              nr.error_code);
         r->error = ERR_TCP_CONNECT;

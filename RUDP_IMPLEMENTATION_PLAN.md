@@ -87,6 +87,8 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 4. **`current_rtt` never written (IMPLEMENTED 2026-09-08)** — now sampled in `rt_handle_udp_packet` on each `latest_recv_my_tick` advance, deduped via new `latest_recv_my_tick2` (§ Parity Audit, Gap 2).
 5. **ICMP client parity (IMPLEMENTED 2026-09-08)** — random-size (64–127 B) Echo keep-alive on 1–3 s random interval in init + established; 39-byte connect probe sent as Echo-Response (0) then Info-Request (7); receive path accepts types 0/7/8/15 (§ Parity Audit, Gap 3). On-device regression still requires root.
 6. **ALT relay hostname fallback (IMPLEMENTED 2026-09-08)** — primary + ALT relay tags added; `nat_t_connect` fails over to `.uxcom.jp` when the `softether-network.net` relay fails to resolve (§ Parity Audit, Gap 4).
+7. **`hint` / `target_hostname` in NAT-T request (IMPLEMENTED 2026-09-08)** — new `nat_t_connect_ex` forwards non-empty `hint`/`target_hostname`; the parallel-race NAT-T thread passes the original hostname as `target_hostname` (§ Parity Audit, Gap 5).
+8. **`multi_candidates` precedence (IMPLEMENTED 2026-09-08)** — response parser now treats `ok` as having priority; `multi_candidates` is only consulted when `ok` is false (§ Parity Audit, Gap 6).
 
 ### Key Source References
 
@@ -128,16 +130,17 @@ Audit of `softether_nat_t.c` / `rudp_transport.c` against the official client (`
 2. **`current_rtt` never written — perf only.** Official updates `CurrentRtt = now - LatestRecvMyTick` on each valid segment, deduped via `LatestRecvMyTick2` (`Network.c:3508-3511`). Ours declares/reads it (`rudp_transport.c:135`, `:781`) but never assigns → always fixed 200 ms retransmit base. Fix: set it in `rt_handle_udp_packet` when `your_tick` advances, with a dedupe guard.
 3. **ICMP client parity — robustness, ICMP-only (IMPLEMENTED).** Official client periodically sends a random-size (64–127 B) ICMP Echo Request to keep the NAT mapping alive (`Network.c:2765-2773`) and sends the init as *both* Echo-Response and Info-Request (`Network.c:2776-2777`). Ours now mirrors this in `rudp_transport.c` (`rt_send_icmp_echo` + `next_icmp_echo_tick` pacing; init probes as type 0 then 7). Low priority (raw socket needs root).
 4. **ALT relay hostname fallback — robustness (IMPLEMENTED + VERIFIED 2026-09-08).** Official shards to `x%c.x%c.servers.nat-traversal.uxcom.jp.` when `IsUseAlternativeHostname()` (`Network.c:4650-4653`); note that function returns `false` unconditionally in the stable client, so ours instead fails over to the ALT tag only when the primary relay domain fails to resolve (`softether_nat_t.c`, `nat_t_build_hostname_internal` + `nat_t_connect`). Host harness (`/tmp/opencode/nat_t_test.c`, `nat_t_connect_alt`) confirmed the ALT domains resolve to the same relay shards (e.g. `x4.x1.servers.nat-traversal.uxcom.jp.` → `130.158.6.112`) and serve the NAT-T protocol identically to primary; in one sample the ALT relay answered while primary timed out.
-5. **`hint` / `target_hostname` in NAT-T request — dormant.** Official adds them when non-empty (`Network.c:5475-5482`); ours doesn't accept them. Empty for direct-IP VPN Gate targets, so no practical impact until hostname-with-hint support is wanted.
-6. **`ok && multi_candidates` precedence — cosmetic.** Ours returns TWO_OR_MORE when both set (`softether_nat_t.c:144-150`); official only looks at multi_candidates when `ok == 0` (`Network.c:5436-5445`). Relay never sets both.
+5. **`hint` / `target_hostname` in NAT-T request (IMPLEMENTED).** Official adds them when non-empty (`Network.c:5475-5482`). Ours now forwards them via new `nat_t_connect_ex` (`softether_nat_t.c`), and the parallel-race NAT-T thread passes the original hostname as `target_hostname` (`softether_protocol.c`). Empty for direct-IP VPN Gate targets, so dormant there, but hostname-hint routing now works.
+6. **`ok && multi_candidates` precedence (IMPLEMENTED).** Ours returned TWO_OR_MORE when both set; official only looks at multi_candidates when `ok == 0` (`Network.c:5436-5445`). Response parser now honors `ok` priority (`softether_nat_t.c`, `nat_t_parse_response`).
 
 ### Recommended fix scope
 
 - **Gap 1 + Gap 2**: small, isolated changes in `rudp_transport.c` — **done 2026-09-08** (see Open Items 2 & 4). Gap 1 is required for DNS/ICMP transports to work at all; Gap 2 lets the retransmit interval adapt to RTT.
 - **Gap 4**: ALT relay-domain failover in `softether_nat_t.c` — **done 2026-09-08** (see Open Item 6).
 - **Gap 3**: ICMP client parity in `rudp_transport.c` — **done 2026-09-08** (see Open Item 5).
-- **Gaps 5, 6**: remaining optional items. Gap 5 (hint/target_hostname) is dormant for VPN Gate targets; Gap 6 is cosmetic.
-- Gap 5/6 can be dropped entirely if later work never needs hostname-hint or multi-candidate relays.
+- **Gap 5**: `hint`/`target_hostname` forwarding in NAT-T requests (`nat_t_connect_ex`, `softether_nat_t.c` + `softether_protocol.c`) — **done 2026-09-08** (see Open Item 7).
+- **Gap 6**: `ok`-over-`multi_candidates` precedence in the response parser — **done 2026-09-08** (see Open Item 8).
+- All 6 parity gaps now implemented; no remaining recommended fixes.
 
 ---
 

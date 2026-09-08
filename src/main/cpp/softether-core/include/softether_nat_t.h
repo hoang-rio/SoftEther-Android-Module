@@ -57,6 +57,15 @@ int nat_t_connect_alt(uint32_t server_ip_net, const char* svc_name,
                       uint32_t timeout_ms, softether_nat_t_result_t* result,
                       const volatile int* cancel_flag);
 
+// Extended variant: forwards optional hint and target_hostname in the
+// nat_t_connect_request (only when non-empty), mirroring the official client
+// (Network.c:5475-5482). Pass NULL for either to omit it. Uses the primary
+// relay domain with ALT failover (same as nat_t_connect).
+int nat_t_connect_ex(uint32_t server_ip_net, const char* svc_name,
+                     const char* hint, const char* target_hostname,
+                     uint32_t timeout_ms, softether_nat_t_result_t* result,
+                     const volatile int* cancel_flag);
+
 #ifdef __cplusplus
 }
 #endif

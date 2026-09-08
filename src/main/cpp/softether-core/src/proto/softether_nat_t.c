@@ -153,13 +153,9 @@ static int nat_t_parse_response(const uint8_t* buf, uint32_t len, uint64_t tran_
     uint32_t ok = 0;
     pack_get_int(buf, len, "ok", &ok);
     if (ok != 0) {
-        uint32_t multi_candidates = 0;
-        pack_get_int(buf, len, "multi_candidates", &multi_candidates);
-        if (multi_candidates != 0) {
-            result->error_code = NAT_T_ERR_TWO_OR_MORE;
-            return -1;
-        }
-
+        // Success has priority over multi_candidates, exactly as the official
+        // client (Network.c:5414-5445): it only looks at multi_candidates when
+        // ok is false.
         char result_ip_str[INET_ADDRSTRLEN] = {0};
         if (pack_get_str(buf, len, "result_ip", result_ip_str,
                          sizeof(result_ip_str)) != 0) {
@@ -196,11 +192,18 @@ static int nat_t_parse_response(const uint8_t* buf, uint32_t len, uint64_t tran_
 }
 
 static int nat_t_connect_internal(uint32_t server_ip_net, const char* svc_name,
+                                  const char* hint, const char* target_hostname,
                                   uint32_t timeout_ms,
                                   softether_nat_t_result_t* result,
                                   const volatile int* cancel_flag, int use_alt) {
     if (result == NULL) {
         return -1;
+    }
+    if (hint != NULL && hint[0] == '\0') {
+        hint = NULL;
+    }
+    if (target_hostname != NULL && target_hostname[0] == '\0') {
+        target_hostname = NULL;
     }
     memset(result, 0, sizeof(*result));
     result->udp_fd = -1;
@@ -341,6 +344,12 @@ static int nat_t_connect_internal(uint32_t server_ip_net, const char* svc_name,
                 pack_add_int64(p, "tran_id", tran_id);
                 pack_add_str(p, "dest_ip", ip_str);
                 pack_add_int64(p, "cookie", current_cookie);
+                if (hint != NULL) {
+                    pack_add_str(p, "hint", hint);
+                }
+                if (target_hostname != NULL) {
+                    pack_add_str(p, "target_hostname", target_hostname);
+                }
                 pack_add_str(p, "svc_name", svc_name);
                 pack_add_int(p, "nat_traversal_version", NAT_T_TRAVERSAL_VERSION);
 
@@ -385,16 +394,26 @@ static int nat_t_connect_internal(uint32_t server_ip_net, const char* svc_name,
 // (softether-network.net) with an ALT-domain failover on DNS failure;
 // nat_t_connect_alt forces the ALT domain (uxcom.jp) directly — used by the
 // host-side NAT-T verification harness, mirrors a forced IsUseAlternativeHostname().
+// hint / target_hostname are optional (NULL when unused) and are forwarded in
+// the request when non-empty (Network.c:5475-5482).
 int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
                   uint32_t timeout_ms, softether_nat_t_result_t* result,
                   const volatile int* cancel_flag) {
-    return nat_t_connect_internal(server_ip_net, svc_name, timeout_ms, result,
-                                  cancel_flag, 0);
+    return nat_t_connect_internal(server_ip_net, svc_name, NULL, NULL,
+                                  timeout_ms, result, cancel_flag, 0);
 }
 
 int nat_t_connect_alt(uint32_t server_ip_net, const char* svc_name,
                       uint32_t timeout_ms, softether_nat_t_result_t* result,
                       const volatile int* cancel_flag) {
-    return nat_t_connect_internal(server_ip_net, svc_name, timeout_ms, result,
-                                  cancel_flag, 1);
+    return nat_t_connect_internal(server_ip_net, svc_name, NULL, NULL,
+                                  timeout_ms, result, cancel_flag, 1);
+}
+
+int nat_t_connect_ex(uint32_t server_ip_net, const char* svc_name,
+                     const char* hint, const char* target_hostname,
+                     uint32_t timeout_ms, softether_nat_t_result_t* result,
+                     const volatile int* cancel_flag) {
+    return nat_t_connect_internal(server_ip_net, svc_name, hint, target_hostname,
+                                  timeout_ms, result, cancel_flag, 0);
 }
