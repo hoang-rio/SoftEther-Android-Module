@@ -195,9 +195,10 @@ static int nat_t_parse_response(const uint8_t* buf, uint32_t len, uint64_t tran_
     return -1;
 }
 
-int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
-                  uint32_t timeout_ms, softether_nat_t_result_t* result,
-                  const volatile int* cancel_flag) {
+static int nat_t_connect_internal(uint32_t server_ip_net, const char* svc_name,
+                                  uint32_t timeout_ms,
+                                  softether_nat_t_result_t* result,
+                                  const volatile int* cancel_flag, int use_alt) {
     if (result == NULL) {
         return -1;
     }
@@ -213,7 +214,8 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
     }
 
     char relay_hostname[NAT_T_HOSTNAME_MAX];
-    if (nat_t_build_hostname(server_ip_net, relay_hostname, sizeof(relay_hostname)) != 0) {
+    if (nat_t_build_hostname_internal(server_ip_net, use_alt, relay_hostname,
+                                      sizeof(relay_hostname)) != 0) {
         LOGE("nat_t: failed to build relay hostname");
         return -1;
     }
@@ -222,8 +224,12 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
     if (nat_t_resolve_relay(relay_hostname, &relay_ip) != 0) {
         // Primary relay domain failed to resolve: fail over to the ALT domain
         // (uxcom.jp). Mirrors the official client's alternate-hostname path in
-        // RUDPGetRegisterHostNameByIP (Network.c:4650-4653); the primary tag is
-        // retried only after a clean DNS failure so normal operation is unchanged.
+        // RUDPGetRegisterHostNameByIP (Network.c:4650-4653). When use_alt was
+        // already forced there is nothing left to try.
+        if (use_alt) {
+            result->error_code = NAT_T_ERR_GETIP_FAILED;
+            return -1;
+        }
         LOGD("nat_t: primary relay unresolvable, failing over to ALT domain");
         if (nat_t_build_hostname_internal(server_ip_net, 1, relay_hostname,
                                           sizeof(relay_hostname)) != 0 ||
@@ -373,4 +379,22 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
         close(fd);
     }
     return -1;
+}
+
+// Public entry points. nat_t_connect uses the primary relay domain
+// (softether-network.net) with an ALT-domain failover on DNS failure;
+// nat_t_connect_alt forces the ALT domain (uxcom.jp) directly — used by the
+// host-side NAT-T verification harness, mirrors a forced IsUseAlternativeHostname().
+int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
+                  uint32_t timeout_ms, softether_nat_t_result_t* result,
+                  const volatile int* cancel_flag) {
+    return nat_t_connect_internal(server_ip_net, svc_name, timeout_ms, result,
+                                  cancel_flag, 0);
+}
+
+int nat_t_connect_alt(uint32_t server_ip_net, const char* svc_name,
+                      uint32_t timeout_ms, softether_nat_t_result_t* result,
+                      const volatile int* cancel_flag) {
+    return nat_t_connect_internal(server_ip_net, svc_name, timeout_ms, result,
+                                  cancel_flag, 1);
 }

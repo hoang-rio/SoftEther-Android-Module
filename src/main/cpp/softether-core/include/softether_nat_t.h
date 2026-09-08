@@ -51,6 +51,12 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
                   uint32_t timeout_ms, softether_nat_t_result_t* result,
                   const volatile int* cancel_flag);
 
+// Same as nat_t_connect but forces the ALT relay domain (uxcom.jp) instead of
+// the primary (softether-network.net). Useful to verify the ALT NAT-T servers.
+int nat_t_connect_alt(uint32_t server_ip_net, const char* svc_name,
+                      uint32_t timeout_ms, softether_nat_t_result_t* result,
+                      const volatile int* cancel_flag);
+
 #ifdef __cplusplus
 }
 #endif
