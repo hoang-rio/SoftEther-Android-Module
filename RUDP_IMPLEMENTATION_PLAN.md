@@ -82,9 +82,9 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 ### Open Items
 
 1. **OpenVPN fallback for UDP-only servers** — parse column 14 base64 OpenVPN config, connect via OpenVPN library. This is the only viable path for UDP-only servers.
-2. **SvcNameHash XOR (confirmed missing)** — DNS/ICMP transports XOR the RUDP signature with `SvcNameHash` (SHA1 of `svc_name`); zero references anywhere in `src`. R-UDP-over-DNS/ICMP can never establish against a real server. UDP-direct + NAT-T unaffected. See § RUDP Connection Parity Audit, Gap 1.
+2. **SvcNameHash XOR (IMPLEMENTED 2026-09-08)** — DNS/ICMP transports XOR the RUDP signature with `SvcNameHash` (SHA1 of Lower(Trim(`svc_name`))). Implemented in `rudp_transport.c` (compute in `rudp_transport_connect`, XOR in `rt_send_segment_now` + `rt_handle_udp_packet`). See § RUDP Connection Parity Audit, Gap 1.
 3. **On-device regression** — ICMP transport gracefully fails on production Android without root. Full NDK/SDK test not possible on this machine.
-4. **`current_rtt` never written** — declared/read but no assignment anywhere; retransmission always uses the fixed 200 ms base (§ Parity Audit, Gap 2).
+4. **`current_rtt` never written (IMPLEMENTED 2026-09-08)** — now sampled in `rt_handle_udp_packet` on each `latest_recv_my_tick` advance, deduped via new `latest_recv_my_tick2` (§ Parity Audit, Gap 2).
 5. **ICMP client parity** — no rand-size Echo keep-alive; init sent as Echo-Request instead of Echo-Response/Info-Request (§ Parity Audit, Gap 3).
 6. **ALT relay hostname fallback** — only the `softether-network.net` tag; official client shards to `.uxcom.jp` via `IsUseAlternativeHostname()` (§ Parity Audit, Gap 4).
 
@@ -133,7 +133,7 @@ Audit of `softether_nat_t.c` / `rudp_transport.c` against the official client (`
 
 ### Recommended fix scope
 
-- **Gap 1 + Gap 2**: small, isolated changes in `rudp_transport.c`. Gap 1 is required for DNS/ICMP transports to work at all; Gap 2 lets the retransmit interval adapt to RTT.
+- **Gap 1 + Gap 2**: small, isolated changes in `rudp_transport.c` — **done 2026-09-08** (see Open Items 2 & 4). Gap 1 is required for DNS/ICMP transports to work at all; Gap 2 lets the retransmit interval adapt to RTT.
 - **Gaps 3–6**: optional robustness/parity; not needed for the UDP-only VPN Gate path (UDP-direct + NAT-T already work, and the only working UDP-only path is OpenVPN fallback).
 - Gap 5/6 can be dropped entirely if later work never needs hostname-hint or multi-candidate relays.
 

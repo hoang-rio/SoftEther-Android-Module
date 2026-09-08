@@ -1,5 +1,6 @@
 #include "rudp_transport.h"
 #include "softether_crypto.h"
+#include "softether_nat_t.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -132,6 +133,7 @@ typedef struct {
     uint64_t last_recv_complete_seq;
     uint64_t your_tick;
     uint64_t latest_recv_my_tick;
+    uint64_t latest_recv_my_tick2;
     uint32_t current_rtt;
     uint64_t last_sent_tick;
     uint64_t next_keepalive_interval;
@@ -170,6 +172,8 @@ struct rudp_transport {
     uint16_t dns_tran_id;        // DNS transaction ID (for DNS mode)
     uint8_t client_icmp_id[2];   // ICMP identifier (for ICMP mode)
     uint8_t client_icmp_seq[2];  // ICMP sequence number (for ICMP mode)
+    int svc_name_hash_valid;                     // SvcNameHash computed (DNS/ICMP modes)
+    uint8_t svc_name_hash[RUDP_T_SHA1_SIZE];     // SHA1(trim+lower(svc_name))
     rt_session_t se;
 };
 
@@ -368,8 +372,15 @@ static void rt_send_segment_now(rudp_transport_t* t, uint64_t seq,
     rc4_crypt(key, RUDP_T_SHA1_SIZE, pkt + RUDP_T_SHA1_SIZE * 2,
               current_size - RUDP_T_SHA1_SIZE * 2);
 
-    // Sign over the whole packet, then overwrite the SIGN slot
+    // Sign over the whole packet, then overwrite the SIGN slot.
+    // DNS/ICMP modes XOR the signature with SvcNameHash (RUDPSendSegmentNow,
+    // Network.c:3984-3988).
     sha1_hash(pkt, current_size, sign);
+    if (t->svc_name_hash_valid) {
+        for (i = 0; i < RUDP_T_SHA1_SIZE; i++) {
+            sign[i] ^= t->svc_name_hash[i];
+        }
+    }
     memcpy(pkt, sign, RUDP_T_SHA1_SIZE);
 
     rt_send_udp(t, pkt, current_size);
@@ -538,12 +549,19 @@ static void rt_handle_udp_packet(rudp_transport_t* t, uint32_t src_ip,
     memcpy(pkt, buf, size);
 
     // Verify the signature: SHA1 over the whole packet with the SIGN slot
-    // replaced by Key_Recv.
+    // replaced by Key_Recv (DNS/ICMP additionally XOR SvcNameHash, mirroring
+    // RUDPCheckSignOfRecvPacket / RUDPProcessRecvPacket, Network.c:3090-3093,
+    // :3385-3388).
     memcpy(sign, pkt, RUDP_T_SHA1_SIZE);
     memcpy(pkt, se->key_recv, RUDP_T_SHA1_SIZE);
     {
         uint8_t sign2[RUDP_T_SHA1_SIZE];
         sha1_hash(pkt, size, sign2);
+        if (t->svc_name_hash_valid) {
+            for (i = 0; i < RUDP_T_SHA1_SIZE; i++) {
+                sign2[i] ^= t->svc_name_hash[i];
+            }
+        }
         memcpy(pkt, sign, RUDP_T_SHA1_SIZE);
         if (memcmp(sign, sign2, RUDP_T_SHA1_SIZE) != 0) {
             LOGD("rt: sign verify FAILED on %u-byte pkt (state=%d)",
@@ -596,6 +614,14 @@ static void rt_handle_udp_packet(rudp_transport_t* t, uint32_t src_ip,
         if (my_tick > se->your_tick) se->your_tick = my_tick;
         if (your_tick > se->latest_recv_my_tick) {
             se->latest_recv_my_tick = your_tick;
+        }
+        // RTT sample on the first tick advance after a change, deduped via
+        // latest_recv_my_tick2 (RUDPProcessRecvPacket, Network.c:3506-3511).
+        if (se->latest_recv_my_tick2 != se->latest_recv_my_tick) {
+            uint64_t now_ms = rt_tick64();
+            se->latest_recv_my_tick2 = se->latest_recv_my_tick;
+            se->current_rtt = (now_ms >= se->latest_recv_my_tick) ?
+                (uint32_t)(now_ms - se->latest_recv_my_tick) : 0;
         }
 
         seq_no = rt_r64(p);
@@ -994,6 +1020,23 @@ static void rt_derive_keys(rt_session_t* se) {
     }
 }
 
+// SvcNameHash = SHA1(trim + lower(svc_name)), used to XOR the RUDP segment
+// signature in DNS/ICMP modes (mirrors NewRUDP at Network.c:5777-5781). The
+// connection transport uses the single service name the client sends
+// ("SoftEther_VPN" == VPN_RUDP_SVC_NAME == NAT_T_SVC_NAME).
+static void rt_compute_svc_name_hash(uint8_t out[RUDP_T_SHA1_SIZE]) {
+    const char* name = NAT_T_SVC_NAME;
+    char buf[128];
+    size_t n = 0;
+    while (name[n] != '\0' && n < sizeof(buf) - 1) {
+        char c = name[n];
+        buf[n] = (char)((c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
+        n++;
+    }
+    buf[n] = '\0';
+    sha1_hash((const uint8_t*)buf, (uint32_t)n, out);
+}
+
 static int rt_set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
@@ -1020,6 +1063,16 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
                                               : RUDP_T_TIMEOUT_MS;
     t->connect_timeout_ms = timeout_ms;
     t->transport_mode = cfg->transport_mode;
+
+    // DNS/ICMP modes sign segments with SHA1(trim+lower(svc_name)) XOR'd in
+    // (RUDPSendSegmentNow / RUDPCheckSignOfRecvPacket, Network.c:3984-3988,
+    // :3385-3388). Plain UDP needs no XOR.
+    t->svc_name_hash_valid = 0;
+    if (t->transport_mode == RUDP_T_MODE_DNS ||
+        t->transport_mode == RUDP_T_MODE_ICMP) {
+        rt_compute_svc_name_hash(t->svc_name_hash);
+        t->svc_name_hash_valid = 1;
+    }
 
     // Create the appropriate socket for the transport mode
     if (cfg->udp_fd >= 0) {
