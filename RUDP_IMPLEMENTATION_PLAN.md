@@ -82,8 +82,11 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 ### Open Items
 
 1. **OpenVPN fallback for UDP-only servers** — parse column 14 base64 OpenVPN config, connect via OpenVPN library. This is the only viable path for UDP-only servers.
-2. **SvcNameHash XOR** — DNS/ICMP transports XOR SHA1 signature with `SvcNameHash`. Not implemented — may cause server-side rejection.
+2. **SvcNameHash XOR (confirmed missing)** — DNS/ICMP transports XOR the RUDP signature with `SvcNameHash` (SHA1 of `svc_name`); zero references anywhere in `src`. R-UDP-over-DNS/ICMP can never establish against a real server. UDP-direct + NAT-T unaffected. See § RUDP Connection Parity Audit, Gap 1.
 3. **On-device regression** — ICMP transport gracefully fails on production Android without root. Full NDK/SDK test not possible on this machine.
+4. **`current_rtt` never written** — declared/read but no assignment anywhere; retransmission always uses the fixed 200 ms base (§ Parity Audit, Gap 2).
+5. **ICMP client parity** — no rand-size Echo keep-alive; init sent as Echo-Request instead of Echo-Response/Info-Request (§ Parity Audit, Gap 3).
+6. **ALT relay hostname fallback** — only the `softether-network.net` tag; official client shards to `.uxcom.jp` via `IsUseAlternativeHostname()` (§ Parity Audit, Gap 4).
 
 ### Key Source References
 
@@ -98,6 +101,41 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 | OpenVPN listener (server) | `SoftEtherVPN_Stable/src/Cedar/Interop_OpenVPN.c:2760` |
 | R-UDP listener (server) | `SoftEtherVPN_Stable/src/Cedar/Server.c:11107` (port 0, random) |
 | NAT-T error codes | `softether_nat_t.h` (0=OK, 5=TWO_OR_MORE, 6=NOT_FOUND) |
+
+---
+
+## RUDP Connection Parity Audit vs Official Client (2026-09-08)
+
+Audit of `softether_nat_t.c` / `rudp_transport.c` against the official client (`SoftEtherVPN_Stable/src/Mayaqua/Network.c`, `Cedar/Protocol.c`, `Cedar/Listener.c`), focused on the **no-TCP connect path** (`NewRUDPClientDirect(VPN_RUDP_SVC_NAME, …)` for `PortUDP ≠ 0`, and `ConnectEx4` parallel race for `PortUDP == 0`).
+
+### Verified identical (no work needed)
+
+| Mechanism | Official | Ours |
+|-----------|----------|------|
+| Session key derivation | `Network.c:4110-4184` (`"zurukko"`→key1, `"yasushineko"`→key2; `Magic_KeepAliveRequest/Response`; client-only `Magic_Disconnect = 0xffffffff00000000 \| Rand32`) | `rudp_transport.c:949-995` |
+| 39-byte init (`Key_Init` + 19 random), resent every 200 ms; server creates session on `<40B` pkt | `Network.c:2750-2789`, `:2077` | `rudp_transport.c:694-703` |
+| V1 segment framing `[Sign][IV][RC4(iv‖Key, hdr+payload)][1..255 pad]` + RC4 keying | `RUDPProcessRecvPacket` (`Network.c:3360-3540`) | `rt_send_segment_now` / `rt_handle_udp_packet` |
+| First payload = BE(`Magic_Disconnect`) | `Network.c:2400` | `rudp_transport.c:1109-1113` |
+| Keepalive + retransmit backoff `RTT*1.2*2^shift` / `200ms*2^shift`, cap 4792 | `Network.c:2680-2682` | `rudp_transport.c:772-793` |
+| NAT-T: relay hostname derivation (SHA1(ip) → 4 lowercase hex), port 5004, version 1, interval 200, backoff `200 * 2^max(tries,6)`, error map, `svc_name` | `Network.c:4627-4663`, `Network.h:765-804` | `softether_nat_t.c` |
+| NAT-T rendezvous socket reuse except same-LAN | `Network.c:5526-5539` | `softether_protocol.c:1643` + `:1937` |
+| Connect flow: UDP-only → parallel race; TCP-available → sequential TCP (IPv4/IPv6 fallback) + TLS → race fallback | `Cedar/Protocol.c:7577` (`PortUDP` split), `Network.c:16287` | `softether_protocol.c:2396-2479` |
+| `svc_name` constant | `VPN_RUDP_SVC_NAME == "SoftEther_VPN"` (`Cedar.h:304`) | `NAT_T_SVC_NAME` (`softether_nat_t.h:13`) |
+
+### Gaps (verified missing in current source)
+
+1. **SvcNameHash XOR — correctness, DNS+ICMP modes only.** Official client XORs the RUDP segment signature with `SvcNameHash` (SHA1 of `svc_name`) on send (`Network.c:3986`) and verify (`Network.c:3092`, `:3387`) when `Protocol == DNS|ICMP`. Ours signs without it (zero refs to `SvcNameHash` in `src`), so R-UDP-over-DNS/ICMP signatures never validate on either side → those race threads can never establish. UDP-direct + NAT-T (plain-UDP protocol) are unaffected. Fix: compute `SHA1("SoftEther_VPN")` once per connect in DNS/ICMP mode and XOR into both outbound sign (`rt_send_segment_now`) and inbound verify (`rt_handle_udp_packet`).
+2. **`current_rtt` never written — perf only.** Official updates `CurrentRtt = now - LatestRecvMyTick` on each valid segment, deduped via `LatestRecvMyTick2` (`Network.c:3508-3511`). Ours declares/reads it (`rudp_transport.c:135`, `:781`) but never assigns → always fixed 200 ms retransmit base. Fix: set it in `rt_handle_udp_packet` when `your_tick` advances, with a dedupe guard.
+3. **ICMP client parity — robustness, ICMP-only.** Official client periodically sends a random-size (64–127 B) ICMP Echo Request to keep the NAT mapping alive (`Network.c:2765-2773`) and sends the init as *both* Echo-Response and Info-Request (`Network.c:2776-2777`). Ours sends all ICMP as Echo-Request only, no keep-alive ping. Self-consistent but diverges from the firewall-bypass trick. Low priority (raw socket needs root).
+4. **ALT relay hostname fallback — robustness.** Official shards to `x%c.x%c.servers.nat-traversal.uxcom.jp.` when `IsUseAlternativeHostname()` (`Network.c:4650-4653`); ours hardcodes the primary `softether-network.net` tag (`softether_nat_t.c:60`).
+5. **`hint` / `target_hostname` in NAT-T request — dormant.** Official adds them when non-empty (`Network.c:5475-5482`); ours doesn't accept them. Empty for direct-IP VPN Gate targets, so no practical impact until hostname-with-hint support is wanted.
+6. **`ok && multi_candidates` precedence — cosmetic.** Ours returns TWO_OR_MORE when both set (`softether_nat_t.c:144-150`); official only looks at multi_candidates when `ok == 0` (`Network.c:5436-5445`). Relay never sets both.
+
+### Recommended fix scope
+
+- **Gap 1 + Gap 2**: small, isolated changes in `rudp_transport.c`. Gap 1 is required for DNS/ICMP transports to work at all; Gap 2 lets the retransmit interval adapt to RTT.
+- **Gaps 3–6**: optional robustness/parity; not needed for the UDP-only VPN Gate path (UDP-direct + NAT-T already work, and the only working UDP-only path is OpenVPN fallback).
+- Gap 5/6 can be dropped entirely if later work never needs hostname-hint or multi-candidate relays.
 
 ---
 
