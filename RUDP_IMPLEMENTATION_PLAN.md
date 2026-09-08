@@ -86,7 +86,7 @@ The only viable path for UDP-only servers is **OpenVPN fallback** using `OpenVPN
 3. **On-device regression** — ICMP transport gracefully fails on production Android without root. Full NDK/SDK test not possible on this machine.
 4. **`current_rtt` never written (IMPLEMENTED 2026-09-08)** — now sampled in `rt_handle_udp_packet` on each `latest_recv_my_tick` advance, deduped via new `latest_recv_my_tick2` (§ Parity Audit, Gap 2).
 5. **ICMP client parity** — no rand-size Echo keep-alive; init sent as Echo-Request instead of Echo-Response/Info-Request (§ Parity Audit, Gap 3).
-6. **ALT relay hostname fallback** — only the `softether-network.net` tag; official client shards to `.uxcom.jp` via `IsUseAlternativeHostname()` (§ Parity Audit, Gap 4).
+6. **ALT relay hostname fallback (IMPLEMENTED 2026-09-08)** — primary + ALT relay tags added; `nat_t_connect` fails over to `.uxcom.jp` when the `softether-network.net` relay fails to resolve (§ Parity Audit, Gap 4).
 
 ### Key Source References
 
@@ -127,14 +127,15 @@ Audit of `softether_nat_t.c` / `rudp_transport.c` against the official client (`
 1. **SvcNameHash XOR — correctness, DNS+ICMP modes only.** Official client XORs the RUDP segment signature with `SvcNameHash` (SHA1 of `svc_name`) on send (`Network.c:3986`) and verify (`Network.c:3092`, `:3387`) when `Protocol == DNS|ICMP`. Ours signs without it (zero refs to `SvcNameHash` in `src`), so R-UDP-over-DNS/ICMP signatures never validate on either side → those race threads can never establish. UDP-direct + NAT-T (plain-UDP protocol) are unaffected. Fix: compute `SHA1("SoftEther_VPN")` once per connect in DNS/ICMP mode and XOR into both outbound sign (`rt_send_segment_now`) and inbound verify (`rt_handle_udp_packet`).
 2. **`current_rtt` never written — perf only.** Official updates `CurrentRtt = now - LatestRecvMyTick` on each valid segment, deduped via `LatestRecvMyTick2` (`Network.c:3508-3511`). Ours declares/reads it (`rudp_transport.c:135`, `:781`) but never assigns → always fixed 200 ms retransmit base. Fix: set it in `rt_handle_udp_packet` when `your_tick` advances, with a dedupe guard.
 3. **ICMP client parity — robustness, ICMP-only.** Official client periodically sends a random-size (64–127 B) ICMP Echo Request to keep the NAT mapping alive (`Network.c:2765-2773`) and sends the init as *both* Echo-Response and Info-Request (`Network.c:2776-2777`). Ours sends all ICMP as Echo-Request only, no keep-alive ping. Self-consistent but diverges from the firewall-bypass trick. Low priority (raw socket needs root).
-4. **ALT relay hostname fallback — robustness.** Official shards to `x%c.x%c.servers.nat-traversal.uxcom.jp.` when `IsUseAlternativeHostname()` (`Network.c:4650-4653`); ours hardcodes the primary `softether-network.net` tag (`softether_nat_t.c:60`).
+4. **ALT relay hostname fallback — robustness (IMPLEMENTED).** Official shards to `x%c.x%c.servers.nat-traversal.uxcom.jp.` when `IsUseAlternativeHostname()` (`Network.c:4650-4653`); note that function returns `false` unconditionally in the stable client, so ours instead fails over to the ALT tag only when the primary relay domain fails to resolve (`softether_nat_t.c`, `nat_t_build_hostname_internal` + `nat_t_connect`).
 5. **`hint` / `target_hostname` in NAT-T request — dormant.** Official adds them when non-empty (`Network.c:5475-5482`); ours doesn't accept them. Empty for direct-IP VPN Gate targets, so no practical impact until hostname-with-hint support is wanted.
 6. **`ok && multi_candidates` precedence — cosmetic.** Ours returns TWO_OR_MORE when both set (`softether_nat_t.c:144-150`); official only looks at multi_candidates when `ok == 0` (`Network.c:5436-5445`). Relay never sets both.
 
 ### Recommended fix scope
 
 - **Gap 1 + Gap 2**: small, isolated changes in `rudp_transport.c` — **done 2026-09-08** (see Open Items 2 & 4). Gap 1 is required for DNS/ICMP transports to work at all; Gap 2 lets the retransmit interval adapt to RTT.
-- **Gaps 3–6**: optional robustness/parity; not needed for the UDP-only VPN Gate path (UDP-direct + NAT-T already work, and the only working UDP-only path is OpenVPN fallback).
+- **Gap 4**: ALT relay-domain failover in `softether_nat_t.c` — **done 2026-09-08** (see Open Item 6).
+- **Gaps 3, 5, 6**: remaining optional items, not needed for the UDP-only VPN Gate path (UDP-direct + NAT-T already work, and the only working UDP-only path is OpenVPN fallback).
 - Gap 5/6 can be dropped entirely if later work never needs hostname-hint or multi-candidate relays.
 
 ---

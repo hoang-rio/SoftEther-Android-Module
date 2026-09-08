@@ -34,7 +34,9 @@ typedef struct {
     int error_code;         // NAT_T_ERR_* on failure
 } softether_nat_t_result_t;
 
-// Derive the NAT-T relay hostname for a target IPv4 address.
+// Derive the NAT-T relay hostname for a target IPv4 address (primary relay
+// domain, softether-network.net). nat_t_connect falls back to the ALT domain
+// (uxcom.jp, mirroring UDP_NAT_T_SERVER_TAG_ALT) if the primary fails to resolve.
 // server_ip_net: target IP in network byte order (sin_addr.s_addr).
 // dst must hold at least 96 bytes.
 int nat_t_build_hostname(uint32_t server_ip_net, char* dst, size_t dst_size);

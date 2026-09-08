@@ -37,7 +37,14 @@ static void nat_t_ip_to_str(uint32_t ip_net, char* dst, size_t dst_size) {
     }
 }
 
-int nat_t_build_hostname(uint32_t server_ip_net, char* dst, size_t dst_size) {
+// Relay domains (mirror UDP_NAT_T_SERVER_TAG / _ALT, Network.h:765-766).
+// The ALT domain is used as a DNS-failure fallback in nat_t_connect.
+#define NAT_T_RELAY_TAG_PRIMARY  "x%c.x%c.servers.nat-traversal.softether-network.net."
+#define NAT_T_RELAY_TAG_ALT      "x%c.x%c.servers.nat-traversal.uxcom.jp."
+
+// use_alt: 0 = primary relay domain, 1 = ALT domain (uxcom.jp).
+static int nat_t_build_hostname_internal(uint32_t server_ip_net, int use_alt,
+                                         char* dst, size_t dst_size) {
     if (dst == NULL || dst_size < NAT_T_HOSTNAME_MAX) {
         return -1;
     }
@@ -57,9 +64,13 @@ int nat_t_build_hostname(uint32_t server_ip_net, char* dst, size_t dst_size) {
     tmp[3] = hex[hash[1] & 0xF];
     tmp[4] = '\0';
 
-    snprintf(dst, dst_size, "x%c.x%c.servers.nat-traversal.softether-network.net.",
+    snprintf(dst, dst_size, use_alt ? NAT_T_RELAY_TAG_ALT : NAT_T_RELAY_TAG_PRIMARY,
              tmp[2], tmp[3]);
     return 0;
+}
+
+int nat_t_build_hostname(uint32_t server_ip_net, char* dst, size_t dst_size) {
+    return nat_t_build_hostname_internal(server_ip_net, 0, dst, dst_size);
 }
 
 // Resolve the relay hostname to a single IPv4 address (first A record).
@@ -209,8 +220,17 @@ int nat_t_connect(uint32_t server_ip_net, const char* svc_name,
 
     uint32_t relay_ip = 0;
     if (nat_t_resolve_relay(relay_hostname, &relay_ip) != 0) {
-        result->error_code = NAT_T_ERR_GETIP_FAILED;
-        return -1;
+        // Primary relay domain failed to resolve: fail over to the ALT domain
+        // (uxcom.jp). Mirrors the official client's alternate-hostname path in
+        // RUDPGetRegisterHostNameByIP (Network.c:4650-4653); the primary tag is
+        // retried only after a clean DNS failure so normal operation is unchanged.
+        LOGD("nat_t: primary relay unresolvable, failing over to ALT domain");
+        if (nat_t_build_hostname_internal(server_ip_net, 1, relay_hostname,
+                                          sizeof(relay_hostname)) != 0 ||
+            nat_t_resolve_relay(relay_hostname, &relay_ip) != 0) {
+            result->error_code = NAT_T_ERR_GETIP_FAILED;
+            return -1;
+        }
     }
 
     int fd = -1;
