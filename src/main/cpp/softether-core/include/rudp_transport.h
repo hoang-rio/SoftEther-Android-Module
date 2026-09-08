@@ -34,6 +34,11 @@ extern "C" {
 #define RUDP_T_LOOP_WAIT_MS         100
 #define RUDP_T_MAX_SEGMENT_SIZE     512
 #define RUDP_T_MAX_NUM_ACK          64
+
+// ICMP keep-alive echo pacing (mirror RUDP_CLIENT_ECHO_REQUEST_SEND_INTERVAL_*,
+// Network.h:681-682).
+#define RUDP_T_ICMP_ECHO_INTERVAL_MIN  1000
+#define RUDP_T_ICMP_ECHO_INTERVAL_MAX  3000
 #define RUDP_T_MAX_FIFO_SIZE        (512 * 1024)
 #define RUDP_T_MAX_PACKET_SIZE      (RUDP_T_MAX_SEGMENT_SIZE + 8 * RUDP_T_MAX_NUM_ACK + \
                                      RUDP_T_SHA1_SIZE * 2 + 8 * 4 + 4 + 255)

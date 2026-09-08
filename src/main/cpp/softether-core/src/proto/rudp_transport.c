@@ -138,6 +138,9 @@ typedef struct {
     uint64_t last_sent_tick;
     uint64_t next_keepalive_interval;
     uint64_t created_tick;
+    // ICMP keep-alive echo pacing (ICMP mode, mirrors
+    // Client_Icmp_NextSendEchoRequest, Network.c:2796-2812).
+    uint64_t next_icmp_echo_tick;
     // Peer endpoint
     uint32_t your_ip;   // network byte order
     uint16_t your_port; // host byte order
@@ -172,6 +175,8 @@ struct rudp_transport {
     uint16_t dns_tran_id;        // DNS transaction ID (for DNS mode)
     uint8_t client_icmp_id[2];   // ICMP identifier (for ICMP mode)
     uint8_t client_icmp_seq[2];  // ICMP sequence number (for ICMP mode)
+    uint8_t icmp_type;           // ICMP type for DATA probes: 0 = Echo Response,
+                                 // 7 = Info Request (ICMP mode)
     int svc_name_hash_valid;                     // SvcNameHash computed (DNS/ICMP modes)
     uint8_t svc_name_hash[RUDP_T_SHA1_SIZE];     // SHA1(trim+lower(svc_name))
     rt_session_t se;
@@ -247,12 +252,16 @@ static void rt_send_udp(rudp_transport_t* t, const uint8_t* data, uint32_t size)
             LOGD("rt: DNS sendto failed: %s", strerror(errno));
         }
     } else if (t->transport_mode == RUDP_T_MODE_ICMP) {
-        // Wrap in ICMP Echo Request (28-byte overhead: 4 header + 4 echo + 20 SHA1)
+        // Wrap in ICMP Echo (28-byte overhead: 4 header + 4 echo + 20 SHA1).
+        // Mirrors the official client where DATA segments are sent as
+        // ECHO_RESPONSE (type 0) with the peer's payload type once established
+        // (Network.c:2134/2163/2191), and INFO_REQUEST (7) before the peer's
+        // type is known (Network.c:2195).
         uint8_t pkt[RUDP_T_MAX_PACKET_SIZE + 64];
         uint32_t offset = 0;
 
         // ICMP Header (4 bytes)
-        pkt[offset++] = 8;  // Type: Echo Request
+        pkt[offset++] = t->icmp_type;  // 0 = Echo Response, 7 = Info Request
         pkt[offset++] = 0;  // Code
         pkt[offset++] = 0;  // Checksum (placeholder)
         pkt[offset++] = 0;
@@ -713,6 +722,22 @@ static void rt_segment_send_fifo(rudp_transport_t* t) {
     }
 }
 
+// Send a raw ICMP Echo with a random-size payload (64..127 bytes) to keep the
+// NAT mapping alive in ICMP mode (Network.c:2796-2812). Mirrors RUDPSendPacket
+// with icmp_type = ICMP_TYPE_ECHO_REQUEST; the payload is intentionally random
+// application-layer data that the ICMP receive path discards (not an Echo
+// Reply, type 0). Sends only when the peer endpoint is known.
+static void rt_send_icmp_echo(rudp_transport_t* t) {
+    uint32_t size = (uint32_t)(rand() % 64) + 64;
+    uint8_t* pkt = (uint8_t*)malloc((size_t)size);
+    if (pkt == NULL) {
+        return;
+    }
+    generate_random_bytes(pkt, size);
+    rt_send_udp(t, pkt, size);
+    free(pkt);
+}
+
 // Periodic session processing (mirrors RUDPInterruptProc client paths)
 static void rt_interrupt(rudp_transport_t* t, uint64_t now) {
     rt_session_t* se = &t->se;
@@ -724,12 +749,32 @@ static void rt_interrupt(rudp_transport_t* t, uint64_t now) {
             uint8_t tmp[39];
             memcpy(tmp, se->key_init, RUDP_T_SHA1_SIZE);
             generate_random_bytes(tmp + RUDP_T_SHA1_SIZE, 19);
-            rt_send_udp(t, tmp, 39);
+            if (t->transport_mode == RUDP_T_MODE_ICMP) {
+                // In ICMP mode mirror the official client: send the initial
+                // keep-alive Echo Request (random 64..127 B), then the 39-byte
+                // connection probe as ECHO_RESPONSE (0) and switch later probes
+                // to INFORMATION_REQUEST (7) so the server sees both forms from
+                // the client side (Network.c:2759-2777).
+                rt_send_icmp_echo(t);
+                se->next_icmp_echo_tick = now + RUDP_T_ICMP_ECHO_INTERVAL_MIN +
+                    (uint32_t)(rand() % (RUDP_T_ICMP_ECHO_INTERVAL_MAX - RUDP_T_ICMP_ECHO_INTERVAL_MIN));
+                rt_send_udp(t, tmp, 39); // type = ECHO_RESPONSE (0)
+                t->icmp_type = 7;        // subsequent init(s) use INFORMATION_REQUEST (7)
+            } else {
+                rt_send_udp(t, tmp, 39);
+            }
             se->last_sent_tick = now;
         }
         if (now - se->created_tick >= t->connect_timeout_ms) {
             t->error_code = RUDP_T_ERR_TIMEOUT;
             rt_set_disconnected(t, 0);
+        }
+        // ICMP keep-alive echo (init stage) in between re-sends.
+        if (t->transport_mode == RUDP_T_MODE_ICMP &&
+            now >= se->next_icmp_echo_tick) {
+            rt_send_icmp_echo(t);
+            se->next_icmp_echo_tick = now + RUDP_T_ICMP_ECHO_INTERVAL_MIN +
+                (uint32_t)(rand() % (RUDP_T_ICMP_ECHO_INTERVAL_MAX - RUDP_T_ICMP_ECHO_INTERVAL_MIN));
         }
         return;
     }
@@ -793,6 +838,16 @@ static void rt_interrupt(rudp_transport_t* t, uint64_t now) {
         }
         se->next_keepalive_interval = RUDP_T_KEEPALIVE_MIN +
             (uint32_t)(rand() % (RUDP_T_KEEPALIVE_MAX - RUDP_T_KEEPALIVE_MIN));
+    }
+
+    // ICMP keep-alive echo while established (Network.c:2796-2812): random-size
+    // Echo Request on a 1-3s random interval. The 39-byte DATA probes are sent
+    // as type 0 (ECHO_RESPONSE) / 7 (INFO_REQUEST) by rt_send_udp, keeping the
+    // keep-alive and key-carrying packets distinguishable.
+    if (t->transport_mode == RUDP_T_MODE_ICMP && now >= se->next_icmp_echo_tick) {
+        rt_send_icmp_echo(t);
+        se->next_icmp_echo_tick = now + RUDP_T_ICMP_ECHO_INTERVAL_MIN +
+            (uint32_t)(rand() % (RUDP_T_ICMP_ECHO_INTERVAL_MAX - RUDP_T_ICMP_ECHO_INTERVAL_MIN));
     }
 
     // Retransmit due segments with exponential backoff
@@ -902,8 +957,10 @@ static void* rt_worker(void* param) {
                 uint32_t icmp_offset = ip_header_size;
                 if (payload_size >= icmp_offset + 28) {
                     uint8_t type = buf[icmp_offset];
-                    // Accept Echo Response (0) or Echo Request (8)
-                    if (type == 0 || type == 8) {
+                    // Accept Echo Response (0), Echo Request (8), or Info
+                    // Request/Reply (7/15) — the official client exchanges probes
+                    // as ECHO_RESPONSE and INFORMATION_REQUEST (Network.c:2776-2777).
+                    if (type == 0 || type == 7 || type == 15 || type == 8) {
                         payload = buf + icmp_offset + 8 + RUDP_T_SHA1_SIZE; // skip ICMP header(4)+Echo(4)+SHA1(20)
                         payload_size -= (icmp_offset + 8 + RUDP_T_SHA1_SIZE);
                     } else {
@@ -1092,6 +1149,11 @@ int rudp_transport_connect(rudp_transport_t* t, const rudp_transport_config_t* c
         t->client_icmp_id[1] = (uint8_t)(my_icmp_id & 0xFF);
         t->client_icmp_seq[0] = (uint8_t)(my_icmp_seq >> 8);
         t->client_icmp_seq[1] = (uint8_t)(my_icmp_seq & 0xFF);
+        // First DATA probe is sent as ECHO_RESPONSE (0); subsequent probes and
+        // the keep-alive pulse use INFORMATION_REQUEST (7). Mirrors the official
+        // client's Icmp_Type handoff (Network.c:2134/2163/2191/2195).
+        t->icmp_type = 0;
+        t->se.next_icmp_echo_tick = 0;
         // ICMP uses "port" 0 (the echo ID) as the server port for addressing
         t->se.your_port = 0;  // ICMP has no port; addressed by IP only
     } else {
