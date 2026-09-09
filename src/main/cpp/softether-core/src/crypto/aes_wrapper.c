@@ -388,12 +388,20 @@ void ssl_destroy(ssl_context_t* ctx) {
     }
     
     pthread_rwlock_wrlock(&g_tls_use_lock);
+    // SSL_free/SSL_CTX_free release provider-cached EVP_MD/EVP_MAC refs from
+    // the process-global provider store — the same registry every data-path
+    // call serializes under g_openssl_lock. Holding only g_tls_use_lock here
+    // lets the shared digest refcounts race with a concurrent SSL_read/write
+    // or digest on another connection (scudo invalid-chunk in evp_md_free_int
+    // inside SSL_CTX_free). Lock order stays g_tls_use_lock -> g_openssl_lock.
+    pthread_mutex_lock(&g_openssl_lock);
     if (ctx->ssl) {
         SSL_free(ctx->ssl);
     }
     if (ctx->ctx) {
         SSL_CTX_free(ctx->ctx);
     }
+    pthread_mutex_unlock(&g_openssl_lock);
     pthread_rwlock_unlock(&g_tls_use_lock);
     
     free(ctx);
@@ -423,7 +431,9 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     // Attach socket to SSL
     if (SSL_set_fd(ctx->ssl, socket_fd) != 1) {
         LOGE("Failed to set SSL fd");
+        pthread_mutex_lock(&g_openssl_lock);
         SSL_free(ctx->ssl);
+        pthread_mutex_unlock(&g_openssl_lock);
         ctx->ssl = NULL;
         pthread_rwlock_unlock(&g_tls_use_lock);
         return -1;
@@ -488,7 +498,9 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
                  err_detail ? ERR_error_string(err_detail, NULL) : "none");
         }
         pthread_rwlock_unlock(&g_tls_use_lock);
+        pthread_mutex_lock(&g_openssl_lock);
         SSL_free(ctx->ssl);
+        pthread_mutex_unlock(&g_openssl_lock);
         ctx->ssl = NULL;
         return -1;
     }
@@ -496,7 +508,9 @@ int ssl_connect(ssl_context_t* ctx, int socket_fd, const char* hostname) {
     if (result != 1) {
         LOGE("SSL handshake did not complete after %d attempts", max_attempts);
         pthread_rwlock_unlock(&g_tls_use_lock);
+        pthread_mutex_lock(&g_openssl_lock);
         SSL_free(ctx->ssl);
+        pthread_mutex_unlock(&g_openssl_lock);
         ctx->ssl = NULL;
         return -1;
     }
@@ -623,7 +637,11 @@ void ssl_shutdown(ssl_context_t* ctx) {
     }
 
     pthread_rwlock_wrlock(&g_tls_use_lock);
+    // SSL_shutdown processes the record layer (provider EVP_MAC/EVP_MD), so it
+    // must be serialized under g_openssl_lock like every other OpenSSL call.
+    pthread_mutex_lock(&g_openssl_lock);
     SSL_shutdown(ctx->ssl);
+    pthread_mutex_unlock(&g_openssl_lock);
     ctx->connected = 0;
     pthread_rwlock_unlock(&g_tls_use_lock);
 }
