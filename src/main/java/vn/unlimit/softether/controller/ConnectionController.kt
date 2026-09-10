@@ -20,6 +20,7 @@ import vn.unlimit.softether.client.protocol.KeepAliveManager
 import vn.unlimit.softether.model.ClientInfo
 import vn.unlimit.softether.model.ConnectionConfig
 import vn.unlimit.softether.model.ConnectionState
+import vn.unlimit.softether.model.SoftEtherError
 import vn.unlimit.softether.terminal.TunTerminal
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -393,7 +394,7 @@ class ConnectionController(
 
         if (result != 0) {
             currentState = ConnectionState.ERROR
-            throw Exception("Connection failed with error code: $result")
+            throw Exception("Connection failed: ${SoftEtherError.getErrorString(result)} ($result)")
         }
 
         // Connection established at protocol level — run DHCP before announcing CONNECTED
