@@ -210,14 +210,14 @@ Client                              Server
 
 Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Stable` reference (`Mayaqua/Network.c`, `Cedar/Protocol.c`, `Cedar/Listener.c`). Ranked by priority.
 
-### P0 — Correctness / Crash
+### P0 — Correctness / Crash — ✅ All done (2026-09-10)
 
-| # | Issue | Location | Fix |
-|---|-------|----------|-----|
-| 1 | `disconnect()` ignores `tryLock()` return — `finally` calls `unlock()` unconditionally → `IllegalStateException` on concurrent connect+disconnect | `ConnectionController.kt:527` | Guard `unlock()` with `if (tryLock())` or use `withLock` |
-| 2 | Native error codes never mapped to human strings for UI — user sees generic "disconnected by error" | `ConnectionController.kt:394-397` | Map via `SoftEtherError.getErrorString(result)` (legacy path at `SoftEtherClient.kt:112` already does this) |
-| 3 | `attemptReconnect()` at max retries emits `DISCONNECTED` instead of `STATE_ERROR` | `ConnectionController.kt:788-793` | Set `STATE_ERROR` before calling `disconnect()` |
-| 4 | `protectedFds` (HashSet<Int>) grows unbounded across reconnects — stale FDs suppress `protect()` for new sockets | `ConnectionController.kt:1153` | Clear on each reconnect or use a WeakHashSet |
+| # | Issue | Location | Fix | Status |
+|---|-------|----------|-----|--------|
+| 1 | `disconnect()` ignores `tryLock()` return — `finally` calls `unlock()` unconditionally → `IllegalStateException` on concurrent connect+disconnect | `ConnectionController.kt:527` | Guard `unlock()` with `if (tryLock())` or use `withLock` | ✅ `6650927` |
+| 2 | Native error codes never mapped to human strings for UI — user sees generic "disconnected by error" | `ConnectionController.kt:394-397` | Map via `SoftEtherError.getErrorString(result)` (legacy path at `SoftEtherClient.kt:112` already does this) | ✅ `1ca0e00` |
+| 3 | `attemptReconnect()` at max retries emits `DISCONNECTED` instead of `STATE_ERROR` | `ConnectionController.kt:788-793` | Set `STATE_ERROR` before calling `disconnect()`; `stopVpn(disconnectByError)` broadcasts ERROR | ✅ `95e01d4` |
+| 4 | `protectedFds` (HashSet<Int>) grows unbounded across reconnects — stale FDs suppress `protect()` for new sockets | `ConnectionController.kt:1153` | Clear on each native teardown; `Collections.synchronizedSet` (multiple threads) | ✅ `ec6cc00` |
 
 ### P1 — Performance
 
@@ -259,4 +259,4 @@ Multi-connection support from the original Remaining Tasks is superseded by the 
 ---
 
 *Last Updated: 2026-09-10*
-*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; optimization audit complete*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 optimization items done, P1/P2/P3 pending*
