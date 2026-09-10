@@ -25,6 +25,7 @@ import vn.unlimit.softether.terminal.TunTerminal
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -286,6 +287,7 @@ class ConnectionController(
      */
     private fun teardownNativeConnection() {
         client.externalHandle = 0
+        protectedFds.clear()
         val handle = nativeHandle
         nativeHandle = 0
         if (handle == 0L) return
@@ -619,6 +621,7 @@ class ConnectionController(
 
         val handle = nativeHandle
         nativeHandle = 0
+        protectedFds.clear()
         if (handle != 0L) {
             try {
                 client.nativeForceCloseSocket(handle)
@@ -825,6 +828,7 @@ class ConnectionController(
             if (nativeHandle != 0L) {
                 val handle = nativeHandle
                 nativeHandle = 0
+                protectedFds.clear()
                 try {
                     client.nativeDisconnect(handle)
                     client.nativeDestroy(handle)
@@ -1157,8 +1161,12 @@ class ConnectionController(
         }
     }
 
-    // Track FDs we've already protected to avoid redundant protect() calls
-    private val protectedFds = mutableSetOf<Int>()
+    // Track FDs we've already protected to avoid redundant protect() calls.
+    // Synchronized because teardown (connect/disconnect/reconnect threads) clears
+    // it while the receive loop may be calling contain/add concurrently.
+    // Cleared on every native teardown so stale FDs from a previous session can
+    // never suppress protect() for a recycled fd number in a fresh connection.
+    private val protectedFds = Collections.synchronizedSet(mutableSetOf<Int>())
 
     /**
      * Protect any new additional TCP sockets from routing through TUN.
