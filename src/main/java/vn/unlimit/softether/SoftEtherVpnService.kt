@@ -354,7 +354,7 @@ class SoftEtherVpnService : VpnService() {
                         Log.e(TAG, "VPN Error: $error")
                         // updateNotification(getString(R.string.softether_disconnected_by_error))
                         mIsUserDisconnect = false
-                        stopVpn()
+                        stopVpn(disconnectByError = true)
                     },
                     onTrafficUpdate = { snapshot ->
                         handleTrafficUpdate(snapshot)
@@ -388,12 +388,12 @@ class SoftEtherVpnService : VpnService() {
                 Log.e(TAG, "Failed to start VPN", e)
                 // updateNotification("Connection failed: ${e.message}")
                 mIsUserDisconnect = false
-                stopVpn()
+                stopVpn(disconnectByError = true)
             }
         }
     }
 
-    private fun stopVpn() {
+    private fun stopVpn(disconnectByError: Boolean = false) {
         if (isStopping) {
             Log.d(TAG, "Already stopping, skipping re-entrant call")
             return
@@ -403,8 +403,8 @@ class SoftEtherVpnService : VpnService() {
         Log.d(TAG, "Stopping VPN")
         isRunning = false
 
-        // Send disconnect broadcast immediately so the UI reacts right away
-        sendConnectionStateBroadcast(STATE_DISCONNECTED)
+        // Send disconnect/error broadcast immediately so the UI reacts right away
+        sendConnectionStateBroadcast(if (disconnectByError) STATE_ERROR else STATE_DISCONNECTED)
         notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
 
         // Cancel the connection coroutine so it won't interfere

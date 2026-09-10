@@ -792,6 +792,9 @@ class ConnectionController(
         try {
             if (reconnectAttempts.incrementAndGet() >= MAX_RECONNECT_ATTEMPTS) {
                 Log.e(TAG, "Max reconnection attempts reached")
+                // Surface as ERROR (not silent DISCONNECTED) so the UI shows the
+                // disconnect-by-error notification and STATE_ERROR broadcast.
+                currentState = ConnectionState.ERROR
                 onError("Connection lost - max reconnection attempts reached")
                 disconnect()
                 return
