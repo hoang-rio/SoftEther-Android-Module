@@ -523,29 +523,33 @@ class ConnectionController(
         isCancelled.set(true)
         client.externalHandle = 0
 
-        // Use mutex to prevent race with connect()
-        connectionMutex.tryLock()
-        try {
-            // Update state
-            if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
-                currentState = ConnectionState.DISCONNECTING
-            }
+        // Use mutex to prevent race with connect(); tryLock keeps disconnect()
+        // non-blocking so it stays responsive on the calling thread.
+        if (connectionMutex.tryLock()) {
+            try {
+                // Update state
+                if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
+                    currentState = ConnectionState.DISCONNECTING
+                }
 
-            // Disconnect native connection (this will interrupt any blocking operations).
-            // If a connect flow is in flight, DEFER native teardown to it: the
-            // connect coroutine is blocked inside nativeConnectWithHub and owns
-            // the handle. Freeing here would either deadlock on connect_mutex or
-            // free the connection out from under the connect thread (zombie
-            // session + poisoned state for every later connect attempt).
-            if (isConnectInFlight()) {
-                Log.w(TAG, "Connect in flight - deferring native teardown to connect flow")
-            } else if (nativeHandle != 0L) {
-                teardownNativeConnection()
-            }
-        } finally {
-            if (connectionMutex.isLocked) {
+                // Disconnect native connection (this will interrupt any blocking operations).
+                // If a connect flow is in flight, DEFER native teardown to it: the
+                // connect coroutine is blocked inside nativeConnectWithHub and owns
+                // the handle. Freeing here would either deadlock on connect_mutex or
+                // free the connection out from under the connect thread (zombie
+                // session + poisoned state for every later connect attempt).
+                if (isConnectInFlight()) {
+                    Log.w(TAG, "Connect in flight - deferring native teardown to connect flow")
+                } else if (nativeHandle != 0L) {
+                    teardownNativeConnection()
+                }
+            } finally {
                 connectionMutex.unlock()
             }
+        } else {
+            // connect() holds the mutex; native teardown stays owned by the
+            // connect flow via its connectInFlight guarantee.
+            Log.w(TAG, "Connect in progress, skipping mutex-protected native teardown")
         }
 
         // Stop TunTerminal first to avoid reading from closed interface
