@@ -94,13 +94,13 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 | 3 | `attemptReconnect()` sets `STATE_ERROR` before disconnect | `95e01d4` |
 | 4 | `protectedFds` cleared on teardown, `synchronizedSet` | `ec6cc00` |
 
-### P1 — Performance
+### P1 — Performance — #6,#7 done (2026-09-10)
 
-| # | Issue | Location | Fix |
-|---|-------|----------|-----|
-| 5 | TX globally serialized by single `write_mutex` — even full-duplex (4× BOTH) sends one packet at a time | `packet_handler.c:356` | Split to per-connection transmit locks (Phase 17.1 in RUDP plan) |
-| 6 | `Thread.sleep(200)` destroy heuristic — `nativeDestroy` can block on `connect_mutex` if TLS read is slow | `ConnectionController.kt:626` | Replace with a CountDownLatch or CompletableDeferred signaled by the connect flow |
-| 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows model imports, drift risk | `SoftEtherClient.kt:456,461` vs `model/Exceptions.kt:6,26` | Keep only `model/` versions; remove file-level duplicates |
+| # | Issue | Location | Fix | Status |
+|---|-------|----------|-----|--------|
+| 5 | TX globally serialized by single `write_mutex` — even full-duplex (4× BOTH) sends one packet at a time | `packet_handler.c:356` | Split to per-connection transmit locks (Phase 17.1 in RUDP plan) | ⏳ |
+| 6 | `Thread.sleep(200)` destroy heuristic — `nativeDestroy` can block on `connect_mutex` if TLS read is slow | `ConnectionController.kt:626` | Replace with a CountDownLatch or CompletableDeferred signaled by the connect flow | ✅ `b6060c6` |
+| 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows model imports, drift risk | `SoftEtherClient.kt:456,461` vs `model/Exceptions.kt:6,26` | Keep only `model/` versions; remove file-level duplicates | ✅ `f876db8` |
 
 ### P2 — Parity with Official Client
 
@@ -126,7 +126,7 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 ### Recommended execution order
 
 ```
-P0 correctness (#1–#4) ✅ → P1 perf (#5–#7) → P2 parity (#8–#10, #9/#10 done) → P3 cleanup (#11–#16, #13 done)
+P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10, #9/#10 done) → P3 cleanup (#11–#16, #13 done)
 ```
 
 Multi-connection support from the original Remaining Tasks is superseded by the throughput optimization plan in [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 13–17.
@@ -134,4 +134,4 @@ Multi-connection support from the original Remaining Tasks is superseded by the 
 ---
 
 *Last Updated: 2026-09-11*
-*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 pending, P2 partially done (#8 partial, #9/#10 done), P3 partially done (#13 done)*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 partially done (#8 partial, #9/#10 done), P3 partially done (#13 done)*
