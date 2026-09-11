@@ -26,6 +26,8 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -47,6 +49,7 @@ class ConnectionController(
         private const val RECONNECT_DELAY_MS = 3000L
         private const val STATS_INTERVAL_MS = 1000L
         private const val RX_BATCH_MAX_PACKETS = 32  // Phase 13D: frames per receiveBatch call
+        private const val NATIVE_TEARDOWN_TIMEOUT_MS = 500L
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -58,6 +61,11 @@ class ConnectionController(
     // to DISCONNECTED immediately, but the blocked nativeConnectWithHub JNI
     // call may still hold connect_mutex long after that.
     private val connectInFlight = AtomicBoolean(false)
+    // Latches the moment a connect flow finishes owning the native handle.
+    // destroyResources() awaits it (bounded) instead of a fixed Thread.sleep
+    // heuristic before calling nativeDestroy, so a slow TLS read in the connect
+    // flow can't race the destroy. Fresh instance per connect flow.
+    private var nativeTeardownGate = CountDownLatch(1)
     private val reconnectAttempts = AtomicInteger(0)
     private val connectionMutex = Mutex()
     private var stateMonitorJob: Job? = null
@@ -263,6 +271,7 @@ class ConnectionController(
         // fresh handle under the connect thread (use-after-free crash inside
         // softether_protocol_login / ssl_write).
         connectInFlight.set(true)
+        nativeTeardownGate = CountDownLatch(1)
         try {
             nativeHandle = client.nativeCreate()
             if (nativeHandle == 0L) {
@@ -275,6 +284,7 @@ class ConnectionController(
             teardownNativeConnection()
             throw e
         } finally {
+            nativeTeardownGate.countDown()
             connectInFlight.set(false)
         }
     }
@@ -628,11 +638,14 @@ class ConnectionController(
             } catch (e: Exception) {
                 Log.e(TAG, "Error force-closing socket", e)
             }
-            // Brief yield so the blocking connect can notice the socket closure
-            // and release connect_mutex before we call nativeDestroy.
-            try {
-                Thread.sleep(200)
-            } catch (_: InterruptedException) {}
+            // Bounded wait for the connect flow to finish owning the native
+            // handle instead of a fixed Thread.sleep heuristic. If a connect
+            // flow was in flight it defers teardown entirely (see connectInFlight
+            // guard above), so in the common case this returns immediately; on a
+            // slow TLS read it still bounds the wait before nativeDestroy.
+            if (!nativeTeardownGate.await(NATIVE_TEARDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Timed out waiting for connect flow to release native handle before destroy")
+            }
 
             try {
                 client.nativeDestroy(handle)
@@ -853,7 +866,8 @@ class ConnectionController(
             // connection under the blocked reconnect thread (use-after-free
             // crash inside softether_protocol_login / ssl_write). Cleared in
             // the outer finally below.
-            connectInFlight.set(true)
+connectInFlight.set(true)
+            nativeTeardownGate = CountDownLatch(1)
 
             // Create new native connection
             nativeHandle = client.nativeCreate()
@@ -993,6 +1007,7 @@ class ConnectionController(
             currentState = ConnectionState.DISCONNECTED
             onStateChange(ConnectionState.DISCONNECTED)
         } finally {
+            nativeTeardownGate.countDown()
             connectInFlight.set(false)
             isReconnecting.set(false)
         }
