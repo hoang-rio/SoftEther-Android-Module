@@ -102,13 +102,13 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 | 6 | `Thread.sleep(200)` destroy heuristic — `nativeDestroy` can block on `connect_mutex` if TLS read is slow | `ConnectionController.kt:626` | Replace with a CountDownLatch or CompletableDeferred signaled by the connect flow | ✅ `b6060c6` |
 | 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows model imports, drift risk | `SoftEtherClient.kt:456,461` vs `model/Exceptions.kt:6,26` | Keep only `model/` versions; remove file-level duplicates | ✅ `f876db8` |
 
-### P2 — Parity with Official Client
+### P2 — Parity with Official Client — ✅ all done (2026-09-14)
 
-| # | Issue | Location | Fix |
-|---|-------|----------|-----|
-| 8 | ARP reply for LAN-side queries — proxy ARP reply exists (`softether_reply_arp_request` in `softether_protocol.c:2904-2930`), but gratuitous ARP advertisement is still missing | `softether_protocol.c` (reply), `dhcp_client.c` (no gratuitous) | Add gratuitous ARP broadcast after IP assignment (see `SoftEtherVPN_Stable/src/Cedar/Virtual.c`) |
-| 9 | ~~RUDP keepalive interval not randomized~~ | `softether_rudp.c:728-729` | ✅ Done — `rand() % (ka_max - ka_min) + ka_min` already in direct RUDP + NAT-T paths |
-| 10 | ~~RUDP `current_rtt` dedup only on `your_tick` advance~~ | `rudp_transport.c:627-634` | ✅ Done — sampled on `latest_recv_my_tick` advance, deduped via `latest_recv_my_tick2` (see RUDP plan Open Item 4) |
+| # | Issue | Location | Fix | Status |
+|---|-------|----------|-----|--------|
+| 8 | ARP reply for LAN-side queries — proxy ARP reply exists (`softether_reply_arp_request` in `softether_protocol.c:2904-2930`), but gratuitous ARP advertisement is still missing | `softether_protocol.c` (reply), `dhcp_client.c` (no gratuitous) | Add gratuitous ARP broadcast after IP assignment (see `SoftEtherVPN_Stable/src/Cedar/Virtual.c`) | ✅ `f463b41` |
+| 9 | ~~RUDP keepalive interval not randomized~~ | `softether_rudp.c:728-729` | ✅ Done — `rand() % (ka_max - ka_min) + ka_min` already in direct RUDP + NAT-T paths | ✅ |
+| 10 | ~~RUDP `current_rtt` dedup only on `your_tick` advance~~ | `rudp_transport.c:627-634` | ✅ Done — sampled on `latest_recv_my_tick` advance, deduped via `latest_recv_my_tick2` (see RUDP plan Open Item 4) | ✅ |
 
 ### P3 — Code Quality / Dead Code — ✅ all done (2026-09-14)
 
@@ -126,7 +126,7 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 ### Recommended execution order
 
 ```
-P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10, #9/#10 done) → P3 cleanup (#11–#16) ✅
+P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10) ✅ → P3 cleanup (#11–#16) ✅
 ```
 
 Multi-connection support from the original Remaining Tasks is superseded by the throughput optimization plan in [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 13–17.
@@ -134,4 +134,4 @@ Multi-connection support from the original Remaining Tasks is superseded by the 
 ---
 
 *Last Updated: 2026-09-14*
-*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 partially done (#8 partial, #9/#10 done), P3 done (#11–#16)*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 done (#8–#10), P3 done (#11–#16)*
