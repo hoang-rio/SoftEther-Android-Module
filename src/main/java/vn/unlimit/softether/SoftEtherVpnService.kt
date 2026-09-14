@@ -721,7 +721,6 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private var pendingStateRunnable: Runnable? = null
-    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private fun handleConnectionState(state: ConnectionState, hostname: String) {
         // During user-initiated stopVpn() we already sent STATE_DISCONNECTED to listeners,
