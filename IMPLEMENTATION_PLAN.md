@@ -110,28 +110,28 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 | 9 | ~~RUDP keepalive interval not randomized~~ | `softether_rudp.c:728-729` | ✅ Done — `rand() % (ka_max - ka_min) + ka_min` already in direct RUDP + NAT-T paths |
 | 10 | ~~RUDP `current_rtt` dedup only on `your_tick` advance~~ | `rudp_transport.c:627-634` | ✅ Done — sampled on `latest_recv_my_tick` advance, deduped via `latest_recv_my_tick2` (see RUDP plan Open Item 4) |
 
-### P3 — Code Quality / Dead Code
+### P3 — Code Quality / Dead Code — ✅ all done (2026-09-14)
 
-| # | Issue | Location | Fix |
-|---|-------|----------|-----|
-| 11 | 7 dead Kotlin files never referenced from main code | `PacketHandler.kt`, `HandshakeManager.kt`, `AuthManager.kt`, `SSLTerminal.kt`, `SessionState.kt`, `ByteBufferUtil.kt`, `CryptoUtil.kt` | Delete; `PacketHandler.kt` has wrong wire-format model (20-byte `SETH`) that misleads readers |
-| 12 | Dead legacy path in `SoftEtherClient.kt` | `connect()` :35-120, `setAuthType` :126, `setMaxConnection` :141, `getNumConnections` :160, `setKeepAliveInterval` :283, `setMtu` :294, `cleanup` :303 | Remove; live path goes through `ConnectionController.performConnectInner()` → `nativeConnectWithHub` |
-| 13 | ~~JNI test natives declared in header but no C implementation~~ | `softether_jni.h:63-97` | ✅ Done — implemented in `cpp/test/test_jni_bridge.c`, compiled into `softether_test` lib, loaded by androidTest |
-| 14 | Two TODO no-ops in JNI (keepalive interval, MTU) | `softether_jni.c:473,477` | Implement or remove the option codes |
-| 15 | `@Suppress("DEPRECATION")` ×4 in VpnService | `SoftEtherVpnService.kt:146/:262/:421/:847` | Migrate to `ContextCompat` equivalents |
-| 16 | Two `mainHandler` instances (companion + instance) | `SoftEtherVpnService.kt:90` vs `:734` | Consolidate into one |
+| # | Issue | Location | Fix | Status |
+|---|-------|----------|-----|--------|
+| 11 | 7 dead Kotlin files never referenced from main code | `PacketHandler.kt`, `HandshakeManager.kt`, `AuthManager.kt`, `SSLTerminal.kt`, `SessionState.kt`, `ByteBufferUtil.kt`, `CryptoUtil.kt` | Delete; `PacketHandler.kt` has wrong wire-format model (20-byte `SETH`) that misleads readers | ✅ `b035495` |
+| 12 | Dead legacy path in `SoftEtherClient.kt` | `connect()` :35-120, `setAuthType` :126, `setMaxConnection` :141, `getNumConnections` :160, `setKeepAliveInterval` :283, `setMtu` :294, `cleanup` :303 | Remove; live path goes through `ConnectionController.performConnectInner()` → `nativeConnectWithHub` | ✅ `0e44c67` |
+| 13 | ~~JNI test natives declared in header but no C implementation~~ | `softether_jni.h:63-97` | ✅ Done — implemented in `cpp/test/test_jni_bridge.c`, compiled into `softether_test` lib, loaded by androidTest | ✅ |
+| 14 | Two TODO no-ops in JNI (keepalive interval, MTU) | `softether_jni.c:473,477` | Remove the option codes — callers deleted in #12, MTU applied via `VpnService.Builder.setMtu`, keepalive native in `rudp_transport.c` | ✅ `35c5060` |
+| 15 | `@Suppress("DEPRECATION")` ×4 in VpnService | `SoftEtherVpnService.kt:146/:262/:421/:847` | Migrate to AndroidX equivalents: `NetworkCallback`/`ContextCompat`/`IntentCompat`/`ServiceCompat` | ✅ `415873e` |
+| 16 | Two `mainHandler` instances (companion + instance) | `SoftEtherVpnService.kt:90` vs `:734` | Consolidate into companion one | ✅ `a00469b` |
 
 ---
 
 ### Recommended execution order
 
 ```
-P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10, #9/#10 done) → P3 cleanup (#11–#16, #13 done)
+P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10, #9/#10 done) → P3 cleanup (#11–#16) ✅
 ```
 
 Multi-connection support from the original Remaining Tasks is superseded by the throughput optimization plan in [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 13–17.
 
 ---
 
-*Last Updated: 2026-09-11*
-*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 partially done (#8 partial, #9/#10 done), P3 partially done (#13 done)*
+*Last Updated: 2026-09-14*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 partially done (#8 partial, #9/#10 done), P3 done (#11–#16)*
