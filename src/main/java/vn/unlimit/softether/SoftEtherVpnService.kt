@@ -4,15 +4,14 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -22,6 +21,9 @@ import android.os.ParcelFileDescriptor
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -143,17 +145,15 @@ class SoftEtherVpnService : VpnService() {
     private var pendingStateUpdate: (() -> Unit)? = null
     private var currentSessionName: String? = null
 
-    @Suppress("DEPRECATION")
-    private val networkReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == ConnectivityManager.CONNECTIVITY_ACTION) {
-                val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val activeNetwork = cm?.activeNetworkInfo
-                val isConnected = activeNetwork?.isConnectedOrConnecting == true
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            Log.d(TAG, "Network available")
+            controller?.onNetworkChanged(true)
+        }
 
-                Log.d(TAG, "Network connectivity changed: isConnected=$isConnected")
-                controller?.onNetworkChanged(isConnected)
-            }
+        override fun onLost(network: Network) {
+            Log.d(TAG, "Network lost")
+            controller?.onNetworkChanged(false)
         }
     }
 
@@ -256,12 +256,7 @@ class SoftEtherVpnService : VpnService() {
         when (intent?.action) {
             ACTION_CONNECT -> {
                 mIsUserDisconnect = false
-                val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(EXTRA_CONFIG, ConnectionConfig::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(EXTRA_CONFIG)
-                }
+                val config = IntentCompat.getParcelableExtra(intent, EXTRA_CONFIG, ConnectionConfig::class.java)
 
                 if (config != null) {
                     startVpn(config)
@@ -415,12 +410,7 @@ class SoftEtherVpnService : VpnService() {
         // immediately on the main thread so the user sees "disconnected"
         // right away.
         showDisconnectedNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
 
         // Snapshot references and clear them immediately so onDestroy()
         // won't try to free the same resources concurrently.
@@ -844,17 +834,19 @@ class SoftEtherVpnService : VpnService() {
         )
     }
 
-    @Suppress("DEPRECATION")
     private fun registerNetworkReceiver() {
-        val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
-        registerReceiver(networkReceiver, filter)
+        val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
+            ?: return
+        cm.registerDefaultNetworkCallback(networkCallback)
     }
 
     private fun unregisterNetworkReceiver() {
+        val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
+            ?: return
         try {
-            unregisterReceiver(networkReceiver)
+            cm.unregisterNetworkCallback(networkCallback)
         } catch (e: IllegalArgumentException) {
-            // Receiver was not registered
+            // Callback was not registered
         }
     }
 }
