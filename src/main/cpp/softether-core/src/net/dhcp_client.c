@@ -280,6 +280,52 @@ static int parse_dhcp_response(const uint8_t* frame, uint32_t frame_len,
     return msg_type;
 }
 
+// Broadcast a gratuitous ARP announcement (sender == target == our IP)
+// so LAN peers update their ARP caches right after DHCP assignment
+// instead of waiting for the first proxy-ARP reply. Matches the official
+// client's VirtualArpSendRequest() (Cedar/Virtual.c): ARP REQUEST, sender
+// and target protocol addresses = assigned_ip, sender HW = client MAC,
+// target HW zeroed, Ethernet dest = broadcast.
+static void send_gratuitous_arp(softether_connection_t* conn, uint32_t assigned_ip) {
+    if (conn == NULL || assigned_ip == 0) return;
+
+    uint8_t frame[42];
+    memset(frame, 0, sizeof(frame));
+
+    // Ethernet header: dst = broadcast, src = client MAC, type = ARP
+    memset(frame, 0xFF, 6);
+    memcpy(frame + 6, conn->client_mac, 6);
+    frame[12] = 0x08; frame[13] = 0x06;  // ETH_P_ARP
+
+    // ARP: htype=eth(1), ptype=ipv4(0x0800), hlen=6, plen=4, op=request(1)
+    frame[14] = 0x00; frame[15] = 0x01;
+    frame[16] = 0x08; frame[17] = 0x00;
+    frame[18] = 6;    frame[19] = 4;
+    frame[20] = 0x00; frame[21] = 0x01;
+
+    // Sender HW = client MAC
+    memcpy(frame + 22, conn->client_mac, 6);
+    // Sender IP = assigned_ip
+    frame[28] = (assigned_ip >> 24) & 0xFF;
+    frame[29] = (assigned_ip >> 16) & 0xFF;
+    frame[30] = (assigned_ip >> 8) & 0xFF;
+    frame[31] = assigned_ip & 0xFF;
+    // Target HW = 00:00:00:00:00:00 (already zeroed)
+    // Target IP = assigned_ip (gratuitous self-announcement)
+    frame[38] = (assigned_ip >> 24) & 0xFF;
+    frame[39] = (assigned_ip >> 16) & 0xFF;
+    frame[40] = (assigned_ip >> 8) & 0xFF;
+    frame[41] = assigned_ip & 0xFF;
+
+    if (softether_send_raw(conn, frame, sizeof(frame)) < 0) {
+        LOGE("Failed to send gratuitous ARP");
+        return;
+    }
+    LOGD("Sent gratuitous ARP for %u.%u.%u.%u",
+         (assigned_ip >> 24) & 0xFF, (assigned_ip >> 16) & 0xFF,
+         (assigned_ip >> 8) & 0xFF, assigned_ip & 0xFF);
+}
+
 // Wait for a DHCP response with timeout
 static int wait_dhcp_response(softether_connection_t* conn,
                               uint32_t xid,
@@ -424,6 +470,10 @@ int softether_do_dhcp(softether_connection_t* conn, dhcp_result_t* result) {
                  (result->gateway >> 8) & 0xFF, result->gateway & 0xFF,
                  (result->dns_server >> 24) & 0xFF, (result->dns_server >> 16) & 0xFF,
                  (result->dns_server >> 8) & 0xFF, result->dns_server & 0xFF);
+            // Announce our new IP on the LAN (gratuitous ARP, see plan P2#8)
+            // so peers learn our MAC right away instead of waiting for a
+            // proxy-ARP reply before traffic flows.
+            send_gratuitous_arp(conn, result->assigned_ip);
             return 0;
         }
         if (msg_type == DHCP_NAK) {
