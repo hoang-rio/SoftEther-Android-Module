@@ -469,14 +469,6 @@ JNIEXPORT void JNICALL Java_vn_unlimit_softether_client_SoftEtherClient_nativeSe
             conn->timeout_ms = (int)value;
             LOGD("Set timeout to %d ms", conn->timeout_ms);
             break;
-        case 2: // OPTION_KEEPALIVE_INTERVAL
-            // TODO: Implement keepalive interval setting
-            LOGD("Set keepalive interval to %ld", (long)value);
-            break;
-        case 3: // OPTION_MTU
-            // TODO: Implement MTU setting
-            LOGD("Set MTU to %ld", (long)value);
-            break;
         case 4: // OPTION_UDP_PORT (seUdpPort) — enables the direct R-UDP stage
             conn->udp_port = (int)value;
             LOGD("Set UDP port to %d", conn->udp_port);
