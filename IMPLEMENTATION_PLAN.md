@@ -94,11 +94,11 @@ Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Sta
 | 3 | `attemptReconnect()` sets `STATE_ERROR` before disconnect | `95e01d4` |
 | 4 | `protectedFds` cleared on teardown, `synchronizedSet` | `ec6cc00` |
 
-### P1 — Performance — #6,#7 done (2026-09-10)
+### P1 — Performance — ✅ all done (2026-09-21)
 
 | # | Issue | Location | Fix | Status |
 |---|-------|----------|-----|--------|
-| 5 | TX globally serialized by single `write_mutex` — even full-duplex (4× BOTH) sends one packet at a time | `packet_handler.c:356` | Split to per-connection transmit locks (Phase 17.1 in RUDP plan) | ⏳ |
+| 5 | TX globally serialized by single `write_mutex` — even full-duplex (4× BOTH) sends one packet at a time | `packet_handler.c` | Split into per-link I/O locks: each TCP link (primary + each additional slot) gets its own `io_mutex` for all SSL read/write/keepalive, so I/O on different links is independent and a slow `SSL_write` on one link can't stall staging/reads/keepalives on healthy links. `write_mutex` retained for `send_block` staging + teardown serialization; slot retirement holds the same `io_mutex` and re-checks slot identity (lock order `ssl_lifetime → write_mutex → io`, io is a leaf) | ✅ `d225f44` |
 | 6 | `Thread.sleep(200)` destroy heuristic — `nativeDestroy` can block on `connect_mutex` if TLS read is slow | `ConnectionController.kt:626` | Replace with a CountDownLatch or CompletableDeferred signaled by the connect flow | ✅ `b6060c6` |
 | 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows model imports, drift risk | `SoftEtherClient.kt:456,461` vs `model/Exceptions.kt:6,26` | Keep only `model/` versions; remove file-level duplicates | ✅ `f876db8` |
 
