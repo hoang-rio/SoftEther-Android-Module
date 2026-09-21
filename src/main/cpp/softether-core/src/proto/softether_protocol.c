@@ -1007,6 +1007,16 @@ softether_connection_t* softether_create(void) {
     conn->additional_connect_slot = -1;
     conn->additional_connect_result = -1;
 
+    // Per-link I/O mutexes: one for the primary TCP socket and one per
+    // additional slot. Each live link owns its SSL I/O lock so I/O on one link
+    // never blocks I/O on another (see the softether_protocol.h comment on the
+    // write_mutex / io_mutex split). Initialized after the additional[] memset
+    // above, destroyed in softether_destroy().
+    pthread_mutex_init(&conn->io_mutex, NULL);
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        pthread_mutex_init(&conn->additional[i].io_mutex, NULL);
+    }
+
     // Phase 13C: preallocate the TX staging buffer once per connection so the
     // data path does zero heap allocations. Survives disconnect/reconnect.
     conn->send_block_cap = 8 + ETH_HEADER_SIZE + 65535;
@@ -1063,6 +1073,14 @@ void softether_destroy(softether_connection_t* conn) {
     pthread_mutex_destroy(&conn->write_mutex);
     pthread_mutex_destroy(&conn->connect_mutex);
     pthread_rwlock_destroy(&conn->ssl_lifetime_lock);
+
+    // Destroy the per-link I/O mutexes (no thread can use them anymore:
+    // disconnect ran above to join the receive/send paths, and the additional
+    // connect thread was joined at the top of destroy()).
+    pthread_mutex_destroy(&conn->io_mutex);
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        pthread_mutex_destroy(&conn->additional[i].io_mutex);
+    }
 
     // Release the Phase 13C TX staging buffer
     free(conn->send_block);
@@ -2711,27 +2729,38 @@ void softether_disconnect(softether_connection_t* conn) {
         close(saved_fd);
     }
 
-    // Serialize SSL-context teardown against the send path. softether_send
-    // holds write_mutex across building the block AND reading conn->ssl and
-    // transmitting it (ssl_write_all -> ssl_write -> SSL_write). If we freed
-    // conn->ssl / additional SSL contexts without write_mutex, a concurrently
-    // running sender could already hold a stale ssl_context_t* and crash in
-    // ossl_ssl_get_error (inside SSL_get_error) after ssl_destroy() free()s it.
-    // Any sender is bounded by the socket timeout (SO_SNDTIMEO/SO_RCVTIMEO set
-    // at connect) and the fd closes above force it to finish shortly, so
-    // waiting here cannot deadlock. The background additional-connect thread is
-    // joined above; this mutex is never taken while connect_mutex is held,
-    // keeping the lock order connect->write consistent.
+    // Serialize SSL-context teardown against every in-flight I/O site:
     //
-    // Take the SSL-lifetime WRITE lock BEFORE write_mutex: it must exclude the
-    // receive path (softether_fill_recv_queue), which holds the same lock READ
-    // while capturing/using conn->ssl / additional[i].ssl and only takes
-    // write_mutex afterwards via keepalive. Locking in this order (ssl_lifetime
-    // then write_mutex) keeps a single global order and prevents an AB-BA
-    // deadlock. A receiver holding READ is bounded by poll()/SSL_read, and its
-    // fd was already force-closed above, so it releases promptly.
+    //   * The send path (softether_send / softether_send_packet) builds into
+    //     conn->send_block and transmits under write_mutex. Freeing the SSL
+    //     contexts without it would let a concurrent sender crash in
+    //     ssl_get_error after ssl_destroy() free()s the context. Any sender is
+    //     bounded by the socket timeout and the fd closes above force it to
+    //     finish shortly, so waiting here cannot deadlock. The background
+    //     additional-connect thread is joined above; this mutex is never taken
+    //     while connect_mutex is held, keeping the lock order connect->write
+    //     consistent.
+    //
+    //   * The receive path (softether_fill_recv_queue) holds ssl_lifetime_lock
+    //     in READ mode across its whole pass (capture + poll + SSL_read).
+    //     Locking it in WRITE mode here excludes every receiver; a receiver
+    //     holding READ is bounded by poll()/SSL_read and its fd was already
+    //     force-closed above, so it releases promptly.
+    //
+    //   * Reads, writes and keepalives on a live link hold ONLY that link's
+    //     io_mutex (the per-link I/O lock). They never take write_mutex or
+    //     ssl_lifetime_lock, so acquiring every io_mutex here (primary, then
+    //     additional slots in index order) is what excludes them from a context
+    //     being freed under them. This is the only place that holds more than
+    //     one io_mutex at a time, and it does so in fixed order while holding
+    //     write_mutex, keeping the order ssl_lifetime(W) -> write -> io a DAG —
+    //     io_mutex is a leaf lock everywhere else.
     pthread_rwlock_wrlock(&conn->ssl_lifetime_lock);
     pthread_mutex_lock(&conn->write_mutex);
+    pthread_mutex_lock(&conn->io_mutex);
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        pthread_mutex_lock(&conn->additional[i].io_mutex);
+    }
 
     // Close all additional connections first
     softether_close_additional(conn);
@@ -2754,8 +2783,13 @@ void softether_disconnect(softether_connection_t* conn) {
         }
     }
 
-    // Release write_mutex before touching the NAT-T/RUDP transports: they are
-    // independent objects with their own teardown and don't need this mutex.
+    // Release the per-link I/O mutexes (reverse of acquisition) and then
+    // write_mutex before touching the NAT-T/RUDP transports: they are
+    // independent objects with their own teardown and don't need these locks.
+    for (int i = MAX_SE_CONNECTIONS - 1; i >= 0; i--) {
+        pthread_mutex_unlock(&conn->additional[i].io_mutex);
+    }
+    pthread_mutex_unlock(&conn->io_mutex);
     pthread_mutex_unlock(&conn->write_mutex);
     // Release the SSL-lifetime WRITE lock after all SSL contexts (primary +
     // additional) have been freed above. From here on no thread can observe a

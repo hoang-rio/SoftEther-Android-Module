@@ -119,6 +119,7 @@ typedef struct {
     uint64_t last_recv;  // monotonic timestamp of last recv (ms)
     uint32_t late_count; // number of times this socket had no data when polled
     int active;          // 1 if slot is in use, 0 if free
+    pthread_mutex_t io_mutex;  // per-link I/O lock (see softether_connection_t comment)
 } softether_tcp_sock_t;
 
 // Connection context
@@ -202,15 +203,31 @@ typedef struct softether_connection {
     char server_ip_v6[128];   // Server IPv6 address (from resolved host)
     int is_ipv6;              // 1 if the connection is over IPv6
     // Thread safety for concurrent send/receive
-    pthread_mutex_t write_mutex;  // protects SSL writes (send loop + keepalive response)
+    // write_mutex protects ONLY the shared send_block staging buffer (build +
+    // transmit are one critical section so ARP replies can't interleave into a
+    // half-built data block) and serializes SSL-context teardown against the
+    // send path. It does NOT serialize SSL I/O anymore: each live TCP link has
+    // its own io_mutex below, so a read on link A no longer blocks writes on
+    // link B and a slow SSL_write on one link cannot stall staging for the rest.
+    // Per-link io_mutex: every SSL read/write/keepalive on a link takes that
+    // link's io_mutex (BoringSSL SSL objects forbid concurrent operations on the
+    // SAME context, but different links are independent). io_mutex is a strict
+    // leaf lock: it is never held while acquiring write_mutex / connect_mutex /
+    // ssl_lifetime_lock, keeping a single global order:
+    //   receive path : ssl_lifetime(R) -> io
+    //   send path    : write_mutex     -> io
+    //   teardown     : ssl_lifetime(W) -> write_mutex -> io(primary + all slots)
+    pthread_mutex_t write_mutex;  // send_block staging + teardown serialization
+    pthread_mutex_t io_mutex;     // per-link I/O lock for the primary TCP socket
     pthread_mutex_t connect_mutex;  // serializes connect/disconnect (recursive; connect calls disconnect internally)
     // Protects the LIFETIME of ssl_context_t* pointers (conn->ssl and the
-    // additional[i].ssl slots). Readers (the receive path) hold it while
-    // capturing and using an SSL pointer; teardown holds it (write) while
-    // CAS-claiming a slot to NULL and freeing it, so the receive path can
-    // never deref a freed context. Acquired BEFORE write_mutex everywhere
-    // (receive holds read then may take write_mutex via keepalive; teardown
-    // holds write then takes write_mutex), keeping a single lock order.
+    // additional[i].ssl slots). Readers (the receive path) hold it in READ mode
+    // across their whole pass while capturing and using an SSL pointer; teardown
+    // holds it in WRITE mode while CAS-claiming a slot to NULL and freeing it,
+    // so the receive path can never deref a freed context. Ordering: teardown
+    // acquires ssl_lifetime(W) BEFORE write_mutex; every other lock user takes
+    // io_mutex only as a leaf, so the single global order is
+    // ssl_lifetime(R|W) -> write_mutex -> io.
     pthread_rwlock_t ssl_lifetime_lock;  // protects ssl_context_t* pointer lifetime
     // Multi-connection support
     softether_tcp_sock_t additional[MAX_SE_CONNECTIONS];  // additional TCP sockets (index 0 unused; primary is in socket_fd/ssl)
@@ -228,9 +245,9 @@ typedef struct softether_connection {
     int send_rr_idx;              // round-robin index for send socket selection
     uint64_t next_tcp_keepalive_time;  // monotonic timestamp for next periodic TCP keepalive sweep (ms)
     // Phase 13C: preallocated TX staging buffer laid out as
-    // "[block_count(4)][block_size(4)][ethernet frame]". Written by the single
-    // producer thread outside write_mutex, transmitted under it. Allocated in
-    // softether_create(), freed in softether_destroy().
+    // "[block_count(4)][block_size(4)][ethernet frame]". Built and transmitted
+    // under write_mutex (shared by softether_send / softether_send_packet). 
+    // Allocated in softether_create(), freed in softether_destroy().
     uint8_t* send_block;
     uint32_t send_block_cap;
     // Phase 13G: permanent traffic counters (updated on the data paths)

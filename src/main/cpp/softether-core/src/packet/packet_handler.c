@@ -170,21 +170,75 @@ static int raw_read_all_fd(int fd, uint8_t* buf, int len) {
     return 0;
 }
 
+// ---- Per-link I/O locking (P1#5) ----
+// Every SSL read/write/keepalive on a live TCP link takes that link's own
+// io_mutex (conn->io_mutex for the primary socket, additional[i].io_mutex for
+// the extra links). The old session-wide write_mutex was shared by ALL links and
+// also by SSL reads, so a read on link A blocked sends on link B and a slow
+// SSL_write on one link stalled staging/keepalives on healthy links. With a
+// per-link mutex, I/O on different links is fully independent while I/O on the
+// SAME SSL object stays mutually exclusive (BoringSSL forbids concurrent ops on
+// one context). The staging/teardown write_mutex is unchanged. io_mutex is a
+// strict leaf lock (never held while acquiring write_mutex / connect_mutex /
+// ssl_lifetime_lock), and retirement of a socket NULLs its ssl/socket_fd while
+// holding the SAME io_mutex.
+
+// Resolve a caller-captured ssl/fd pair to its per-link I/O mutex. The slot
+// pointers are read without the lock, so the caller must re-validate under the
+// lock (link_io_live) before dereferencing the SSL — a concurrent retire holds
+// the same io_mutex while NULLing the slot. Returns NULL when nothing matches
+// (the socket was already retired) and sets *slot_idx = -1 for primary.
+static pthread_mutex_t* link_io_resolve(softether_connection_t* conn,
+                                        void* ssl, int socket_fd,
+                                        int* slot_idx) {
+    if (ssl == conn->ssl && socket_fd == conn->socket_fd) {
+        *slot_idx = -1;
+        return &conn->io_mutex;
+    }
+    for (int i = 0; i < MAX_SE_CONNECTIONS; i++) {
+        if (conn->additional[i].ssl == ssl &&
+            conn->additional[i].socket_fd == socket_fd) {
+            *slot_idx = i;
+            return &conn->additional[i].io_mutex;
+        }
+    }
+    *slot_idx = -1;
+    return NULL;
+}
+
+// Re-check, while holding the link's io_mutex, that the slot still references
+// the caller's captured ssl/fd. 0 if still live, -1 if already retired.
+static int link_io_live(softether_connection_t* conn, int slot_idx,
+                        void* ssl, int socket_fd) {
+    if (slot_idx < 0) {
+        return (conn->ssl == ssl && conn->socket_fd == socket_fd) ? 0 : -1;
+    }
+    return (conn->additional[slot_idx].ssl == ssl &&
+            conn->additional[slot_idx].socket_fd == socket_fd) ? 0 : -1;
+}
+
 // Read `len` bytes from a specific socket (SSL or raw).
-// Thread-safe: acquires write_mutex for SSL reads to serialize against
-// concurrent SSL_write from the send thread (BoringSSL SSL objects are not
-// thread-safe for concurrent read+write on the same SSL*).
 static int data_read_all_sock(softether_connection_t* conn,
                               void* ssl, int socket_fd,
                               uint8_t* buf, int len) {
-    if (conn->use_ssl_data) {
-        pthread_mutex_lock(&conn->write_mutex);
-        int ret = ssl_read_all_ctx((ssl_context_t*)ssl, buf, len);
-        pthread_mutex_unlock(&conn->write_mutex);
-        return ret;
-    } else {
+    if (!conn->use_ssl_data) {
         return raw_read_all_fd(socket_fd, buf, len);
     }
+
+    int slot_idx = -1;
+    pthread_mutex_t* io = link_io_resolve(conn, ssl, socket_fd, &slot_idx);
+    if (io == NULL) {
+        return -1;  // socket already retired by another thread
+    }
+
+    pthread_mutex_lock(io);
+    if (link_io_live(conn, slot_idx, ssl, socket_fd) != 0) {
+        pthread_mutex_unlock(io);
+        return -1;  // retired while we resolved — don't touch a freed context
+    }
+    int ret = ssl_read_all_ctx((ssl_context_t*)ssl, buf, len);
+    pthread_mutex_unlock(io);
+    return ret;
 }
 
 // Read a big-endian uint32 from a specific socket.
@@ -202,15 +256,7 @@ static int read_uint32_sock(softether_connection_t* conn,
 static int data_write_all_sock(softether_connection_t* conn,
                                void* ssl, int socket_fd,
                                const uint8_t* buf, int len) {
-    if (conn->use_ssl_data) {
-        int total = 0;
-        while (total < len) {
-            int ret = ssl_write((ssl_context_t*)ssl, buf + total, len - total);
-            if (ret <= 0) return -1;
-            total += ret;
-        }
-        return 0;
-    } else {
+    if (!conn->use_ssl_data) {
         int total = 0;
         while (total < len) {
             int ret = (int)send(socket_fd, buf + total, len - total, 0);
@@ -222,29 +268,54 @@ static int data_write_all_sock(softether_connection_t* conn,
         }
         return 0;
     }
+
+    int slot_idx = -1;
+    pthread_mutex_t* io = link_io_resolve(conn, ssl, socket_fd, &slot_idx);
+    if (io == NULL) {
+        return -1;  // socket already retired by another thread
+    }
+
+    pthread_mutex_lock(io);
+    if (link_io_live(conn, slot_idx, ssl, socket_fd) != 0) {
+        pthread_mutex_unlock(io);
+        return -1;  // retired while we resolved — don't touch a freed context
+    }
+    int total = 0;
+    while (total < len) {
+        int ret = ssl_write((ssl_context_t*)ssl, buf + total, len - total);
+        if (ret <= 0) {
+            pthread_mutex_unlock(io);
+            return -1;
+        }
+        total += ret;
+    }
+    pthread_mutex_unlock(io);
+    return 0;
 }
 
-// Read `len` bytes using the appropriate channel (SSL or raw TCP)
-// Thread-safe: acquires write_mutex for SSL reads to serialize against
-// concurrent SSL_write from the send thread.
+// Read `len` bytes using the appropriate channel (SSL or raw TCP).
+// Primary-socket variant: locks conn->io_mutex for SSL reads so a concurrent
+// SSL_write on the primary (same SSL object) stays exclusive.
 static int data_read_all(softether_connection_t* conn, uint8_t* buf, int len) {
-    if (conn->use_ssl_data) {
-        pthread_mutex_lock(&conn->write_mutex);
-        int ret = ssl_read_all(conn, buf, len);
-        pthread_mutex_unlock(&conn->write_mutex);
-        return ret;
-    } else {
+    if (!conn->use_ssl_data) {
         return raw_read_all(conn, buf, len);
     }
+    pthread_mutex_lock(&conn->io_mutex);
+    int ret = ssl_read_all(conn, buf, len);
+    pthread_mutex_unlock(&conn->io_mutex);
+    return ret;
 }
 
-// Write `len` bytes using the appropriate channel (SSL or raw TCP)
+// Write `len` bytes using the appropriate channel (SSL or raw TCP).
+// Primary-socket variant: locks conn->io_mutex (same rationale as above).
 static int data_write_all(softether_connection_t* conn, const uint8_t* buf, int len) {
-    if (conn->use_ssl_data) {
-        return ssl_write_all(conn, buf, len);
-    } else {
+    if (!conn->use_ssl_data) {
         return raw_write_all(conn, buf, len);
     }
+    pthread_mutex_lock(&conn->io_mutex);
+    int ret = ssl_write_all(conn, buf, len);
+    pthread_mutex_unlock(&conn->io_mutex);
+    return ret;
 }
 
 // Read a big-endian uint32 from the data channel.
@@ -327,21 +398,31 @@ int softether_transmit_block_nolock(softether_connection_t* conn,
 
         // Write failed on this socket. Retire failed additional sockets so
         // later sends skip them; a dead primary falls through to others.
+        // The retire runs under the link's io_mutex: a concurrent reader or
+        // keepalive may be mid-IO on this same socket (those paths take only
+        // the per-link lock), so NULLing the slot + destroying the SSL must be
+        // exclusive with them too.
         LOGW("transmit_block: write failed on %s socket fd=%d, failing over",
              send_idx == 0 ? "primary" : "additional", send_fd);
         if (ts != NULL) {
-            int saved_fd = ts->socket_fd;
-            ts->active = 0;
-            ts->ssl = NULL;
-            ts->socket_fd = -1;
-            __sync_synchronize();
-            if (saved_fd >= 0) close(saved_fd);
-            ssl_context_t* doomed = (ssl_context_t*)take_ssl_ctx_slot(&ts->ssl_ctx);
-            if (doomed != NULL) {
-                ssl_shutdown(doomed);
-                ssl_destroy(doomed);
+            pthread_mutex_lock(&ts->io_mutex);
+            // Re-check: the slot is still this socket (a reader's CLOSE_FAILED
+            // path may have retired it while we waited for the io lock).
+            if (ts->ssl == send_ssl && ts->socket_fd == send_fd) {
+                int saved_fd = ts->socket_fd;
+                ts->active = 0;
+                ts->ssl = NULL;
+                ts->socket_fd = -1;
+                __sync_synchronize();
+                if (saved_fd >= 0) close(saved_fd);
+                ssl_context_t* doomed = (ssl_context_t*)take_ssl_ctx_slot(&ts->ssl_ctx);
+                if (doomed != NULL) {
+                    ssl_shutdown(doomed);
+                    ssl_destroy(doomed);
+                }
+                conn->num_additional--;
             }
-            conn->num_additional--;
+            pthread_mutex_unlock(&ts->io_mutex);
         }
     }
 
@@ -361,7 +442,11 @@ int softether_transmit_block(softether_connection_t* conn,
 
 // Send one data block (Ethernet frame) using the real SoftEther block format.
 // Format: [block_count=1][block_size][block_data]
-// Thread-safe: locks write_mutex to prevent interleaving with keepalive responses
+// Thread-safe: locks write_mutex around building into the shared send_block
+// staging buffer AND transmitting it, so the control path (ARP replies, DHCP)
+// can't interleave into a half-built data block from the TUN send thread. The
+// socket write itself then takes only the target link's io_mutex (inside the
+// data_write helpers), so a read on another link proceeds concurrently.
 // Phase 13C: builds into the preallocated conn->send_block scratch — no heap
 // allocation in steady state. The zlib branch only runs when session
 // compression was negotiated (off by default since Phase 13B).
@@ -635,8 +720,10 @@ int softether_receive_packet(softether_connection_t* conn, uint16_t* command,
 }
 
 // Send keepalive over a specific TCP socket using the real SoftEther format:
-// [0xFFFFFFFF][size][random_data]. Thread-safe: locks write_mutex since this may
-// be called from the receive thread.
+// [0xFFFFFFFF][size][random_data]. Thread-safe: does NOT take write_mutex — the
+// packet is built in a stack-local buffer (no shared send_block staging), and
+// data_write_all_sock takes only the target link's io_mutex. A slow SSL_write
+// on another link therefore never stalls this keepalive.
 static int softether_send_keepalive_sock(softether_connection_t* conn,
                                          void* ssl, int socket_fd) {
     if (conn == NULL || ssl == NULL) {
@@ -645,8 +732,6 @@ static int softether_send_keepalive_sock(softether_connection_t* conn,
     if (conn->state != STATE_CONNECTED) {
         return -1;
     }
-
-    pthread_mutex_lock(&conn->write_mutex);
 
     // Build keepalive as a single buffer (matching reference ConnectionSend behavior)
     // Format: [KEEP_ALIVE_MAGIC(4)][ka_size(4)][random_data(ka_size)]
@@ -672,9 +757,9 @@ static int softether_send_keepalive_sock(softether_connection_t* conn,
         ka_buf[8 + i] = (uint8_t)(rand() & 0xFF);
     }
 
-    // Send entire keepalive as one SSL_write (single TLS record)
+    // Send entire keepalive as one SSL_write (single TLS record) under the
+    // per-link io_mutex (taken inside data_write_all_sock).
     int ret = data_write_all_sock(conn, ssl, socket_fd, ka_buf, (int)total_size);
-    pthread_mutex_unlock(&conn->write_mutex);
 
     if (ret != 0) {
         LOGE("Failed to send keepalive");
@@ -684,8 +769,8 @@ static int softether_send_keepalive_sock(softether_connection_t* conn,
     return (int)total_size;
 }
 
-// Send keepalive using the real SoftEther format: [0xFFFFFFFF][size][random_data]
-// Thread-safe: locks write_mutex since this may be called from the receive thread
+// Send keepalive over the primary socket.
+// Thread-safe: serialized per-link via the primary io_mutex (see keepalive_sock)
 int softether_send_keepalive(softether_connection_t* conn) {
     if (conn == NULL || conn->ssl == NULL) {
         return -1;
@@ -1016,11 +1101,15 @@ static int softether_fill_recv_queue_locked(softether_connection_t* conn) {
         // Helper macro to close and deactivate a failed additional socket.
         // Mark inactive BEFORE destroying to prevent use-after-free by other threads.
         // Close fd FIRST so any in-flight SSL_write returns error instead of crashing.
+        // The retirement runs under the slot's io_mutex so it is exclusive with
+        // a concurrent keepalive/data-write on the same link (tx failover takes
+        // the same lock), preventing a use-after-free on a mid-IO context.
         // Returns 0 to keep connection alive, or propagates -1 for primary socket failures
         #define CLOSE_FAILED_ADDITIONAL_SOCKET() do { \
             if (sel_is_additional && sel_add_idx >= 0) { \
                 LOGW("Additional socket fd=%d read failure, marking inactive", sel_fd); \
                 softether_tcp_sock_t* _ts = &conn->additional[sel_add_idx]; \
+                pthread_mutex_lock(&_ts->io_mutex); \
                 int _saved_fd = _ts->socket_fd; \
                 _ts->active = 0; \
                 _ts->ssl = NULL; \
@@ -1032,6 +1121,7 @@ static int softether_fill_recv_queue_locked(softether_connection_t* conn) {
                     ssl_shutdown(_doomed); \
                     ssl_destroy(_doomed); \
                 } \
+                pthread_mutex_unlock(&_ts->io_mutex); \
                 conn->num_additional--; \
                 return 0; \
             } \
