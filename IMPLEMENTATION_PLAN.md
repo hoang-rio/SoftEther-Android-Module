@@ -81,57 +81,57 @@ Client                              Server
 
 ---
 
-## Optimization Findings (2026-09-10)
+## Optimization Findings — ✅ all done (2026-09-21)
 
-Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Stable` reference (`Mayaqua/Network.c`, `Cedar/Protocol.c`, `Cedar/Listener.c`). Ranked by priority.
+Audit of `SoftEtherClient` (Kotlin + native C) vs the official `SoftEtherVPN_Stable` reference (`Mayaqua/Network.c`, `Cedar/Protocol.c`, `Cedar/Listener.c`). All items shipped; full per-item rationale lives in git history (commits below).
 
-### P0 — Correctness / Crash — ✅ All done (2026-09-10)
+### P0 — Correctness / Crash — ✅ `6650927`, `1ca0e00`, `95e01d4`, `ec6cc00`
 
-| # | Issue | Commit |
-|---|-------|--------|
-| 1 | `disconnect()` `tryLock()` guard for `unlock()` | `6650927` |
-| 2 | Native error codes mapped via `SoftEtherError.getErrorString()` | `1ca0e00` |
-| 3 | `attemptReconnect()` sets `STATE_ERROR` before disconnect | `95e01d4` |
-| 4 | `protectedFds` cleared on teardown, `synchronizedSet` | `ec6cc00` |
+| # | Issue |
+|---|-------|
+| 1 | `disconnect()` `tryLock()` guard for `unlock()` |
+| 2 | Native error codes mapped via `SoftEtherError.getErrorString()` |
+| 3 | `attemptReconnect()` sets `STATE_ERROR` before disconnect |
+| 4 | `protectedFds` cleared on teardown, `synchronizedSet` |
 
-### P1 — Performance — ✅ all done (2026-09-21)
+### P1 — Performance — ✅ `d225f44`, `b6060c6`, `f876db8`
 
-| # | Issue | Location | Fix | Status |
-|---|-------|----------|-----|--------|
-| 5 | TX globally serialized by single `write_mutex` — even full-duplex (4× BOTH) sends one packet at a time | `packet_handler.c` | Split into per-link I/O locks: each TCP link (primary + each additional slot) gets its own `io_mutex` for all SSL read/write/keepalive, so I/O on different links is independent and a slow `SSL_write` on one link can't stall staging/reads/keepalives on healthy links. `write_mutex` retained for `send_block` staging + teardown serialization; slot retirement holds the same `io_mutex` and re-checks slot identity (lock order `ssl_lifetime → write_mutex → io`, io is a leaf) | ✅ `d225f44` |
-| 6 | `Thread.sleep(200)` destroy heuristic — `nativeDestroy` can block on `connect_mutex` if TLS read is slow | `ConnectionController.kt:626` | Replace with a CountDownLatch or CompletableDeferred signaled by the connect flow | ✅ `b6060c6` |
-| 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows model imports, drift risk | `SoftEtherClient.kt:456,461` vs `model/Exceptions.kt:6,26` | Keep only `model/` versions; remove file-level duplicates | ✅ `f876db8` |
+| # | Issue |
+|---|-------|
+| 5 | TX globally serialized by single `write_mutex` → per-link I/O locks (`conn->io_mutex` + `additional[i].io_mutex`): I/O on different links now independent, slow `SSL_write` can't stall staging/reads/keepalives on healthy links; `write_mutex` kept for `send_block` staging + teardown, slot retirement holds the same `io_mutex` (order `ssl_lifetime → write_mutex → io`, io a leaf) |
+| 6 | `Thread.sleep(200)` destroy heuristic → latch signaled by the connect flow |
+| 7 | Duplicate `SoftEtherError`/`ConnectionException` definitions — file-level shadows removed |
 
-### P2 — Parity with Official Client — ✅ all done (2026-09-14)
+### P2 — Parity with Official Client — ✅ `f463b41`
 
-| # | Issue | Location | Fix | Status |
-|---|-------|----------|-----|--------|
-| 8 | ARP reply for LAN-side queries — proxy ARP reply exists (`softether_reply_arp_request` in `softether_protocol.c:2904-2930`), but gratuitous ARP advertisement is still missing | `softether_protocol.c` (reply), `dhcp_client.c` (no gratuitous) | Add gratuitous ARP broadcast after IP assignment (see `SoftEtherVPN_Stable/src/Cedar/Virtual.c`) | ✅ `f463b41` |
-| 9 | ~~RUDP keepalive interval not randomized~~ | `softether_rudp.c:728-729` | ✅ Done — `rand() % (ka_max - ka_min) + ka_min` already in direct RUDP + NAT-T paths | ✅ |
-| 10 | ~~RUDP `current_rtt` dedup only on `your_tick` advance~~ | `rudp_transport.c:627-634` | ✅ Done — sampled on `latest_recv_my_tick` advance, deduped via `latest_recv_my_tick2` (see RUDP plan Open Item 4) | ✅ |
+| # | Issue |
+|---|-------|
+| 8 | Gratuitous ARP broadcast after IP assignment |
+| 9 | RUDP keepalive interval — already randomized (`rand() % (ka_max - ka_min) + ka_min` in direct RUDP + NAT-T) |
+| 10 | RUDP `current_rtt` dedup — already sampled on `latest_recv_my_tick` advance |
 
-### P3 — Code Quality / Dead Code — ✅ all done (2026-09-14)
+### P3 — Code Quality / Dead Code — ✅ `b035495`, `0e44c67`, `415873e`, `35c5060`, `a00469b`
 
-| # | Issue | Location | Fix | Status |
-|---|-------|----------|-----|--------|
-| 11 | 7 dead Kotlin files never referenced from main code | `PacketHandler.kt`, `HandshakeManager.kt`, `AuthManager.kt`, `SSLTerminal.kt`, `SessionState.kt`, `ByteBufferUtil.kt`, `CryptoUtil.kt` | Delete; `PacketHandler.kt` has wrong wire-format model (20-byte `SETH`) that misleads readers | ✅ `b035495` |
-| 12 | Dead legacy path in `SoftEtherClient.kt` | `connect()` :35-120, `setAuthType` :126, `setMaxConnection` :141, `getNumConnections` :160, `setKeepAliveInterval` :283, `setMtu` :294, `cleanup` :303 | Remove; live path goes through `ConnectionController.performConnectInner()` → `nativeConnectWithHub` | ✅ `0e44c67` |
-| 13 | ~~JNI test natives declared in header but no C implementation~~ | `softether_jni.h:63-97` | ✅ Done — implemented in `cpp/test/test_jni_bridge.c`, compiled into `softether_test` lib, loaded by androidTest | ✅ |
-| 14 | Two TODO no-ops in JNI (keepalive interval, MTU) | `softether_jni.c:473,477` | Remove the option codes — callers deleted in #12, MTU applied via `VpnService.Builder.setMtu`, keepalive native in `rudp_transport.c` | ✅ `35c5060` |
-| 15 | `@Suppress("DEPRECATION")` ×4 in VpnService | `SoftEtherVpnService.kt:146/:262/:421/:847` | Migrate to AndroidX equivalents: `NetworkCallback`/`ContextCompat`/`IntentCompat`/`ServiceCompat` | ✅ `415873e` |
-| 16 | Two `mainHandler` instances (companion + instance) | `SoftEtherVpnService.kt:90` vs `:734` | Consolidate into companion one | ✅ `a00469b` |
-
----
-
-### Recommended execution order
-
-```
-P0 correctness (#1–#4) ✅ → P1 perf (#5–#7, #6/#7 done) → P2 parity (#8–#10) ✅ → P3 cleanup (#11–#16) ✅
-```
-
-Multi-connection support from the original Remaining Tasks is superseded by the throughput optimization plan in [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 13–17.
+| # | Issue |
+|---|-------|
+| 11 | 7 dead Kotlin files deleted (incl. wrong 20-byte `SETH` wire model in `PacketHandler.kt`) |
+| 12 | Dead legacy path removed from `SoftEtherClient.kt`; live path is `ConnectionController.performConnectInner()` → `nativeConnectWithHub` |
+| 13 | JNI test natives implemented in `cpp/test/test_jni_bridge.c` (compiled into `softether_test` lib) |
+| 14 | Two TODO no-ops in JNI removed (keepalive interval, MTU) |
+| 15 | `@Suppress("DEPRECATION")` ×4 in VpnService → AndroidX equivalents |
+| 16 | Duplicate `mainHandler` consolidated |
 
 ---
 
-*Last Updated: 2026-09-14*
-*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0 done, P1 done (#5 pending), P2 done (#8–#10), P3 done (#11–#16)*
+### Execution order
+
+```
+P0 correctness (#1–#4) ✅ → P1 perf (#5–#7) ✅ → P2 parity (#8–#10) ✅ → P3 cleanup (#11–#16) ✅
+```
+
+Multi-connection support from the original Remaining Tasks is superseded by the throughput optimization plan in [RUDP_IMPLEMENTATION_PLAN.md](RUDP_IMPLEMENTATION_PLAN.md) Phase 13–17 (all done).
+
+---
+
+*Last Updated: 2026-09-21*
+*Status: ✅ TCP + RUDP V1 + V2 working, compression implemented; P0–P3 all done. Only open item: periodic on-device instrumentation / regression runs (Remaining Tasks §2).*
