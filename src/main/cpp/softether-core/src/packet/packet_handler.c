@@ -979,10 +979,28 @@ static int softether_fill_recv_queue_locked(softether_connection_t* conn) {
     __sync_synchronize();
     if (conn->state == STATE_DISCONNECTING) return -1;
 
-    // Check for SSL-buffered data on any TCP socket before polling
+    // Check for SSL-buffered data on any TCP socket before polling.
+    // Each captured ssl pointer is only safe to dereference while that link's
+    // io_mutex is held: a transmit failover retires a dead additional socket and
+    // destroys its SSL context under the SAME per-link lock (NOT under
+    // ssl_lifetime_lock WRITE), so the captured pointer must be re-validated and
+    // dereferenced under that mutex to avoid a use-after-free. Re-validating via
+    // link_io_live also skips entries retired between capture and this check.
     int ssl_pending_idx = -1;
     for (int t = 0; t < tcp_count; t++) {
-        if (conn->use_ssl_data && ssl_has_pending((ssl_context_t*)tcp_info[t].ssl)) {
+        if (!conn->use_ssl_data) break;
+        void* cap_ssl = tcp_info[t].ssl;
+        int cap_fd = tcp_info[t].fd;
+        int slot_idx = tcp_info[t].additional_idx;
+        pthread_mutex_t* io = (slot_idx < 0) ? &conn->io_mutex
+                                             : &conn->additional[slot_idx].io_mutex;
+        pthread_mutex_lock(io);
+        int pending = 0;
+        if (link_io_live(conn, slot_idx, cap_ssl, cap_fd) == 0) {
+            pending = ssl_has_pending((ssl_context_t*)cap_ssl);
+        }
+        pthread_mutex_unlock(io);
+        if (pending) {
             ssl_pending_idx = t;
             break;
         }

@@ -647,9 +647,10 @@ void ssl_shutdown(ssl_context_t* ctx) {
 }
 
 int ssl_has_pending(ssl_context_t* ctx) {
-    if (ctx == NULL || ctx->ssl == NULL) return 0;
+    if (ctx == NULL) return 0;
     pthread_rwlock_rdlock(&g_tls_use_lock);
-    int pending = SSL_pending(ctx->ssl) > 0 ? 1 : 0;
+    SSL* s = ctx->ssl;  // read ctx->ssl under the lock, not before it
+    int pending = (s != NULL && SSL_pending(s) > 0) ? 1 : 0;
     pthread_rwlock_unlock(&g_tls_use_lock);
     return pending;
 }

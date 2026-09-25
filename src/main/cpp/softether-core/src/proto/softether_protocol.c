@@ -3020,6 +3020,20 @@ static void softether_maintain_links(softether_connection_t* conn) {
         if (poll_ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             LOGW("Additional socket [%d] fd=%d disconnected, closing",
                  i, ts->socket_fd);
+            // Retire the slot under its io_mutex: a concurrent send/keepalive on
+            // this same link (transmit failover, data_write_all_sock) holds that
+            // per-link mutex while using the SSL, so destroying the context here
+            // without it can free an SSL mid-IO. (Commit d225f44 made io_mutex a
+            // strict leaf lock; while a disconnect holds ssl_lifetime WRITE it may
+            // block on this mutex, but this path is holding no lifetime lock and
+            // never waits on one, so there is no cycle.)
+            pthread_mutex_lock(&ts->io_mutex);
+            // Re-check under the lock: slot may have been retired by a concurrent
+            // transmit failover or close_additional while we polled the fd.
+            if (!ts->active || ts->socket_fd != pfd.fd) {
+                pthread_mutex_unlock(&ts->io_mutex);
+                continue;
+            }
             // Mark inactive BEFORE destroying (prevent use-after-free by other threads)
             int saved_fd = ts->socket_fd;
             ts->active = 0;
@@ -3039,6 +3053,7 @@ static void softether_maintain_links(softether_connection_t* conn) {
                 ssl_destroy(doomed);
             }
             conn->num_additional--;
+            pthread_mutex_unlock(&ts->io_mutex);
         }
     }
 }
