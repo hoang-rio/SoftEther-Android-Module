@@ -100,16 +100,25 @@ build_openssl() {
     local OUTPUT_DIR="$BUILD_DIR/$ABI"
     local JNI_ABI_DIR="$JNILIBS_DIR/$ABI"
     
+    # Drop any previous install output so a failed run cannot leave stale
+    # headers/objects behind for the next one.
+    rm -rf "$OUTPUT_DIR"
     mkdir -p "$OUTPUT_DIR"
     mkdir -p "$JNI_ABI_DIR"
     
     cd "$OPENSSL_DIR"
     
-    # Clean previous builds
+    # Clean previous builds. distclean (not clean) is required here: `make clean`
+    # is documented "keep the configuration" and leaves include/openssl/
+    # configuration.h in place, so re-configuring for a new target would
+    # otherwise silently reuse the previous version's config macros.
     log_info "Cleaning previous build..."
-    make clean 2>/dev/null || true
+    make distclean 2>/dev/null || make clean 2>/dev/null || true
     # NOTE: in OpenSSL 3.x, include/openssl/opensslconf.h is a committed
     # wrapper (includes generated configuration.h) and must NOT be deleted.
+    # configuration.h itself IS generated and must go -- distclean above removes
+    # it; this catches the case where no Makefile existed to run distclean with.
+    rm -f include/openssl/configuration.h 2>/dev/null || true
     rm -f Makefile 2>/dev/null || true
     
     # Setup NDK toolchain
@@ -165,16 +174,29 @@ generate_headers() {
     
     cd "$OPENSSL_DIR"
     
-    # Check if headers already exist in the repository.
-    # NOTE: in OpenSSL 3.x, opensslconf.h is a *committed* wrapper that
-    # includes configuration.h, which Configure generates from
-    # configuration.h.in. A fresh checkout has opensslconf.h but NOT
-    # configuration.h, so we must gate on configuration.h — otherwise
-    # headers-only mode would skip Configure and leave the build broken.
-    if [ -f "$OPENSSL_DIR/include/openssl/configuration.h" ]; then
-        log_info "OpenSSL headers already exist in repository"
+    # Check if headers are already generated AND newer than the pinned OpenSSL
+    # version.
+    # NOTE: in OpenSSL 3.x, opensslconf.h is a *committed* wrapper that includes
+    # configuration.h, which Configure generates from configuration.h.in. A fresh
+    # checkout has opensslconf.h but NOT configuration.h, so we must gate on
+    # configuration.h — otherwise headers-only mode would skip Configure and
+    # leave the build broken.
+    #
+    # Existence alone is NOT sufficient: configuration.h is gitignored, so it
+    # survives a submodule version bump. Comparing against VERSION.dat (committed
+    # upstream, and rewritten by every `git checkout openssl-<tag>`) makes the
+    # gate version-aware, so bumping the submodule always forces a re-configure.
+    local CONFIG_H="$OPENSSL_DIR/include/openssl/configuration.h"
+    local VERSION_DAT="$OPENSSL_DIR/VERSION.dat"
+
+    if [ -f "$CONFIG_H" ] && [ -f "$VERSION_DAT" ] && [ "$CONFIG_H" -nt "$VERSION_DAT" ]; then
+        log_info "OpenSSL headers already exist and match the pinned version"
         log_info "✓ Using existing headers from $OPENSSL_DIR/include/openssl/"
         return 0
+    fi
+
+    if [ -f "$CONFIG_H" ]; then
+        log_warn "Stale generated configuration.h detected - regenerating headers"
     fi
     
     # Generate headers using a simple config
