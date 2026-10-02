@@ -15,6 +15,7 @@ import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -144,6 +145,8 @@ class SoftEtherVpnService : VpnService() {
     private var lastStateUpdateTime = 0L
     private var pendingStateUpdate: (() -> Unit)? = null
     private var currentSessionName: String? = null
+
+    private val networkCallbackThread = HandlerThread("network-callback").apply { start() }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -836,7 +839,11 @@ class SoftEtherVpnService : VpnService() {
     private fun registerNetworkReceiver() {
         val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
             ?: return
-        cm.registerDefaultNetworkCallback(networkCallback)
+        // Register with a background Handler so ConnectivityManager's callback
+        // delivery (incl. unparceling the NetworkCapabilities parcel) runs off
+        // the main thread — otherwise a large parcel unparceled on main causes
+        // ANRs in androidx ConnectivityManager$CallbackHandler (see Android docs).
+        cm.registerDefaultNetworkCallback(networkCallback, Handler(networkCallbackThread.looper))
     }
 
     private fun unregisterNetworkReceiver() {
@@ -846,6 +853,9 @@ class SoftEtherVpnService : VpnService() {
             cm.unregisterNetworkCallback(networkCallback)
         } catch (e: IllegalArgumentException) {
             // Callback was not registered
+        }
+        if (networkCallbackThread.isAlive) {
+            networkCallbackThread.quitSafely()
         }
     }
 }
