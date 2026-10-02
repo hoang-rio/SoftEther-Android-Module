@@ -165,7 +165,7 @@ Fixed 5 regression issues: batched RX eth processing, TCP failover, write_mutex 
 
 #### 16 — TLS shared-SSL_CTX heap corruption (P1) — DONE
 
-Per-connection `SSL_CTX` + process-wide TLS I/O lock. Caveat: prebuilt OpenSSL 3.5.8 has internal multiblock race under extreme concurrency — production single-session unaffected. Verified: paired-session 60s full-duplex, no scudo aborts.
+Per-connection `SSL_CTX` + process-wide TLS I/O lock. Caveat: prebuilt OpenSSL 3.6.5 has internal multiblock race under extreme concurrency — production single-session unaffected. Verified: paired-session 60s full-duplex, no scudo aborts.
 
 #### 17 — Half/full-duplex auto-selection (device-tier) (P2) — DONE
 
