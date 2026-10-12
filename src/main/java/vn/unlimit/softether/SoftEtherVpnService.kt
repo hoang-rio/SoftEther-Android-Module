@@ -12,6 +12,7 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -843,7 +844,14 @@ class SoftEtherVpnService : VpnService() {
         // delivery (incl. unparceling the NetworkCapabilities parcel) runs off
         // the main thread — otherwise a large parcel unparceled on main causes
         // ANRs in androidx ConnectivityManager$CallbackHandler (see Android docs).
-        cm.registerDefaultNetworkCallback(networkCallback, Handler(networkCallbackThread.looper))
+        val handler = Handler(networkCallbackThread.looper)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            cm.registerDefaultNetworkCallback(networkCallback, handler)
+        } else {
+            // registerDefaultNetworkCallback(cb, handler) requires API 26; on older
+            // devices use registerNetworkCallback with an all-networks request.
+            cm.registerNetworkCallback(NetworkRequest.Builder().build(), networkCallback, handler)
+        }
     }
 
     private fun unregisterNetworkReceiver() {
