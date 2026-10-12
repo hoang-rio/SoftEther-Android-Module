@@ -470,26 +470,28 @@ class ConnectionController(
             throw CancellationException("Connection cancelled by user")
         }
 
-        val dhcpConfig: ConnectionConfig?
-        if (dhcpResult != null) {
-            Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
-                    "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer} DNS2=${dhcpResult.dnsServer2}")
-            assignedLocalIp = dhcpResult.assignedIp
-            // Update config with DHCP-assigned values
-            dhcpConfig = config.copy(
-                localAddress = dhcpResult.assignedIp,
-                prefixLength = dhcpResult.prefixLength,
-                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
-                secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
-            )
-            vpnInterface = service.establishVpnInterface(dhcpConfig)
-                ?: throw Exception("Failed to establish VPN interface")
-        } else {
-            Log.w(TAG, "DHCP failed, falling back to hardcoded IP config")
-            assignedLocalIp = config.localAddress
-            vpnInterface = service.establishVpnInterface(config)
-                ?: throw Exception("Failed to establish VPN interface")
+        // DHCP is the only source of our virtual IP. Without it the tunnel has
+        // no reachable address (native conn->assigned_ip stays 0 and ARP replies
+        // are suppressed), so the session would "connect" yet carry no traffic.
+        // Fail hard instead of masking it with the hardcoded placeholder IP and
+        // reporting a bogus CONNECTED.
+        if (dhcpResult == null || dhcpResult.assignedIp == "0.0.0.0") {
+            Log.e(TAG, "DHCP failed: server assigned no usable IP — failing connection")
+            throw Exception("DHCP failed: no IP address assigned by server")
         }
+
+        Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
+                "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer} DNS2=${dhcpResult.dnsServer2}")
+        assignedLocalIp = dhcpResult.assignedIp
+        // Update config with DHCP-assigned values
+        val dhcpConfig = config.copy(
+            localAddress = dhcpResult.assignedIp,
+            prefixLength = dhcpResult.prefixLength,
+            dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
+            secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
+        )
+        vpnInterface = service.establishVpnInterface(dhcpConfig)
+            ?: throw Exception("Failed to establish VPN interface")
 
         // Now that we have an IP and VPN interface, transition to CONNECTED
         currentState = ConnectionState.CONNECTED
@@ -963,23 +965,22 @@ connectInFlight.set(true)
             // Perform DHCP over the new tunnel
             Log.d(TAG, "Starting DHCP over reconnected tunnel...")
             val dhcpResult = client.doDhcp(nativeHandle)
-            if (dhcpResult != null) {
-                Log.d(TAG, "DHCP success on reconnect: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength}")
-                assignedLocalIp = dhcpResult.assignedIp
-                val dhcpConfig = config.copy(
-                    localAddress = dhcpResult.assignedIp,
-                    prefixLength = dhcpResult.prefixLength,
-                    dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
-                    secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
-                )
-                vpnInterface = service.establishVpnInterface(dhcpConfig)
-                    ?: throw Exception("Failed to establish VPN interface during reconnect")
-            } else {
-                Log.w(TAG, "DHCP failed on reconnect, falling back to hardcoded config")
-                assignedLocalIp = config.localAddress
-                vpnInterface = service.establishVpnInterface(config)
-                    ?: throw Exception("Failed to establish VPN interface during reconnect")
+            // No usable IP means the tunnel cannot carry traffic — fail the
+            // reconnect rather than report a bogus CONNECTED on the placeholder IP.
+            if (dhcpResult == null || dhcpResult.assignedIp == "0.0.0.0") {
+                Log.e(TAG, "DHCP failed on reconnect: server assigned no usable IP")
+                throw Exception("DHCP failed on reconnect: no IP address assigned by server")
             }
+            Log.d(TAG, "DHCP success on reconnect: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength}")
+            assignedLocalIp = dhcpResult.assignedIp
+            val dhcpConfig = config.copy(
+                localAddress = dhcpResult.assignedIp,
+                prefixLength = dhcpResult.prefixLength,
+                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
+                secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
+            )
+            vpnInterface = service.establishVpnInterface(dhcpConfig)
+                ?: throw Exception("Failed to establish VPN interface during reconnect")
 
             // Transition to CONNECTED and restart data forwarding
             currentState = ConnectionState.CONNECTED
