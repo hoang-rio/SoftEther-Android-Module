@@ -12,7 +12,6 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -840,17 +839,18 @@ class SoftEtherVpnService : VpnService() {
     private fun registerNetworkReceiver() {
         val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
             ?: return
-        // Register with a background Handler so ConnectivityManager's callback
-        // delivery (incl. unparceling the NetworkCapabilities parcel) runs off
-        // the main thread — otherwise a large parcel unparceled on main causes
-        // ANRs in androidx ConnectivityManager$CallbackHandler (see Android docs).
-        val handler = Handler(networkCallbackThread.looper)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            cm.registerDefaultNetworkCallback(networkCallback, handler)
+            // Register with a background Handler so ConnectivityManager's callback
+            // delivery (incl. unparceling the NetworkCapabilities parcel) runs off
+            // the main thread — otherwise a large parcel unparceled on main causes
+            // ANRs in ConnectivityManager$CallbackHandler.
+            cm.registerDefaultNetworkCallback(networkCallback, Handler(networkCallbackThread.looper))
         } else {
-            // registerDefaultNetworkCallback(cb, handler) requires API 26; on older
-            // devices use registerNetworkCallback with an all-networks request.
-            cm.registerNetworkCallback(NetworkRequest.Builder().build(), networkCallback, handler)
+            // The Handler overloads of registerDefaultNetworkCallback()/registerNetworkCallback()
+            // were only added in API 26 — calling either here throws NoSuchMethodError on
+            // API 24-25. Fall back to the 1-arg method (API 24). Callbacks then arrive on
+            // the main looper, which is acceptable because networkCallback only flips a flag.
+            cm.registerDefaultNetworkCallback(networkCallback)
         }
     }
 
