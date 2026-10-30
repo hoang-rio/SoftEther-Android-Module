@@ -37,6 +37,12 @@ void socket_destroy(softether_socket_t* sock);
 // Connection
 int socket_connect(softether_socket_t* sock, const char* host, int port);
 int socket_connect_timeout(softether_socket_t* sock, const char* host, int port, int timeout_ms);
+// Same as socket_connect_timeout(), but polls *cancel_flag every 200 ms while
+// the non-blocking connect is in flight. A non-zero flag aborts immediately,
+// letting a user cancel interrupt a hanging TCP connect instead of waiting out
+// the full timeout. cancel_flag may be NULL (identical to the plain variant).
+int socket_connect_timeout_cancel(softether_socket_t* sock, const char* host, int port,
+                                  int timeout_ms, const volatile int* cancel_flag);
 int socket_disconnect(softether_socket_t* sock);
 
 // I/O operations

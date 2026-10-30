@@ -1098,6 +1098,12 @@ void softether_destroy(softether_connection_t* conn) {
 void softether_force_close_socket(softether_connection_t* conn) {
     if (conn == NULL) return;
 
+    // Tell a connect flow blocked in softether_connect_with_hub() to give up.
+    // Checked inside the TCP connect poll and between transport stages, so a
+    // user cancel unwinds the hanging connect in ~200ms instead of waiting for
+    // the whole timeout budget (TCP + fallback stages).
+    conn->abort_connect = 1;
+
     // Interrupt the primary TCP socket.  shutdown() causes any blocking
     // SSL_read/SSL_write to return with an error, which lets the connect
     // thread unwind and release connect_mutex.  We intentionally do NOT
@@ -2334,6 +2340,9 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         return ERR_UNKNOWN;
     }
 
+    // Fresh connect: clear any abort left over from a previous cancel.
+    conn->abort_connect = 0;
+
     // Ensure no stale NAT-T transport is carried into a fresh connect attempt
     // (re-entered via softether_reconnect). The app fd must already be closed.
     if (conn->socket_fd < 0) {
@@ -2429,7 +2438,8 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
         softether_socket_t* sock = force_nat_t ? NULL : socket_create(SOCKET_TYPE_TCP);
         int tcp_ok = 0;
         if (sock != NULL) {
-            if (socket_connect_timeout(sock, connect_host, port, conn->timeout_ms) != 0) {
+            if (socket_connect_timeout_cancel(sock, connect_host, port, conn->timeout_ms,
+                                              &conn->abort_connect) != 0) {
                 // Fallback: retry with the remaining IP version explicitly resolved.
                 char fallback_ip[64] = "";
                 int fallback_family = preferred_ipv6 ? AF_INET : AF_INET6;
@@ -2438,7 +2448,8 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                     LOGD("Connect via %s failed, retrying via %s: %s",
                          preferred_ipv6 ? "IPv6" : "IPv4",
                          preferred_ipv6 ? "IPv4" : "IPv6", fallback_ip);
-                    if (socket_connect_timeout(sock, fallback_ip, port, conn->timeout_ms) == 0) {
+                    if (socket_connect_timeout_cancel(sock, fallback_ip, port, conn->timeout_ms,
+                                                      &conn->abort_connect) == 0) {
                         snprintf(resolved_ip, sizeof(resolved_ip), "%s", fallback_ip);
                         preferred_ipv6 = (strchr(resolved_ip, ':') != NULL);
                         tcp_ok = 1;
@@ -2489,6 +2500,14 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
             result = ERR_TCP_CONNECT;
         }
 
+        // A concurrent softether_force_close_socket() (user cancel) must not
+        // fall through to another full-timeout transport stage.
+        if (conn->abort_connect) {
+            LOGD("Connect aborted by user (abort flag) - skipping UDP fallback");
+            softether_disconnect(conn);
+            return ERR_TIMEOUT;
+        }
+
         // TCP failed — fall back to parallel UDP transport race: race direct
         // R-UDP and NAT-T relay concurrently (same as UDP-only path).
         if (result != ERR_NONE) {
@@ -2502,6 +2521,14 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
                 result = ERR_TCP_CONNECT;
             }
         }
+    }
+
+    // A cancel that arrived while the transport race was running must not
+    // proceed to login (and another timeout budget).
+    if (conn->abort_connect) {
+        LOGD("Connect aborted by user (abort flag) - skipping login");
+        softether_disconnect(conn);
+        return ERR_TIMEOUT;
     }
 
     // Store server info
@@ -2546,6 +2573,14 @@ int softether_connect_with_hub(softether_connection_t* conn, const char* host, i
     }
 
     LOGD("Authentication successful");
+
+    // Abort before the (long) session/RUDP setup + DHCP if the user cancelled
+    // while the login was in flight.
+    if (conn->abort_connect) {
+        LOGD("Connect aborted by user (abort flag) - skipping session setup");
+        softether_disconnect(conn);
+        return ERR_TIMEOUT;
+    }
 
     // ---- SoftEther Protocol: Step 3 ----
     // If server supports RUDP, initialize the RUDP context

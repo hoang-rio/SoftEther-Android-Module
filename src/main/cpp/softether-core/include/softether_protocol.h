@@ -128,6 +128,12 @@ typedef struct softether_connection {
     void* ssl_ctx;
     void* ssl;
     softether_state_t state;
+    // Set by softether_force_close_socket() from another thread to abort an
+    // in-progress softether_connect_with_hub(). connect resets it on entry and
+    // checks it inside the TCP connect poll and between transport stages, so a
+    // user cancel unwinds a hanging connect promptly instead of waiting for the
+    // whole multi-stage timeout budget.
+    volatile int abort_connect;
     uint32_t session_id;
     uint32_t sequence_num;
     char server_ip[64];

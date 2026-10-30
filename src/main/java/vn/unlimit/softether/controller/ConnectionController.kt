@@ -66,6 +66,13 @@ class ConnectionController(
     // heuristic before calling nativeDestroy, so a slow TLS read in the connect
     // flow can't race the destroy. Fresh instance per connect flow.
     private var nativeTeardownGate = CountDownLatch(1)
+    // Serializes publication/teardown of the TUN interface + CONNECTED state
+    // against disconnect()/destroyResources(). Only in-memory bookkeeping and a
+    // (fast) PFD close are done under it — never a blocking native call — so a
+    // cancel can never leave an orphaned TUN behind. A leaked TUN is what keeps
+    // the status-bar VPN key up and makes the next VpnService.establish() return
+    // null ("cannot connect to any other server").
+    private val lifecycleLock = Any()
     private val reconnectAttempts = AtomicInteger(0)
     private val connectionMutex = Mutex()
     private var stateMonitorJob: Job? = null
@@ -87,6 +94,10 @@ class ConnectionController(
             onStateChange(value)
         }
 
+    // @Volatile: written by the connect flow and read by disconnect()/
+    // destroyResources() on other threads (interruptNativeConnect), so the
+    // handle must be published before it can be interrupted.
+    @Volatile
     private var nativeHandle: Long = 0
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tunTerminal: TunTerminal? = null
@@ -134,8 +145,11 @@ class ConnectionController(
 
         connectionMutex.withLock {
             if (isCancelled.get()) {
+                // Throw instead of returning: a silent return made the caller
+                // believe the tunnel was up (SoftEtherVpnService then set
+                // isRunning = true and swallowed every later connect).
                 Log.w(TAG, "Connection cancelled, not starting")
-                return
+                throw CancellationException("Connection cancelled by user")
             }
             
             // Check network availability
@@ -160,8 +174,11 @@ class ConnectionController(
                     return
                 } catch (e: Exception) {
                     if (isCancelled.get()) {
+                        // Propagate the cancellation so the service runs its
+                        // cancel path (destroy + DISCONNECTED) instead of
+                        // treating this as a completed connect.
                         Log.d(TAG, "Connection cancelled, not retrying")
-                        return
+                        throw CancellationException("Connection cancelled by user")
                     }
                     
                     // If network is lost during attempt, fail immediately
@@ -257,7 +274,12 @@ class ConnectionController(
     private suspend fun performConnect() {
         Log.d(TAG, "Starting connection to ${config.serverHost}:${config.serverPort}")
         currentState = ConnectionState.CONNECTING
-        isCancelled.set(false)
+        // Deliberately do NOT clear isCancelled here: connect() already rejected
+        // a cancelled controller, and clearing it would erase a cancel that lands
+        // between that check and the blocking native call — the exact race that
+        // used to publish a TUN (and CONNECTED) after the user pressed cancel.
+        // Paths that legitimately revive a controller (reconnect) clear it
+        // themselves before calling in.
 
         // Single-owner teardown: while this connect flow is alive, ONLY this
         // function destroys the native handle. disconnect()/destroyResources()
@@ -372,6 +394,12 @@ class ConnectionController(
         Log.d(TAG, "Duplex mode: ${if (fullDuplex) "FULL" else "HALF"} (4x BOTH / directional split)")
         // Build client info (rudpPort will be filled in by native code during RUDP init)
         val clientInfo = buildClientInfo(0)
+        // Last chance to honour a cancel before entering the blocking native
+        // call. The native side has its own abort flag, but it is cleared when
+        // the connect starts, so cancel before that point here.
+        if (isCancelled.get()) {
+            throw CancellationException("Connection cancelled by user")
+        }
         val result = try {
             client.nativeConnectWithHub(
                 nativeHandle,
@@ -490,18 +518,41 @@ class ConnectionController(
             dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
             secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
         )
-        vpnInterface = service.establishVpnInterface(dhcpConfig)
+        val pfd = service.establishVpnInterface(dhcpConfig)
             ?: throw Exception("Failed to establish VPN interface")
 
-        // Now that we have an IP and VPN interface, transition to CONNECTED
-        currentState = ConnectionState.CONNECTED
-        resetTrafficPublishing(publishSnapshot = true)
+        // Publish the tunnel only if no disconnect landed while we were building
+        // it. Serialized with disconnect()/destroyResources() so a cancel can
+        // never leave an orphaned TUN (stuck VPN key icon + every later
+        // VpnService.establish() returning null).
+        synchronized(lifecycleLock) {
+            if (isCancelled.get()) {
+                Log.d(TAG, "Connection cancelled before publishing TUN, closing it")
+                try {
+                    pfd.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error closing orphaned VPN interface", e)
+                }
+                throw CancellationException("Connection cancelled by user")
+            }
+            vpnInterface = pfd
+            // Now that we have an IP and VPN interface, transition to CONNECTED
+            currentState = ConnectionState.CONNECTED
+            resetTrafficPublishing(publishSnapshot = true)
 
-        // Start data forwarding loops
-        startDataForwarding()
+            // Start data forwarding loops
+            startDataForwarding()
 
-        // Start statistics logging
-        startStatisticsLogging()
+            // Start statistics logging
+            startStatisticsLogging()
+        }
+
+        // A cancel can land right after the block above released the lock (the
+        // teardown then already closed the TUN). Bail out so the native handle
+        // is torn down by performConnect() instead of lingering.
+        if (isCancelled.get()) {
+            throw CancellationException("Connection cancelled by user")
+        }
     }
 
     /**
@@ -531,12 +582,38 @@ class ConnectionController(
     }
 
     /**
+     * Mark this controller cancelled immediately (non-blocking, any thread).
+     * The service calls this before its async cleanup so a connect flow that is
+     * about to publish CONNECTED sees the cancel and backs out instead of
+     * leaving a live TUN behind.
+     */
+    fun requestCancel() {
+        isCancelled.set(true)
+        client.externalHandle = 0
+    }
+
+    /**
+     * Interrupt a connect flow blocked inside nativeConnectWithHub *without*
+     * freeing the handle it owns. shutdown() on the sockets makes the blocking
+     * SSL_read/SSL_write return; the connect flow then unwinds and destroys the
+     * handle itself.
+     */
+    private fun interruptNativeConnect() {
+        val handle = nativeHandle
+        if (handle == 0L) return
+        try {
+            client.nativeForceCloseSocket(handle)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error force-closing native socket", e)
+        }
+    }
+
+    /**
      * Disconnect VPN gracefully
      */
     fun disconnect() {
         Log.d(TAG, "Disconnecting VPN")
-        isCancelled.set(true)
-        client.externalHandle = 0
+        requestCancel()
 
         // Use mutex to prevent race with connect(); tryLock keeps disconnect()
         // non-blocking so it stays responsive on the calling thread.
@@ -555,6 +632,7 @@ class ConnectionController(
                 // session + poisoned state for every later connect attempt).
                 if (isConnectInFlight()) {
                     Log.w(TAG, "Connect in flight - deferring native teardown to connect flow")
+                    interruptNativeConnect()
                 } else if (nativeHandle != 0L) {
                     teardownNativeConnection()
                 }
@@ -562,32 +640,40 @@ class ConnectionController(
                 connectionMutex.unlock()
             }
         } else {
-            // connect() holds the mutex; native teardown stays owned by the
-            // connect flow via its connectInFlight guarantee.
-            Log.w(TAG, "Connect in progress, skipping mutex-protected native teardown")
+            // connect() holds the mutex because its coroutine is blocked inside
+            // nativeConnectWithHub. Freeing the handle here would deadlock on
+            // connect_mutex (or free it under the connect thread), so only
+            // interrupt the sockets: that is what actually unblocks the hanging
+            // SSL_read/SSL_write. The connect flow destroys the handle itself
+            // as soon as the native call returns.
+            Log.w(TAG, "Connect in progress - interrupting native connect, teardown deferred")
+            interruptNativeConnect()
         }
 
-        // Stop TunTerminal first to avoid reading from closed interface
-        try {
-            tunTerminal?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping TunTerminal", e)
+        synchronized(lifecycleLock) {
+            // Stop TunTerminal first to avoid reading from closed interface
+            try {
+                tunTerminal?.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping TunTerminal", e)
+            }
+            tunTerminal = null
+
+            // Close VPN interface
+            try {
+                vpnInterface?.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing VPN interface", e)
+            }
+            vpnInterface = null
+
+            currentState = ConnectionState.DISCONNECTED
         }
-        tunTerminal = null
-        
-        // Close VPN interface
-        try {
-            vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
-        }
-        vpnInterface = null
 
         // Don't call scope.cancel() — it permanently kills the scope, making reconnect impossible.
         // The isCancelled flag (set above) causes all data forwarding loops, keepalive,
         // and statistics logging to exit naturally via their while-loop conditions.
 
-        currentState = ConnectionState.DISCONNECTED
         Log.d(TAG, "VPN disconnected. Stats: sent=${bytesSent.get()} bytes (${packetsSent.get()} pkts), " +
                 "received=${bytesReceived.get()} bytes (${packetsReceived.get()} pkts)")
     }
@@ -599,35 +685,35 @@ class ConnectionController(
      */
     fun destroyResources() {
         Log.d(TAG, "Destroying resources (fast cleanup)")
-        isCancelled.set(true)
-        client.externalHandle = 0
+        requestCancel()
 
-        // Stop TunTerminal first to avoid reading from closed interface
-        try {
-            tunTerminal?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping TunTerminal", e)
+        synchronized(lifecycleLock) {
+            // Stop TunTerminal first to avoid reading from closed interface
+            try {
+                tunTerminal?.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping TunTerminal", e)
+            }
+            tunTerminal = null
+
+            // Close VPN interface
+            try {
+                vpnInterface?.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing VPN interface", e)
+            }
+            vpnInterface = null
         }
-        tunTerminal = null
 
-        // Close VPN interface
-        try {
-            vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
-        }
-        vpnInterface = null
-
-        // Force-close sockets to interrupt any blocking nativeConnectWithHub
-        // that may be holding connect_mutex.  This makes softether_connect_with_hub
-        // return with an error so softether_destroy can proceed without deadlock.
-        // If a connect flow is in flight, DEFER native teardown entirely: a
-        // force-close + 200ms sleep is not enough (the connect retries on new
-        // sockets / NAT-T), and destroying here frees the connection under the
-        // connect thread. The connect flow tears the handle down itself as soon
-        // as nativeConnectWithHub returns.
+        // Force-close sockets to interrupt any blocking nativeConnectWithHub /
+        // doDhcp that may be holding connect_mutex. Without this the module stays
+        // busy for the whole connect timeout after a cancel, so the next connect
+        // to another server looks stuck. If a connect flow is in flight, DEFER
+        // the destroy itself: the handle belongs to that flow, which frees it as
+        // soon as the interrupted native call returns.
         if (isConnectInFlight()) {
-            Log.w(TAG, "Connect in flight - deferring native destroy to connect flow")
+            Log.w(TAG, "Connect in flight - interrupting native connect, destroy deferred to connect flow")
+            interruptNativeConnect()
             return
         }
 
@@ -820,8 +906,13 @@ class ConnectionController(
 
             Log.w(TAG, "Attempting automatic reconnection (${reconnectAttempts.get()}/$MAX_RECONNECT_ATTEMPTS)")
 
-            // Reset isCancelled so loops and subsequent operations can proceed
-            isCancelled.set(false)
+            // A user cancel may already be in flight. Never revive a cancelled
+            // controller: clearing isCancelled here would reconnect a tunnel the
+            // user just tore down (and could re-publish a TUN after teardown).
+            if (isCancelled.get()) {
+                Log.d(TAG, "Reconnect skipped: controller cancelled")
+                return
+            }
 
             // Tear down old data forwarding (stop TunTerminal to avoid reading from stale fd)
             try {
@@ -979,14 +1070,26 @@ connectInFlight.set(true)
                 dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
                 secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
             )
-            vpnInterface = service.establishVpnInterface(dhcpConfig)
+            val pfd = service.establishVpnInterface(dhcpConfig)
                 ?: throw Exception("Failed to establish VPN interface during reconnect")
 
-            // Transition to CONNECTED and restart data forwarding
-            currentState = ConnectionState.CONNECTED
-            resetTrafficPublishing(publishSnapshot = true)
-            startDataForwarding()
-            startStatisticsLogging()
+            // Transition to CONNECTED and restart data forwarding. Guarded so a
+            // user disconnect racing the reconnect never leaves a live TUN.
+            synchronized(lifecycleLock) {
+                if (isCancelled.get()) {
+                    try {
+                        pfd.close()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error closing orphaned VPN interface", e)
+                    }
+                    throw CancellationException("Connection cancelled by user")
+                }
+                vpnInterface = pfd
+                currentState = ConnectionState.CONNECTED
+                resetTrafficPublishing(publishSnapshot = true)
+                startDataForwarding()
+                startStatisticsLogging()
+            }
 
             reconnectAttempts.set(0)
             Log.d(TAG, "Reconnection successful — data forwarding restarted")

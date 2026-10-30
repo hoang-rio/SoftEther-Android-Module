@@ -425,6 +425,12 @@ int softether_do_dhcp(softether_connection_t* conn, dhcp_result_t* result) {
          conn->client_mac[3], conn->client_mac[4], conn->client_mac[5]);
 
     for (int retry = 0; retry < DHCP_MAX_RETRIES; retry++) {
+        // A user cancel (softether_force_close_socket) aborts the remaining
+        // retries instead of burning the full DHCP retry budget.
+        if (conn->abort_connect) {
+            LOGE("DHCP aborted by cancel flag");
+            return -1;
+        }
         uint8_t frame[DHCP_MAX_FRAME];
         int frame_len = build_dhcp_frame(frame, sizeof(frame), conn->client_mac,
                                           xid, DHCP_DISCOVER, 0, 0);

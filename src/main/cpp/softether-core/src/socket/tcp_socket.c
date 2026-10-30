@@ -204,8 +204,11 @@ static int socket_recreate_for_family(softether_socket_t* sock, int family) {
 
 // Attempt a non-blocking connect to a single resolved address.
 // On success, sock->addr holds the connected peer address and 0 is returned.
+// cancel_flag (may be NULL) is polled in 200 ms slices so a pending user cancel
+// aborts the wait instead of running the full timeout.
 static int try_connect_addr(softether_socket_t* sock, struct addrinfo* ai,
-                            int timeout_ms, char* log_ip, size_t log_ip_size) {
+                            int timeout_ms, char* log_ip, size_t log_ip_size,
+                            const volatile int* cancel_flag) {
     if (socket_recreate_for_family(sock, ai->ai_family) != 0) {
         return -1;
     }
@@ -233,7 +236,44 @@ static int try_connect_addr(softether_socket_t* sock, struct addrinfo* ai,
         pfd.fd = sock->fd;
         pfd.events = POLLOUT;
 
-        result = poll(&pfd, 1, timeout_ms);
+        if (cancel_flag == NULL) {
+            // Preserve the original single-shot wait when nobody can cancel.
+            result = poll(&pfd, 1, timeout_ms);
+        } else {
+            // Slice the wait so a cancel is noticed within ~200 ms.
+            int waited = 0;
+            for (;;) {
+                if (*cancel_flag) {
+                    LOGE("Connection aborted by cancel flag");
+                    errno = ECANCELED;
+                    return -1;
+                }
+                int remaining = timeout_ms - waited;
+                if (remaining <= 0) {
+                    result = 0;  // treat as timeout below
+                    break;
+                }
+                int slice = remaining < 200 ? remaining : 200;
+                result = poll(&pfd, 1, slice);
+                if (result < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (result < 0) {
+                    break;
+                }
+                if (result > 0) {
+                    break;
+                }
+                waited += slice;
+            }
+            // Re-check after the wait so an abort that landed in the final
+            // slice is honoured before we treat the fd as connected.
+            if (result > 0 && *cancel_flag) {
+                LOGE("Connection aborted by cancel flag");
+                errno = ECANCELED;
+                return -1;
+            }
+        }
 
         if (result < 0) {
             LOGE("Poll failed: %s", strerror(errno));
@@ -260,7 +300,8 @@ static int try_connect_addr(softether_socket_t* sock, struct addrinfo* ai,
     return 0;
 }
 
-int socket_connect_timeout(softether_socket_t* sock, const char* host, int port, int timeout_ms) {
+int socket_connect_timeout_cancel(softether_socket_t* sock, const char* host, int port,
+                                  int timeout_ms, const volatile int* cancel_flag) {
     if (sock == NULL || host == NULL) {
         LOGE("Invalid socket");
         return -1;
@@ -302,7 +343,7 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
     for (ai = res; ai != NULL; ai = ai->ai_next) {
         if (ai->ai_family != first_family) continue;
         attempts++;
-        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
+        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip), cancel_flag) == 0) {
             freeaddrinfo(res);
             // Set back to blocking mode
             int flags = fcntl(sock->fd, F_GETFL, 0);
@@ -318,7 +359,7 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
     for (ai = res; ai != NULL; ai = ai->ai_next) {
         if (ai->ai_family != second_family) continue;
         attempts++;
-        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip)) == 0) {
+        if (try_connect_addr(sock, ai, timeout_ms, last_ip, sizeof(last_ip), cancel_flag) == 0) {
             freeaddrinfo(res);
             // Set back to blocking mode
             int flags = fcntl(sock->fd, F_GETFL, 0);
@@ -333,6 +374,10 @@ int socket_connect_timeout(softether_socket_t* sock, const char* host, int port,
     freeaddrinfo(res);
     LOGE("Connect failed for %s:%d (%d attempts)", host, port, attempts);
     return -1;
+}
+
+int socket_connect_timeout(softether_socket_t* sock, const char* host, int port, int timeout_ms) {
+    return socket_connect_timeout_cancel(sock, host, port, timeout_ms, NULL);
 }
 
 int socket_connect(softether_socket_t* sock, const char* host, int port) {

@@ -292,6 +292,7 @@ class SoftEtherVpnService : VpnService() {
         // Cancel any ongoing connection attempt
         connectionJob?.cancel()
         connectionJob = null
+        isRunning = false
         
         // Clean up resources OFF the main thread: disconnect/destroy make
         // blocking native calls (nativeDisconnect waits on connect_mutex and
@@ -299,6 +300,14 @@ class SoftEtherVpnService : VpnService() {
         // flight — running that on main caused an ANR in softether_disconnect).
         val currentController = controller
         controller = null
+
+        // Non-blocking cancel first so a connect flow still running on the IO
+        // scope can't publish CONNECTED / a new TUN after the service is gone.
+        try {
+            currentController?.requestCancel()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cancelling controller on destroy", e)
+        }
         
         try {
             vpnInterface?.close()
@@ -309,6 +318,14 @@ class SoftEtherVpnService : VpnService() {
         
         unregisterNetworkReceiver()
         notifyTrafficListeners(SoftEtherTrafficSnapshot.EMPTY)
+
+        // The service is going away: never leave the shared (static) state at
+        // CONNECTED/ERROR, or every screen keeps believing a tunnel is up and
+        // refuses to start a new connect.
+        if (currentState != STATE_DISCONNECTED) {
+            sendConnectionStateBroadcast(STATE_DISCONNECTED)
+        }
+
         // NonCancellable: serviceScope is cancelled right below, but this
         // cleanup must still run to free the native connection.
         serviceScope.launch(NonCancellable + Dispatchers.IO) {
@@ -325,12 +342,30 @@ class SoftEtherVpnService : VpnService() {
     private var connectionJob: kotlinx.coroutines.Job? = null
     @Volatile
     private var isStopping = false
+    // Incremented per connect request so a stop cleanup that is still in flight
+    // cannot stopSelf() a service that a newer connect request just restarted,
+    // and so a stale connect flow cannot tear down the new controller.
+    @Volatile
+    private var connectGeneration = 0
 
     private fun startVpn(config: ConnectionConfig) {
-        if (isRunning) {
-            Log.w(TAG, "VPN already running")
+        // A cancelled connect used to leave isRunning = true behind (the connect
+        // flow still reached `isRunning = true` after stopVpn() cleared it), and
+        // that zombie flag silently swallowed every later connect on this service
+        // instance. Only treat the service as busy while it is connected or a
+        // connect job is still active.
+        if (isRunning || connectionJob?.isActive == true) {
+            Log.w(TAG, "VPN already running or connecting")
             return
         }
+
+        // A new connect supersedes any stop that is still finishing its cleanup;
+        // otherwise isStopping would make handleConnectionState() ignore every
+        // state change forever on a reused service instance.
+        isStopping = false
+        isRunning = false
+        connectGeneration++
+        val generation = connectGeneration
 
         Log.d(TAG, "Starting VPN with config: ${config.serverHost}:${config.serverPort}")
         lastTrafficSnapshot = SoftEtherTrafficSnapshot.EMPTY
@@ -339,44 +374,74 @@ class SoftEtherVpnService : VpnService() {
         // Store session name for use in notifications
         currentSessionName = config.sessionName
 
+        // Build the controller up-front so this connect flow owns a stable
+        // reference; a stale flow can then never destroy the *new* controller.
+        val newController = ConnectionController(
+            service = this@SoftEtherVpnService,
+            config = config,
+            onStateChange = { state ->
+                if (generation == connectGeneration) {
+                    handleConnectionState(state, config.serverHost)
+                }
+            },
+            onError = { error ->
+                Log.e(TAG, "VPN Error: $error")
+                if (generation == connectGeneration) {
+                    // updateNotification(getString(R.string.softether_disconnected_by_error))
+                    mIsUserDisconnect = false
+                    stopVpn(disconnectByError = true)
+                }
+            },
+            onTrafficUpdate = { snapshot ->
+                if (generation == connectGeneration) {
+                    handleTrafficUpdate(snapshot)
+                }
+            }
+        )
+        controller = newController
+
         connectionJob = serviceScope.launch {
             try {
-                // Initialize connection controller
-                controller = ConnectionController(
-                    service = this@SoftEtherVpnService,
-                    config = config,
-                    onStateChange = { state ->
-                        handleConnectionState(state, config.serverHost)
-                    },
-                    onError = { error ->
-                        Log.e(TAG, "VPN Error: $error")
-                        // updateNotification(getString(R.string.softether_disconnected_by_error))
-                        mIsUserDisconnect = false
-                        stopVpn(disconnectByError = true)
-                    },
-                    onTrafficUpdate = { snapshot ->
-                        handleTrafficUpdate(snapshot)
-                    }
-                )
-
                 // Establish connection (fires onStateChange -> STATE_CONNECTED with IP after DHCP)
-                controller?.connect()
-                isRunning = true
-                Log.d(TAG, "VPN connection established")
+                newController.connect()
+
+                // connect() throws CancellationException on cancel and only returns
+                // normally when a tunnel is actually up. Never resurrect isRunning
+                // after stopVpn() has already cleared it.
+                val tunnelUp = newController.isConnected()
+                if (tunnelUp && !isStopping && generation == connectGeneration) {
+                    isRunning = true
+                    Log.d(TAG, "VPN connection established")
+                } else {
+                    Log.d(TAG, "Connect flow finished without an active tunnel " +
+                            "(connected=$tunnelUp, stopping=$isStopping, gen=$generation/$connectGeneration)")
+                    // Covers the silent-return cases (network unavailable, state
+                    // guard, superseded flow) so the service does not linger as a
+                    // zombie that refuses the next connect.
+                    if (!isStopping && generation == connectGeneration) {
+                        stopVpn(disconnectByError = true)
+                    }
+                }
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Connection was canceled (user pressed cancel)
                 Log.d(TAG, "Connection cancelled by user")
-                mIsUserDisconnect = true
                 // Clean up whatever the connect flow created (TUN interface,
                 // terminal, deferred native handle). Idempotent — safe even if
                 // the controller already tore itself down.
                 try {
-                    controller?.destroyResources()
+                    newController.destroyResources()
                 } catch (ce: Exception) {
                     Log.e(TAG, "Error destroying resources on cancel", ce)
                 }
-                controller = null
+                if (generation != connectGeneration) {
+                    Log.d(TAG, "Stale connect flow cancelled, leaving newer connect untouched")
+                    return@launch
+                }
+                mIsUserDisconnect = true
+                if (controller === newController) {
+                    controller = null
+                }
                 sendConnectionStateBroadcast(STATE_DISCONNECTED)
                 // stopForeground was already done by stopVpn(); make sure the
                 // service itself also stops, or the process lingers with the
@@ -386,6 +451,10 @@ class SoftEtherVpnService : VpnService() {
                 Log.e(TAG, "Failed to start VPN", e)
                 // updateNotification("Connection failed: ${e.message}")
                 mIsUserDisconnect = false
+                if (generation != connectGeneration) {
+                    Log.d(TAG, "Stale connect flow failed, leaving newer connect untouched", e)
+                    return@launch
+                }
                 stopVpn(disconnectByError = true)
             }
         }
@@ -397,9 +466,28 @@ class SoftEtherVpnService : VpnService() {
             return
         }
         isStopping = true
+        val generation = connectGeneration
 
         Log.d(TAG, "Stopping VPN")
         isRunning = false
+
+        // Snapshot references and clear them immediately so onDestroy()
+        // won't try to free the same resources concurrently.
+        val currentController = controller
+        val currentInterface = vpnInterface
+        controller = null
+        vpnInterface = null
+
+        // Cancel the controller synchronously (non-blocking) *before* any async
+        // cleanup runs. Otherwise a connect flow blocked in native code — or one
+        // about to publish CONNECTED — can win the race and leave an orphaned
+        // TUN behind (VPN key icon stuck in the status bar, and the next
+        // VpnService.establish() returning null).
+        try {
+            currentController?.requestCancel()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cancelling controller", e)
+        }
 
         // Send disconnect/error broadcast immediately so the UI reacts right away
         sendConnectionStateBroadcast(if (disconnectByError) STATE_ERROR else STATE_DISCONNECTED)
@@ -415,13 +503,6 @@ class SoftEtherVpnService : VpnService() {
         showDisconnectedNotification()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
 
-        // Snapshot references and clear them immediately so onDestroy()
-        // won't try to free the same resources concurrently.
-        val currentController = controller
-        val currentInterface = vpnInterface
-        controller = null
-        vpnInterface = null
-
         // Clean up resources on a background thread WITHOUT calling the
         // blocking graceful disconnect (nativeDisconnect waits for server
         // ACK which can hang).  destroyResources() just frees native memory
@@ -433,8 +514,21 @@ class SoftEtherVpnService : VpnService() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Error destroying controller resources", e)
                 }
+                // Safety net: the service-level reference may still hold a live
+                // TUN if the controller never published (or already released) it.
+                // A leaked PFD keeps the VPN key icon up and makes every later
+                // VpnService.establish() return null.
+                try {
+                    currentInterface?.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error closing VPN interface during stop", e)
+                }
             }
-            stopSelf()
+            if (generation == connectGeneration) {
+                stopSelf()
+            } else {
+                Log.d(TAG, "Newer connect request superseded this stop - keeping service alive")
+            }
         }
     }
 
