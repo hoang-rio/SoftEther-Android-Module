@@ -142,11 +142,17 @@ class SoftEtherVpnService : VpnService() {
     private var isRunning = false
     private var mWasConnected = false
     private var mIsUserDisconnect = false
+    private var networkCallbackRegistered = false
+    private var cachedContentPendingIntent: PendingIntent? = null
+    private var cachedContentPendingIntentTarget: Class<*>? = null
     private var lastStateUpdateTime = 0L
     private var pendingStateUpdate: (() -> Unit)? = null
     private var currentSessionName: String? = null
 
-    private val networkCallbackThread = HandlerThread("network-callback").apply { start() }
+    // Started lazily (see registerNetworkReceiver): this service is created inside
+    // the startForegroundService() deadline, and spawning a HandlerThread in the
+    // instance initialiser puts an OS thread creation on that critical path.
+    private val networkCallbackThread by lazy { HandlerThread("network-callback").apply { start() } }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -163,8 +169,11 @@ class SoftEtherVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
+        // Only the notification channel is created here: this runs inside the
+        // startForegroundService() window, so no other binder calls (the network
+        // callback registration is a round trip to ConnectivityService) belong on
+        // this path. The receiver is registered in startVpn() instead.
         createNotificationChannel()
-        registerNetworkReceiver()
     }
 
     private fun triggerDisconnectNotification() {
@@ -246,7 +255,17 @@ class SoftEtherVpnService : VpnService() {
         Log.d(TAG, "onStartCommand: action=${intent?.action}")
 
         // Android requires startForeground() within ~5s of startForegroundService().
-        // Use the correct text and omit the disconnect action when disconnecting.
+        // Take the foreground slot FIRST with a notification that needs no
+        // PendingIntent and no reflection: PendingIntent.getActivity() (used by
+        // createNotification below) is a synchronous binder call into
+        // ActivityManagerService, and this service is started from the UI thread
+        // immediately after another AMS round trip (startForegroundService). When
+        // AMS is busy -- e.g. while the system is bringing up a VPN -- that call
+        // can eat the deadline, and the app is killed with
+        // "Context.startForegroundService() did not then call Service.startForeground()".
+        startForeground(NOTIFICATION_ID, createStubNotification())
+
+        // Deadline satisfied: now replace it with the real notification.
         val isDisconnectAction = intent?.action == ACTION_DISCONNECT
         startForeground(
             NOTIFICATION_ID,
@@ -366,6 +385,11 @@ class SoftEtherVpnService : VpnService() {
         isRunning = false
         connectGeneration++
         val generation = connectGeneration
+
+        // Registered here rather than in onCreate(): the service is created inside
+        // the startForegroundService() deadline and this call is a binder round
+        // trip to ConnectivityService.
+        registerNetworkReceiver()
 
         Log.d(TAG, "Starting VPN with config: ${config.serverHost}:${config.serverPort}")
         lastTrafficSnapshot = SoftEtherTrafficSnapshot.EMPTY
@@ -536,31 +560,7 @@ class SoftEtherVpnService : VpnService() {
      * Show disconnected notification (dismissable, no action buttons)
      */
     private fun showDisconnectedNotification() {
-        // Intent to open DetailActivity when notification is tapped
-        val contentIntent = Intent().apply {
-            if (notificationTargetActivity != null) {
-                setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
-                // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
-                // Similar to OpenVPNService.getContentIntent()
-                try {
-                    val startKey = notificationTargetActivity?.getField("TYPE_START")?.get(null)?.toString()
-                    val startValue = notificationTargetActivity?.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
-                    if (startKey != null && startValue != null) {
-                        putExtra(startKey, startValue)
-                    }
-                } catch (e: Exception) {
-                    // Silent this exception
-                }
-            } else {
-                setClassName(this@SoftEtherVpnService, "vn.unlimit.vpngate.activities.DetailActivity")
-                putExtra("vn.unlimit.vpngate.TYPE_START", 1001)
-            }
-            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val contentPendingIntent = PendingIntent.getActivity(
-            this, 0, contentIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val contentPendingIntent = getContentPendingIntent()
 
         val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle(getString(R.string.softether_vpn_service))
@@ -700,17 +700,47 @@ class SoftEtherVpnService : VpnService() {
         }
     }
 
-    private fun createNotification(content: String, showDisconnectAction: Boolean = true): Notification {
+    /**
+     * Cheapest possible foreground notification: no PendingIntent, no reflection,
+     * no extra bundle work. Replaced a few lines later by [createNotification].
+     */
+    private fun createStubNotification(): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.softether_notification_title_notconnect))
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .build()
+    }
+
+    /**
+     * Content PendingIntent is cached: it is rebuilt on every notification update
+     * (once per second while connected) and PendingIntent.getActivity() is a
+     * synchronous binder call into ActivityManagerService. Re-issuing the same
+     * intent every second needlessly competes with AMS — the same AMS calls whose
+     * latency determines whether startForegroundService() meets its deadline.
+     */
+    private fun getContentPendingIntent(): PendingIntent {
+        val target = notificationTargetActivity
+        cachedContentPendingIntent?.let {
+            if (cachedContentPendingIntentTarget === target) return it
+        }
         // Intent to open DetailActivity when notification is tapped
         val contentIntent = Intent().apply {
-            if (notificationTargetActivity != null) {
-                setClass(this@SoftEtherVpnService, notificationTargetActivity!!)
+            if (target != null) {
+                setClass(this@SoftEtherVpnService, target)
                 // Dynamically fetch TYPE_START and TYPE_FROM_NOTIFY from target activity
                 // to support different activities without hardcoding keys here
                 // Similar to OpenVPNService.getContentIntent()
                 try {
-                    val startKey = notificationTargetActivity?.getField("TYPE_START")?.get(null)?.toString()
-                    val startValue = notificationTargetActivity?.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
+                    val startKey = target.getField("TYPE_START")?.get(null)?.toString()
+                    val startValue = target.getField("TYPE_FROM_NOTIFY")?.get(null)?.toString()?.toInt()
                     if (startKey != null && startValue != null) {
                         putExtra(startKey, startValue)
                     }
@@ -724,10 +754,17 @@ class SoftEtherVpnService : VpnService() {
             }
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
-        val contentPendingIntent = PendingIntent.getActivity(
+        val pendingIntent = PendingIntent.getActivity(
             this, 0, contentIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        cachedContentPendingIntent = pendingIntent
+        cachedContentPendingIntentTarget = target
+        return pendingIntent
+    }
+
+    private fun createNotification(content: String, showDisconnectAction: Boolean = true): Notification {
+        val contentPendingIntent = getContentPendingIntent()
 
         val notificationTitle = if (!currentSessionName.isNullOrEmpty()) {
             getString(R.string.softether_notification_title, currentSessionName)
@@ -931,6 +968,7 @@ class SoftEtherVpnService : VpnService() {
     }
 
     private fun registerNetworkReceiver() {
+        if (networkCallbackRegistered) return
         val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
             ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -946,9 +984,12 @@ class SoftEtherVpnService : VpnService() {
             // the main looper, which is acceptable because networkCallback only flips a flag.
             cm.registerDefaultNetworkCallback(networkCallback)
         }
+        networkCallbackRegistered = true
     }
 
     private fun unregisterNetworkReceiver() {
+        if (!networkCallbackRegistered) return
+        networkCallbackRegistered = false
         val cm = ContextCompat.getSystemService(this, ConnectivityManager::class.java)
             ?: return
         try {
